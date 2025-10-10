@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "streamlined-crispr"
+version = "0.1.0"
+description = "Tools for scalable CRISPR screen analysis on on-disk AnnData objects"
+authors = [{name = "Streamlining CRISPR Team"}]
+dependencies = []
+
+[project.optional-dependencies]
+test = [
+    "pytest",
+]
+
+[tool.pytest.ini_options]
+addopts = "-q"
