@@ -11,7 +11,7 @@ import time
 import anndata as ad
 import numpy as np
 import pandas as pd
-from scipy.stats import mannwhitneyu, norm
+from scipy.stats import norm, rankdata
 
 from .data import (
     ensure_gene_symbol_column,
@@ -19,7 +19,7 @@ from .data import (
     normalize_total_block,
     read_backed,
 )
-from .de import wald_test, wilcoxon_test
+from .de import _tie_correction, wald_test, wilcoxon_test
 from .pseudobulk import compute_average_log_expression, compute_pseudobulk_expression
 from .qc import quality_control_summary
 
@@ -210,13 +210,17 @@ def _compute_reference_wilcoxon(
     candidates = _resolve_reference_candidates(labels, control_label, perturbations)
     gene_symbols = ensure_gene_symbol_column(adata, gene_name_column)
 
+    log_matrix = np.asarray(adata.X, dtype=np.float64)
     norm_matrix = np.asarray(adata.layers["normalized_counts"], dtype=np.float64)
+
     control_mask = labels == control_label
     control_n = int(control_mask.sum())
     if control_n == 0:
         raise ValueError("Control group contains no cells")
-    control_values = norm_matrix[control_mask]
-    control_expr = np.count_nonzero(control_values, axis=0)
+
+    control_log = log_matrix[control_mask]
+    control_norm = norm_matrix[control_mask]
+    control_expr = np.count_nonzero(control_norm, axis=0)
 
     results: Dict[str, Dict[str, np.ndarray]] = {}
     for label in candidates:
@@ -224,31 +228,39 @@ def _compute_reference_wilcoxon(
         n_cells = int(mask.sum())
         if n_cells == 0:
             raise ValueError(f"Perturbation '{label}' contains no cells")
-        pert_values = norm_matrix[mask]
-        pert_expr = np.count_nonzero(pert_values, axis=0)
+
+        pert_log = log_matrix[mask]
+        pert_norm = norm_matrix[mask]
+        pert_expr = np.count_nonzero(pert_norm, axis=0)
         total_expr = control_expr + pert_expr
 
+        combined = np.vstack((pert_log, control_log))
+        ranks = rankdata(combined, axis=0)
+        rank_sum = ranks[:n_cells].sum(axis=0)
+        tie = _tie_correction(ranks)
+
+        expected = n_cells * (n_cells + control_n + 1.0) / 2.0
+        std = np.sqrt(tie * n_cells * control_n * (n_cells + control_n + 1.0) / 12.0)
+        u_stat = rank_sum - n_cells * (n_cells + 1.0) / 2.0
+
+        valid = (std > 0) & (total_expr >= min_cells_expressed)
+
         effect = np.zeros(adata.n_vars, dtype=np.float64)
-        stat = np.zeros_like(effect)
+        z = np.zeros_like(effect)
         pvalue = np.ones_like(effect)
-        for gene_idx in range(adata.n_vars):
-            if total_expr[gene_idx] < min_cells_expressed:
-                continue
-            res = mannwhitneyu(
-                control_values[:, gene_idx],
-                pert_values[:, gene_idx],
-                alternative="two-sided",
-                method="auto",
-            )
-            stat[gene_idx] = res.statistic
-            pvalue[gene_idx] = res.pvalue
-            effect[gene_idx] = res.statistic / (control_n * n_cells) - 0.5
+
+        with np.errstate(divide="ignore", invalid="ignore"):
+            z[valid] = (rank_sum[valid] - expected) / std[valid]
+        pvalue[valid] = 2.0 * norm.sf(np.abs(z[valid]))
+        effect[valid] = u_stat[valid] / (n_cells * control_n) - 0.5
+
         results[label] = {
             "genes": gene_symbols,
             "effect": effect,
-            "statistic": stat,
+            "statistic": z,
             "pvalue": pvalue,
         }
+
     return results
 
 
