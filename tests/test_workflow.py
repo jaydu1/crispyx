@@ -63,6 +63,20 @@ def create_sparse_test_dataset(tmp_path):
     return sparse_path, sparse
 
 
+def _normalize_total(matrix: np.ndarray, *, target_sum: float = 1e4) -> np.ndarray:
+    """Replicate the package's library-size normalisation."""
+
+    matrix = np.asarray(matrix, dtype=float)
+    library_size = matrix.sum(axis=1, keepdims=True)
+    scale = np.divide(
+        float(target_sum),
+        library_size,
+        out=np.zeros_like(library_size, dtype=float),
+        where=library_size > 0,
+    )
+    return matrix * scale
+
+
 def test_quality_control_writes_filtered_dataset(tmp_path):
     path, adata = create_test_dataset(tmp_path)
     result = quality_control_summary(
@@ -160,8 +174,9 @@ def test_pseudobulk_outputs_and_files(tmp_path):
     ctrl_mask = (filtered.obs["perturbation"] == "ctrl").to_numpy()
     ko1_mask = (filtered.obs["perturbation"] == "KO1").to_numpy()
     matrix = filtered.X.toarray() if sp.issparse(filtered.X) else np.asarray(filtered.X)
-    ctrl = np.log1p(matrix[ctrl_mask, 0])
-    ko1 = np.log1p(matrix[ko1_mask, 0])
+    normalised = _normalize_total(matrix)
+    ctrl = np.log1p(normalised[ctrl_mask, 0])
+    ko1 = np.log1p(normalised[ko1_mask, 0])
     expected = ko1.mean() - ctrl.mean()
     assert np.isclose(avg.loc["KO1", "gene0"], expected)
     assert (tmp_path / "avg_effects_avg_log_effects.h5ad").exists()
