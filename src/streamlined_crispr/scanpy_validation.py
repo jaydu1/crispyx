@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, Mapping, Optional
 
+import resource
+import sys
 import time
 
 import anndata as ad
@@ -42,6 +44,8 @@ class ComparisonResult:
     wilcoxon_effect_max_abs_diff: float
     wilcoxon_statistic_max_abs_diff: float
     wilcoxon_pvalue_max_abs_diff: float
+    streamlined_peak_memory_mb: float
+    reference_peak_memory_mb: float
     streamlined_timings: Mapping[str, float]
     reference_timings: Mapping[str, float]
     streamlined_effects: Mapping[str, pd.DataFrame]
@@ -72,6 +76,17 @@ def _filter_cells(matrix: np.ndarray, min_genes: int) -> np.ndarray:
 def _filter_genes(matrix: np.ndarray, min_cells: int) -> np.ndarray:
     expressed = (matrix > 0).sum(axis=0)
     return expressed >= min_cells
+
+
+def _get_peak_memory_mb() -> float:
+    """Return the current process peak RSS in megabytes."""
+
+    usage = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    if sys.platform == "darwin":
+        # macOS reports bytes
+        return usage / (1024.0 * 1024.0)
+    # most UNIX platforms report kilobytes
+    return usage / 1024.0
 
 
 def _load_dense(path: Path) -> ad.AnnData:
@@ -287,39 +302,7 @@ def compare_with_scanpy(
     timings_reference: Dict[str, float] = {}
     de_min_cells_expressed = 0
 
-    raw = _load_dense(path)
-    reference_norm = raw.copy()
-
-    t0 = time.perf_counter()
-    normalised_matrix, _ = _normalize_total(reference_norm.X)
-    timings_reference["normalize_total"] = time.perf_counter() - t0
-    reference_norm.X = normalised_matrix
-
-    t0 = time.perf_counter()
-    log_matrix = _log1p(reference_norm.X)
-    timings_reference["log1p"] = time.perf_counter() - t0
-    reference_norm.X = log_matrix
-
-    # Streamed preprocessing comparison
-    backed = read_backed(path)
-    max_norm_diff = 0.0
-    max_log_diff = 0.0
-    t0 = time.perf_counter()
-    try:
-        for slc, block in iter_matrix_chunks(
-            backed, axis=0, chunk_size=chunk_size, convert_to_dense=False
-        ):
-            norm_block, _ = normalize_total_block(block)
-            max_norm_diff = max(
-                max_norm_diff, float(np.max(np.abs(norm_block - normalised_matrix[slc])))
-            )
-            log_block = np.log1p(norm_block)
-            max_log_diff = max(
-                max_log_diff, float(np.max(np.abs(log_block - log_matrix[slc])))
-            )
-    finally:
-        backed.file.close()
-    timings_streamlined["normalize_total+log1p"] = time.perf_counter() - t0
+    baseline_memory_mb = _get_peak_memory_mb()
 
     # Streamlined QC and effect estimation
     t0 = time.perf_counter()
@@ -393,6 +376,43 @@ def compare_with_scanpy(
     )
     timings_streamlined["wilcoxon_test"] = time.perf_counter() - t0
 
+    streamlined_peak_memory_mb = max(
+        0.0, _get_peak_memory_mb() - baseline_memory_mb
+    )
+
+    raw = _load_dense(path)
+    reference_norm = raw.copy()
+
+    t0 = time.perf_counter()
+    normalised_matrix, _ = _normalize_total(reference_norm.X)
+    timings_reference["normalize_total"] = time.perf_counter() - t0
+    reference_norm.X = normalised_matrix
+
+    t0 = time.perf_counter()
+    log_matrix = _log1p(reference_norm.X)
+    timings_reference["log1p"] = time.perf_counter() - t0
+    reference_norm.X = log_matrix
+
+    max_norm_diff = 0.0
+    max_log_diff = 0.0
+    t0 = time.perf_counter()
+    backed = read_backed(path)
+    try:
+        for slc, block in iter_matrix_chunks(
+            backed, axis=0, chunk_size=chunk_size, convert_to_dense=False
+        ):
+            norm_block, _ = normalize_total_block(block)
+            max_norm_diff = max(
+                max_norm_diff, float(np.max(np.abs(norm_block - normalised_matrix[slc])))
+            )
+            log_block = np.log1p(norm_block)
+            max_log_diff = max(
+                max_log_diff, float(np.max(np.abs(log_block - log_matrix[slc])))
+            )
+    finally:
+        backed.file.close()
+    timings_streamlined["normalize_total+log1p"] = time.perf_counter() - t0
+
     # Reference QC and effect estimation (Scanpy-style)
     reference_filtered = raw.copy()
     t0 = time.perf_counter()
@@ -448,6 +468,10 @@ def compare_with_scanpy(
         min_cells_expressed=de_min_cells_expressed,
     )
     timings_reference["wilcoxon_test"] = time.perf_counter() - t0
+
+    reference_peak_memory_mb = max(
+        0.0, _get_peak_memory_mb() - baseline_memory_mb
+    )
 
     aligned_avg, aligned_ref_avg = _align_frames(avg_log_effects, reference_avg)
     aligned_pseudo, aligned_ref_pseudo = _align_frames(
@@ -517,6 +541,8 @@ def compare_with_scanpy(
         wilcoxon_effect_max_abs_diff=wilcoxon_effect_diff,
         wilcoxon_statistic_max_abs_diff=wilcoxon_stat_diff,
         wilcoxon_pvalue_max_abs_diff=wilcoxon_pvalue_diff,
+        streamlined_peak_memory_mb=streamlined_peak_memory_mb,
+        reference_peak_memory_mb=reference_peak_memory_mb,
         streamlined_timings=timings_streamlined,
         reference_timings=timings_reference,
         streamlined_effects={
