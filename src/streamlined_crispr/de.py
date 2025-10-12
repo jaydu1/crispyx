@@ -351,7 +351,7 @@ def wilcoxon_test(
         results[label] = DifferentialExpressionResult(
             genes=gene_symbols,
             effect_size=effect_matrix[idx],
-            statistic=u_matrix[idx],
+            statistic=z_matrix[idx],
             pvalue=pvalue_matrix[idx],
             method="wilcoxon",
             perturbation=label,

@@ -15,7 +15,7 @@ import numpy as np
 import pandas as pd
 import pytest
 import scipy.sparse as sp
-from scipy.stats import norm
+from scipy.stats import norm, rankdata
 import scanpy as sc
 
 from streamlined_crispr import (
@@ -26,6 +26,7 @@ from streamlined_crispr import (
     wilcoxon_test,
 )
 from streamlined_crispr.data import iter_matrix_chunks, normalize_total_block
+from streamlined_crispr.de import _tie_correction
 
 DATA_PATH = Path(__file__).resolve().parents[1] / "data" / "Adamson_subset.h5ad"
 PERTURBATION_COLUMN = "batch_group"
@@ -272,6 +273,35 @@ def test_differential_expression_matches_scanpy(subset_dataset, tmp_path):
         np.testing.assert_allclose(result.statistic, expected_wald_z[label], atol=1e-8, rtol=1e-6)
         np.testing.assert_allclose(result.pvalue, expected_wald_p[label], atol=1e-8, rtol=1e-6)
 
+    expected_wilcoxon_effect = {}
+    expected_wilcoxon_z = {}
+    expected_wilcoxon_p = {}
+
+    for label in np.unique(labels):
+        if label == control_label:
+            continue
+        mask = labels == label
+        n_cells = float(mask.sum())
+        pert_log = toolkit_log[mask]
+        combined = np.vstack((pert_log, control_log))
+        ranks = rankdata(combined, axis=0)
+        rank_sum = ranks[: int(n_cells)].sum(axis=0)
+        tie = _tie_correction(ranks)
+        expected = n_cells * (n_cells + control_n + 1.0) / 2.0
+        std = np.sqrt(tie * n_cells * control_n * (n_cells + control_n + 1.0) / 12.0)
+        u_stat = rank_sum - n_cells * (n_cells + 1.0) / 2.0
+        valid = std > 0
+        z = np.zeros(filtered.n_vars, dtype=float)
+        p = np.ones_like(z)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            z[valid] = (rank_sum[valid] - expected) / std[valid]
+        p[valid] = 2 * norm.sf(np.abs(z[valid]))
+        effect = np.zeros(filtered.n_vars, dtype=float)
+        effect[valid] = u_stat[valid] / (n_cells * control_n) - 0.5
+        expected_wilcoxon_effect[label] = effect
+        expected_wilcoxon_z[label] = z
+        expected_wilcoxon_p[label] = p
+
     scanpy_filtered = filtered.copy()
     sc.pp.normalize_total(scanpy_filtered, target_sum=1e4)
     sc.pp.log1p(scanpy_filtered)
@@ -307,21 +337,39 @@ def test_differential_expression_matches_scanpy(subset_dataset, tmp_path):
         names = pd.Index(np.array(scanpy_rg["names"][group]).astype(str))
         pvals = np.array(scanpy_rg["pvals"][group], dtype=float)
         padj = np.array(scanpy_rg["pvals_adj"][group], dtype=float)
-        grouped[group] = pd.DataFrame({"pvals": pvals, "pvals_adj": padj}, index=names)
-
-    control_n = float(control_mask.sum())
+        scores = np.array(scanpy_rg["scores"][group], dtype=float)
+        grouped[group] = pd.DataFrame(
+            {"pvals": pvals, "pvals_adj": padj, "scores": scores}, index=names
+        )
 
     for label, result in wilcoxon_results.items():
         group_df = grouped[label].reindex(result.genes)
-        pert_n = float((labels == label).sum())
-        expected_effect = result.statistic / (control_n * pert_n) - 0.5
-        np.testing.assert_allclose(result.effect_size, expected_effect, atol=1e-12, rtol=1e-12)
+        np.testing.assert_allclose(
+            result.effect_size,
+            expected_wilcoxon_effect[label],
+            atol=1e-4,
+            rtol=1e-2,
+        )
+        scores_expected = group_df["scores"].fillna(0.0).to_numpy()
         pvals_expected = group_df["pvals"].fillna(1.0).to_numpy()
         padj_expected = group_df["pvals_adj"].fillna(1.0).to_numpy()
+        np.testing.assert_allclose(result.statistic, scores_expected, atol=2e-3, rtol=5e-3)
         np.testing.assert_allclose(result.pvalue, pvals_expected, atol=2e-3, rtol=5e-3)
         np.testing.assert_allclose(
             result.pvalue_adj,
             padj_expected,
+            atol=2e-3,
+            rtol=5e-3,
+        )
+        np.testing.assert_allclose(
+            expected_wilcoxon_z[label],
+            scores_expected,
+            atol=2e-3,
+            rtol=5e-3,
+        )
+        np.testing.assert_allclose(
+            expected_wilcoxon_p[label],
+            pvals_expected,
             atol=2e-3,
             rtol=5e-3,
         )

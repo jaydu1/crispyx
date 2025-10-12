@@ -198,9 +198,8 @@ def test_wilcoxon_test_matches_scanpy(small_adata, tmp_path):
         mask = adata.obs["perturbation"] == label
         pert_values = log_data[mask]
         pert_n = float(pert_values.shape[0])
-        expected_effect = result.statistic / (control_n * pert_n) - 0.5
-        np.testing.assert_allclose(result.effect_size, expected_effect, atol=1e-12, rtol=1e-12)
 
+        effects = []
         stats = []
         pvals = []
         for gene in range(adata.n_vars):
@@ -211,13 +210,17 @@ def test_wilcoxon_test_matches_scanpy(small_adata, tmp_path):
             expected = pert_n * (pert_n + control_n + 1.0) / 2.0
             std = float(np.sqrt(tie * pert_n * control_n * (pert_n + control_n + 1.0) / 12.0))
             u_stat = float(rank_sum - pert_n * (pert_n + 1.0) / 2.0)
-            stats.append(u_stat)
+            effect = u_stat / (control_n * pert_n) - 0.5
+            effects.append(effect)
             if std == 0 or np.isnan(std):
+                stats.append(0.0)
                 pvals.append(1.0)
             else:
                 z = (rank_sum - expected) / std
+                stats.append(float(z))
                 pvals.append(float(2 * norm.sf(abs(z))))
 
+        np.testing.assert_allclose(result.effect_size, np.asarray(effects), atol=1e-12, rtol=1e-12)
         np.testing.assert_allclose(result.statistic, np.asarray(stats), atol=1e-12, rtol=1e-12)
         np.testing.assert_allclose(result.pvalue, np.asarray(pvals), atol=1e-9, rtol=1e-7)
         assert result.result_path == output_path
