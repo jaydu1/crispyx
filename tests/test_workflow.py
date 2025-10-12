@@ -32,6 +32,7 @@ from streamlined_crispr import (
     wald_test,
     wilcoxon_test,
 )
+from streamlined_crispr.data import normalize_total_block
 
 
 def create_test_dataset(tmp_path):
@@ -46,7 +47,10 @@ def create_test_dataset(tmp_path):
         ],
         dtype=float,
     )
-    obs = pd.DataFrame({"perturbation": ["ctrl", "ctrl", "KO1", "KO1", "KO2", "KO2"]})
+    obs = pd.DataFrame(
+        {"perturbation": ["ctrl", "ctrl", "KO1", "KO1", "KO2", "KO2"]},
+        index=[f"cell_{i}" for i in range(x.shape[0])],
+    )
     var = pd.DataFrame({"gene_symbol": [f"gene{i}" for i in range(x.shape[1])]})
     var.index = var["gene_symbol"]
     adata = ad.AnnData(x, obs=obs, var=var)
@@ -106,6 +110,7 @@ def test_quality_control_sparse_roundtrip(tmp_path):
 def test_gene_symbol_validation(tmp_path):
     x = np.ones((5, 3))
     obs = pd.DataFrame({"perturbation": ["ctrl"] * 5})
+    obs.index = [f"cell_{i}" for i in range(obs.shape[0])]
     var = pd.DataFrame(index=["ENSG000001", "ENSG000002", "ENSG000003"])
     adata = ad.AnnData(x, obs=obs, var=var)
     path = tmp_path / "invalid.h5ad"
@@ -125,8 +130,8 @@ def test_gene_symbol_validation(tmp_path):
         raise AssertionError("Expected a ValueError for Ensembl-style identifiers")
 
 
-def test_pseudobulk_outputs_and_files(tmp_path):
-    path, adata = create_test_dataset(tmp_path)
+def test_downstream_effect_outputs(tmp_path):
+    path, _ = create_test_dataset(tmp_path)
     qc_result = quality_control_summary(
         path,
         min_genes=1,
@@ -136,7 +141,7 @@ def test_pseudobulk_outputs_and_files(tmp_path):
         control_label="ctrl",
         gene_name_column="gene_symbol",
         output_dir=tmp_path,
-        data_name="pseudobulk",
+        data_name="de",
     )
     avg = compute_average_log_expression(
         qc_result.filtered_path,
@@ -154,33 +159,6 @@ def test_pseudobulk_outputs_and_files(tmp_path):
         output_dir=tmp_path,
         data_name="pseudo_effects",
     )
-    assert set(avg.index) == {"KO1", "KO2"}
-    assert set(pseudo.index) == {"KO1", "KO2"}
-    filtered = ad.read_h5ad(qc_result.filtered_path)
-    ctrl_mask = (filtered.obs["perturbation"] == "ctrl").to_numpy()
-    ko1_mask = (filtered.obs["perturbation"] == "KO1").to_numpy()
-    matrix = filtered.X.toarray() if sp.issparse(filtered.X) else np.asarray(filtered.X)
-    ctrl = np.log1p(matrix[ctrl_mask, 0])
-    ko1 = np.log1p(matrix[ko1_mask, 0])
-    expected = ko1.mean() - ctrl.mean()
-    assert np.isclose(avg.loc["KO1", "gene0"], expected)
-    assert (tmp_path / "avg_effects_avg_log_effects.h5ad").exists()
-    assert (tmp_path / "pseudo_effects_pseudobulk_effects.h5ad").exists()
-
-
-def test_differential_expression_outputs(tmp_path):
-    path, _ = create_test_dataset(tmp_path)
-    qc_result = quality_control_summary(
-        path,
-        min_genes=1,
-        min_cells_per_perturbation=2,
-        min_cells_per_gene=1,
-        perturbation_column="perturbation",
-        control_label="ctrl",
-        gene_name_column="gene_symbol",
-        output_dir=tmp_path,
-        data_name="de",
-    )
     wald = wald_test(
         qc_result.filtered_path,
         perturbation_column="perturbation",
@@ -197,10 +175,27 @@ def test_differential_expression_outputs(tmp_path):
         output_dir=tmp_path,
         data_name="wilcoxon",
     )
+
+    assert set(avg.index) == {"KO1", "KO2"}
+    assert set(pseudo.index) == {"KO1", "KO2"}
     assert set(wald.keys()) == {"KO1", "KO2"}
     assert set(wilcoxon.keys()) == {"KO1", "KO2"}
+
+    filtered = ad.read_h5ad(qc_result.filtered_path)
+    ctrl_mask = (filtered.obs["perturbation"] == "ctrl").to_numpy()
+    ko1_mask = (filtered.obs["perturbation"] == "KO1").to_numpy()
+    normalised, _ = normalize_total_block(filtered.X)
+    log_block = np.log1p(normalised)
+    ctrl = log_block[ctrl_mask, 0]
+    ko1 = log_block[ko1_mask, 0]
+    expected = ko1.mean() - ctrl.mean()
+    assert np.isclose(avg.loc["KO1", "gene0"], expected)
+
+    assert (tmp_path / "avg_effects_avg_log_effects.h5ad").exists()
+    assert (tmp_path / "pseudo_effects_pseudobulk_effects.h5ad").exists()
     assert (tmp_path / "wald_wald_de.h5ad").exists()
     assert (tmp_path / "wilcoxon_wilcoxon_de.h5ad").exists()
+
     ko1_result = wald["KO1"]
     assert ko1_result.effect_size.shape[0] == 4
     assert ko1_result.method == "wald"
