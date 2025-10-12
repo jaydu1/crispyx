@@ -16,10 +16,11 @@ if str(SRC_PATH) not in sys.path:
 import numpy as np
 import pandas as pd
 import pytest
-import scanpy as sc
 from scipy.stats import mannwhitneyu, norm
 
 import anndata as ad
+
+sc = pytest.importorskip("scanpy", reason="scanpy is required for regression tests against the reference workflow")
 
 from streamlined_crispr.de import wald_test, wilcoxon_test
 from streamlined_crispr.pseudobulk import (
@@ -68,6 +69,9 @@ def test_average_log_expression_matches_scanpy(small_adata, tmp_path):
         output_dir=tmp_path,
     )
 
+    output_path = tmp_path / "small_avg_log_effects.h5ad"
+    assert output_path.exists()
+
     sc_adata = adata.copy()
     sc.pp.normalize_total(sc_adata, target_sum=1e4)
     sc.pp.log1p(sc_adata)
@@ -97,6 +101,9 @@ def test_pseudobulk_expression_matches_scanpy(small_adata, tmp_path):
         output_dir=tmp_path,
     )
 
+    output_path = tmp_path / "small_pseudobulk_effects.h5ad"
+    assert output_path.exists()
+
     sc_adata = adata.copy()
     sc.pp.normalize_total(sc_adata, target_sum=1e4)
 
@@ -124,6 +131,9 @@ def test_wald_test_matches_scanpy(small_adata, tmp_path):
         chunk_size=2,
         output_dir=tmp_path,
     )
+
+    output_path = tmp_path / "small_wald_de.h5ad"
+    assert output_path.exists()
 
     sc_adata = adata.copy()
     sc.pp.normalize_total(sc_adata, target_sum=1e4)
@@ -159,6 +169,7 @@ def test_wald_test_matches_scanpy(small_adata, tmp_path):
         np.testing.assert_allclose(result.effect_size, effect, rtol=1e-8, atol=1e-8)
         np.testing.assert_allclose(result.statistic, z, rtol=1e-8, atol=1e-8)
         np.testing.assert_allclose(result.pvalue, pvalue, rtol=1e-8, atol=1e-8)
+        assert result.result_path == output_path
 
 
 def test_wilcoxon_test_matches_scanpy(small_adata, tmp_path):
@@ -171,6 +182,9 @@ def test_wilcoxon_test_matches_scanpy(small_adata, tmp_path):
         chunk_size=2,
         output_dir=tmp_path,
     )
+
+    output_path = tmp_path / "small_wilcoxon_de.h5ad"
+    assert output_path.exists()
 
     sc_adata = adata.copy()
     sc.pp.normalize_total(sc_adata, target_sum=1e4)
@@ -200,3 +214,4 @@ def test_wilcoxon_test_matches_scanpy(small_adata, tmp_path):
         np.testing.assert_allclose(result.statistic, stats, rtol=1e-8, atol=1e-8)
         np.testing.assert_allclose(result.pvalue, pvals, rtol=1e-8, atol=1e-8)
         np.testing.assert_allclose(result.effect_size, effects, rtol=1e-8, atol=1e-8)
+        assert result.result_path == output_path

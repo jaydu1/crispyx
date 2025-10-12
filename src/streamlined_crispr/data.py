@@ -42,15 +42,16 @@ def ensure_gene_symbol_column(
     """Return a vector of gene symbols and verify they look like symbols, not Ensembl IDs."""
 
     if gene_name_column is None:
-        names = adata.var_names
+        raw_names = adata.var_names
     else:
         if gene_name_column not in adata.var.columns:
             raise KeyError(
                 f"Gene name column '{gene_name_column}' was not found in adata.var. Available columns: {list(adata.var.columns)}"
             )
-        names = adata.var[gene_name_column].astype(str)
+        raw_names = adata.var[gene_name_column]
+    names = pd.Index(raw_names).astype(str)
     _validate_gene_symbols(names)
-    return pd.Index(names)
+    return names
 
 
 def _validate_gene_symbols(names: Sequence[str]) -> None:
@@ -181,6 +182,8 @@ def write_filtered_subset(
     try:
         obs = backed.obs.iloc[cell_mask].copy()
         var = backed.var.iloc[gene_mask].copy()
+        obs.index = obs.index.astype(str)
+        var.index = var.index.astype(str)
         if var_assignments:
             for key, values in var_assignments.items():
                 if len(values) != var.shape[0]:

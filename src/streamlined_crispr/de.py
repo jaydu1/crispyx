@@ -137,6 +137,8 @@ def wald_test(
             result_path=Path(),  # placeholder updated after writing file
         )
 
+    gene_symbols = pd.Index(gene_symbols).astype(str)
+
     if effect_matrix:
         effect_arr = np.vstack(effect_matrix)
         stat_arr = np.vstack(statistic_matrix)
@@ -146,7 +148,8 @@ def wald_test(
         stat_arr = np.zeros_like(effect_arr)
         p_arr = np.zeros_like(effect_arr)
 
-    obs = pd.DataFrame({perturbation_column: candidates}, index=pd.Index(candidates, name="perturbation"))
+    obs_index = pd.Index(candidates, name="perturbation").astype(str)
+    obs = pd.DataFrame({perturbation_column: obs_index.to_list()}, index=obs_index)
     var = pd.DataFrame(index=gene_symbols)
     adata = ad.AnnData(effect_arr, obs=obs, var=var)
     adata.layers["z_score"] = stat_arr
@@ -240,7 +243,9 @@ def wilcoxon_test(
     finally:
         backed.file.close()
 
-    obs = pd.DataFrame({perturbation_column: candidates}, index=pd.Index(candidates, name="perturbation"))
+    gene_symbols = pd.Index(gene_symbols).astype(str)
+    obs_index = pd.Index(candidates, name="perturbation").astype(str)
+    obs = pd.DataFrame({perturbation_column: obs_index.to_list()}, index=obs_index)
     var = pd.DataFrame(index=gene_symbols)
     adata = ad.AnnData(effect_matrix, obs=obs, var=var)
     adata.layers["u_statistic"] = stat_matrix

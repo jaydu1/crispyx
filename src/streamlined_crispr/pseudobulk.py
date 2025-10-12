@@ -86,9 +86,11 @@ def compute_average_log_expression(
         return pd.DataFrame(columns=gene_symbols, dtype=float)
 
     effect_matrix_np = np.vstack(effect_matrix)
+    gene_symbols = pd.Index(gene_symbols).astype(str)
     effect_df = pd.DataFrame(effect_matrix_np, index=candidates, columns=gene_symbols)
 
-    obs = pd.DataFrame({perturbation_column: candidates}, index=pd.Index(candidates, name="perturbation"))
+    obs_index = pd.Index(candidates, name="perturbation").astype(str)
+    obs = pd.DataFrame({perturbation_column: obs_index.to_list()}, index=obs_index)
     var = pd.DataFrame(index=gene_symbols)
     adata = ad.AnnData(effect_matrix_np, obs=obs, var=var)
     adata.layers["perturbation_mean"] = np.vstack(pert_means)
@@ -158,9 +160,11 @@ def compute_pseudobulk_expression(
         return pd.DataFrame(columns=gene_symbols, dtype=float)
 
     effect_matrix_np = np.vstack(effect_matrix)
+    gene_symbols = pd.Index(gene_symbols).astype(str)
     effect_df = pd.DataFrame(effect_matrix_np, index=candidates, columns=gene_symbols)
 
-    obs = pd.DataFrame({perturbation_column: candidates}, index=pd.Index(candidates, name="perturbation"))
+    obs_index = pd.Index(candidates, name="perturbation").astype(str)
+    obs = pd.DataFrame({perturbation_column: obs_index.to_list()}, index=obs_index)
     var = pd.DataFrame(index=gene_symbols)
     adata = ad.AnnData(effect_matrix_np, obs=obs, var=var)
     adata.layers["perturbation_bulk"] = np.vstack(pert_bulks)
