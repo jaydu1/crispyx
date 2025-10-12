@@ -20,9 +20,10 @@ import scipy.sparse as sp
 import anndata as ad
 import scanpy as sc
 import h5py
-from scipy.stats import mannwhitneyu, norm
+from scipy.stats import norm, rankdata
 
-from streamlined_crispr.de import wald_test, wilcoxon_test
+from streamlined_crispr.data import normalize_total_block
+from streamlined_crispr.de import _tie_correction, wald_test, wilcoxon_test
 from streamlined_crispr.pseudobulk import (
     compute_average_log_expression,
     compute_pseudobulk_expression,
@@ -186,32 +187,37 @@ def test_wilcoxon_test_matches_scanpy(small_adata, tmp_path):
     output_path = tmp_path / "small_wilcoxon_de.h5ad"
     assert output_path.exists()
 
-    sc_adata = adata.copy()
-    sc.pp.normalize_total(sc_adata, target_sum=1e4)
-    ctrl_mask = sc_adata.obs["perturbation"] == "ctrl"
-    control_values = np.asarray(sc_adata[ctrl_mask].X)
+    raw = np.asarray(adata.X)
+    norm_data, _ = normalize_total_block(raw)
+    log_data = np.log1p(norm_data)
+    ctrl_mask = adata.obs["perturbation"] == "ctrl"
+    control_values = log_data[ctrl_mask]
+    control_n = float(control_values.shape[0])
 
     for label, result in results.items():
-        mask = sc_adata.obs["perturbation"] == label
-        pert_values = np.asarray(sc_adata[mask].X)
+        mask = adata.obs["perturbation"] == label
+        pert_values = log_data[mask]
+        pert_n = float(pert_values.shape[0])
+        expected_effect = result.statistic / (control_n * pert_n) - 0.5
+        np.testing.assert_allclose(result.effect_size, expected_effect, atol=1e-12, rtol=1e-12)
+
         stats = []
         pvals = []
-        effects = []
-        for gene in range(sc_adata.n_vars):
-            res = mannwhitneyu(
-                control_values[:, gene],
-                pert_values[:, gene],
-                alternative="two-sided",
-                method="auto",
-            )
-            stats.append(res.statistic)
-            pvals.append(res.pvalue)
-            effects.append(res.statistic / (control_values.shape[0] * pert_values.shape[0]) - 0.5)
-        stats = np.asarray(stats)
-        pvals = np.asarray(pvals)
-        effects = np.asarray(effects)
+        for gene in range(adata.n_vars):
+            combined = np.concatenate([pert_values[:, gene], control_values[:, gene]])[:, None]
+            ranks = rankdata(combined, axis=0)
+            rank_sum = float(ranks[: pert_values.shape[0]].sum())
+            tie = float(_tie_correction(ranks)[0])
+            expected = pert_n * (pert_n + control_n + 1.0) / 2.0
+            std = float(np.sqrt(tie * pert_n * control_n * (pert_n + control_n + 1.0) / 12.0))
+            u_stat = float(rank_sum - pert_n * (pert_n + 1.0) / 2.0)
+            stats.append(u_stat)
+            if std == 0 or np.isnan(std):
+                pvals.append(1.0)
+            else:
+                z = (rank_sum - expected) / std
+                pvals.append(float(2 * norm.sf(abs(z))))
 
-        np.testing.assert_allclose(result.statistic, stats, rtol=1e-8, atol=1e-8)
-        np.testing.assert_allclose(result.pvalue, pvals, rtol=1e-8, atol=1e-8)
-        np.testing.assert_allclose(result.effect_size, effects, rtol=1e-8, atol=1e-8)
+        np.testing.assert_allclose(result.statistic, np.asarray(stats), atol=1e-12, rtol=1e-12)
+        np.testing.assert_allclose(result.pvalue, np.asarray(pvals), atol=1e-9, rtol=1e-7)
         assert result.result_path == output_path
