@@ -42,10 +42,29 @@ def subset_dataset(tmp_path_factory):
 
     adata = sc.read_h5ad(DATA_PATH)
     # Work on a small but representative subset to keep the test quick.
-    obs_slice = slice(0, min(200, adata.n_obs))
+    n_obs = min(200, adata.n_obs)
+    if n_obs < adata.n_obs:
+        rng = np.random.default_rng(0)
+        obs_indices = np.sort(rng.choice(adata.n_obs, size=n_obs, replace=False))
+    else:
+        obs_indices = np.arange(n_obs)
     var_slice = slice(0, min(500, adata.n_vars))
-    subset = adata[obs_slice, var_slice].copy()
-    subset.obs[PERTURBATION_COLUMN] = subset.obs["Batch"].astype(str)
+    subset = adata[obs_indices, var_slice].copy()
+
+    if "Batch" in subset.obs:
+        perturbation_source = subset.obs["Batch"]
+    elif "batch" in subset.obs:
+        perturbation_source = subset.obs["batch"]
+    elif "perturbation" in subset.obs:
+        perturbation_source = subset.obs["perturbation"]
+    else:
+        available = ", ".join(subset.obs.columns)
+        raise KeyError(
+            "No column available to derive perturbation labels. "
+            f"Available columns: {available}"
+        )
+
+    subset.obs[PERTURBATION_COLUMN] = perturbation_source.astype(str)
     control_label = subset.obs[PERTURBATION_COLUMN].value_counts().idxmax()
     subset_path = tmp_path_factory.mktemp("scanpy_parity") / "subset.h5ad"
     subset.write(subset_path)
