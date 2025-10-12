@@ -1,16 +1,29 @@
 from __future__ import annotations
 
 import sys
+from importlib import import_module
 from pathlib import Path
-
-import numpy as np
-import pandas as pd
-import anndata as ad
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SRC_PATH = PROJECT_ROOT / "src"
 if str(SRC_PATH) not in sys.path:
     sys.path.insert(0, str(SRC_PATH))
+
+
+def _require(module_name: str):
+    try:
+        return import_module(module_name)
+    except ModuleNotFoundError as exc:  # pragma: no cover - defensive branch
+        raise RuntimeError(
+            f"Missing dependency '{module_name}'. Install project test extras via 'pip install .[test]'"
+        ) from exc
+
+
+np = _require("numpy")
+pd = _require("pandas")
+ad = _require("anndata")
+sp = _require("scipy.sparse")
+h5py = _require("h5py")
 
 from streamlined_crispr import (
     compute_average_log_expression,
@@ -42,6 +55,14 @@ def create_test_dataset(tmp_path):
     return path, adata
 
 
+def create_sparse_test_dataset(tmp_path):
+    dense_path, dense = create_test_dataset(tmp_path)
+    sparse = ad.AnnData(sp.csr_matrix(dense.X), obs=dense.obs.copy(), var=dense.var.copy())
+    sparse_path = tmp_path / "test_sparse.h5ad"
+    sparse.write(sparse_path)
+    return sparse_path, sparse
+
+
 def test_quality_control_writes_filtered_dataset(tmp_path):
     path, adata = create_test_dataset(tmp_path)
     result = quality_control_summary(
@@ -57,9 +78,29 @@ def test_quality_control_writes_filtered_dataset(tmp_path):
     )
     assert result.filtered_path.exists()
     filtered = ad.read_h5ad(result.filtered_path)
-    assert filtered.n_obs == adata.n_obs
-    assert filtered.n_vars == adata.n_vars
+    assert filtered.n_obs == int(result.cell_mask.sum())
+    assert filtered.n_vars == int(result.gene_mask.sum())
     assert filtered.var["gene_symbols"].tolist() == adata.var["gene_symbol"].tolist()
+
+
+def test_quality_control_sparse_roundtrip(tmp_path):
+    path, adata = create_sparse_test_dataset(tmp_path)
+    result = quality_control_summary(
+        path,
+        min_genes=1,
+        min_cells_per_perturbation=2,
+        min_cells_per_gene=1,
+        perturbation_column="perturbation",
+        control_label="ctrl",
+        gene_name_column="gene_symbol",
+        output_dir=tmp_path,
+        data_name="qc_sparse",
+    )
+    filtered = ad.read_h5ad(result.filtered_path)
+    expected = adata[result.cell_mask, result.gene_mask]
+    np.testing.assert_array_equal(filtered.X.toarray(), expected.X.toarray())
+    with h5py.File(result.filtered_path) as handle:
+        assert handle["X"].attrs["encoding-type"] == b"csr_matrix"
 
 
 def test_gene_symbol_validation(tmp_path):
@@ -115,10 +156,12 @@ def test_pseudobulk_outputs_and_files(tmp_path):
     )
     assert set(avg.index) == {"KO1", "KO2"}
     assert set(pseudo.index) == {"KO1", "KO2"}
-    ctrl_mask = adata.obs["perturbation"] == "ctrl"
-    ko1_mask = adata.obs["perturbation"] == "KO1"
-    ctrl = np.log1p(adata.X[ctrl_mask, 0])
-    ko1 = np.log1p(adata.X[ko1_mask, 0])
+    filtered = ad.read_h5ad(qc_result.filtered_path)
+    ctrl_mask = (filtered.obs["perturbation"] == "ctrl").to_numpy()
+    ko1_mask = (filtered.obs["perturbation"] == "KO1").to_numpy()
+    matrix = filtered.X.toarray() if sp.issparse(filtered.X) else np.asarray(filtered.X)
+    ctrl = np.log1p(matrix[ctrl_mask, 0])
+    ko1 = np.log1p(matrix[ko1_mask, 0])
     expected = ko1.mean() - ctrl.mean()
     assert np.isclose(avg.loc["KO1", "gene0"], expected)
     assert (tmp_path / "avg_effects_avg_log_effects.h5ad").exists()
