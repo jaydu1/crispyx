@@ -5,10 +5,12 @@ from importlib import import_module
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 SRC_PATH = PROJECT_ROOT / "src"
 if str(SRC_PATH) not in sys.path:
     sys.path.insert(0, str(SRC_PATH))
-
 
 def _require(module_name: str):
     try:
@@ -65,6 +67,20 @@ def create_sparse_test_dataset(tmp_path):
     sparse_path = tmp_path / "test_sparse.h5ad"
     sparse.write(sparse_path)
     return sparse_path, sparse
+
+
+def _normalize_total(matrix: np.ndarray, *, target_sum: float = 1e4) -> np.ndarray:
+    """Replicate the package's library-size normalisation."""
+
+    matrix = np.asarray(matrix, dtype=float)
+    library_size = matrix.sum(axis=1, keepdims=True)
+    scale = np.divide(
+        float(target_sum),
+        library_size,
+        out=np.zeros_like(library_size, dtype=float),
+        where=library_size > 0,
+    )
+    return matrix * scale
 
 
 def test_quality_control_writes_filtered_dataset(tmp_path):
