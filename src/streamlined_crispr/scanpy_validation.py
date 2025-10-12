@@ -11,8 +11,15 @@ import time
 import anndata as ad
 import numpy as np
 import pandas as pd
+from scipy.stats import mannwhitneyu, norm
 
-from .data import iter_matrix_chunks, normalize_total_block, read_backed
+from .data import (
+    ensure_gene_symbol_column,
+    iter_matrix_chunks,
+    normalize_total_block,
+    read_backed,
+)
+from .de import wald_test, wilcoxon_test
 from .pseudobulk import compute_average_log_expression, compute_pseudobulk_expression
 from .qc import quality_control_summary
 
@@ -29,6 +36,12 @@ class ComparisonResult:
     reference_gene_count: int
     avg_log_effect_max_abs_diff: float
     pseudobulk_effect_max_abs_diff: float
+    wald_effect_max_abs_diff: float
+    wald_statistic_max_abs_diff: float
+    wald_pvalue_max_abs_diff: float
+    wilcoxon_effect_max_abs_diff: float
+    wilcoxon_statistic_max_abs_diff: float
+    wilcoxon_pvalue_max_abs_diff: float
     streamlined_timings: Mapping[str, float]
     reference_timings: Mapping[str, float]
     streamlined_effects: Mapping[str, pd.DataFrame]
@@ -106,6 +119,139 @@ def _align_frames(left: pd.DataFrame, right: pd.DataFrame) -> tuple[pd.DataFrame
     )
 
 
+def _resolve_reference_candidates(
+    labels: np.ndarray,
+    control_label: str,
+    perturbations: Optional[Iterable[str]],
+) -> list[str]:
+    if perturbations is None:
+        unique = pd.Index(labels).unique().tolist()
+    else:
+        unique = [str(p) for p in perturbations]
+    candidates = [label for label in unique if label != control_label]
+    if not candidates:
+        raise ValueError(
+            "No perturbation groups available for differential expression testing"
+        )
+    return candidates
+
+
+def _compute_reference_wald(
+    adata: ad.AnnData,
+    *,
+    perturbation_column: str,
+    control_label: str,
+    gene_name_column: str | None,
+    perturbations: Optional[Iterable[str]],
+    min_cells_expressed: int,
+) -> Dict[str, Dict[str, np.ndarray]]:
+    labels = adata.obs[perturbation_column].astype(str).to_numpy()
+    candidates = _resolve_reference_candidates(labels, control_label, perturbations)
+    gene_symbols = ensure_gene_symbol_column(adata, gene_name_column)
+
+    log_matrix = np.asarray(adata.X, dtype=np.float64)
+    norm_matrix = np.asarray(adata.layers["normalized_counts"], dtype=np.float64)
+
+    control_mask = labels == control_label
+    control_n = int(control_mask.sum())
+    if control_n == 0:
+        raise ValueError("Control group contains no cells")
+
+    control_log = log_matrix[control_mask]
+    control_mean = control_log.mean(axis=0)
+    control_var = np.zeros_like(control_mean)
+    if control_n > 1:
+        control_var = control_log.var(axis=0, ddof=1)
+    control_var = np.clip(control_var, a_min=0, a_max=None)
+
+    control_expr = np.count_nonzero(norm_matrix[control_mask], axis=0)
+
+    results: Dict[str, Dict[str, np.ndarray]] = {}
+    for label in candidates:
+        mask = labels == label
+        n_cells = int(mask.sum())
+        if n_cells == 0:
+            raise ValueError(f"Perturbation '{label}' contains no cells")
+        group_log = log_matrix[mask]
+        group_mean = group_log.mean(axis=0)
+        group_var = np.zeros_like(group_mean)
+        if n_cells > 1:
+            group_var = group_log.var(axis=0, ddof=1)
+        group_var = np.clip(group_var, a_min=0, a_max=None)
+        effect = group_mean - control_mean
+        se = np.sqrt(control_var / control_n + group_var / n_cells)
+        expr_group = np.count_nonzero(norm_matrix[mask], axis=0)
+        total_expr = control_expr + expr_group
+        valid = (se > 0) & (total_expr >= min_cells_expressed)
+        z = np.zeros_like(effect)
+        pvalue = np.ones_like(effect)
+        if np.any(valid):
+            z[valid] = effect[valid] / se[valid]
+            pvalue[valid] = 2 * norm.sf(np.abs(z[valid]))
+        results[label] = {
+            "genes": gene_symbols,
+            "effect": effect,
+            "statistic": z,
+            "pvalue": pvalue,
+        }
+    return results
+
+
+def _compute_reference_wilcoxon(
+    adata: ad.AnnData,
+    *,
+    perturbation_column: str,
+    control_label: str,
+    gene_name_column: str | None,
+    perturbations: Optional[Iterable[str]],
+    min_cells_expressed: int,
+) -> Dict[str, Dict[str, np.ndarray]]:
+    labels = adata.obs[perturbation_column].astype(str).to_numpy()
+    candidates = _resolve_reference_candidates(labels, control_label, perturbations)
+    gene_symbols = ensure_gene_symbol_column(adata, gene_name_column)
+
+    norm_matrix = np.asarray(adata.layers["normalized_counts"], dtype=np.float64)
+    control_mask = labels == control_label
+    control_n = int(control_mask.sum())
+    if control_n == 0:
+        raise ValueError("Control group contains no cells")
+    control_values = norm_matrix[control_mask]
+    control_expr = np.count_nonzero(control_values, axis=0)
+
+    results: Dict[str, Dict[str, np.ndarray]] = {}
+    for label in candidates:
+        mask = labels == label
+        n_cells = int(mask.sum())
+        if n_cells == 0:
+            raise ValueError(f"Perturbation '{label}' contains no cells")
+        pert_values = norm_matrix[mask]
+        pert_expr = np.count_nonzero(pert_values, axis=0)
+        total_expr = control_expr + pert_expr
+
+        effect = np.zeros(adata.n_vars, dtype=np.float64)
+        stat = np.zeros_like(effect)
+        pvalue = np.ones_like(effect)
+        for gene_idx in range(adata.n_vars):
+            if total_expr[gene_idx] < min_cells_expressed:
+                continue
+            res = mannwhitneyu(
+                control_values[:, gene_idx],
+                pert_values[:, gene_idx],
+                alternative="two-sided",
+                method="auto",
+            )
+            stat[gene_idx] = res.statistic
+            pvalue[gene_idx] = res.pvalue
+            effect[gene_idx] = res.statistic / (control_n * n_cells) - 0.5
+        results[label] = {
+            "genes": gene_symbols,
+            "effect": effect,
+            "statistic": stat,
+            "pvalue": pvalue,
+        }
+    return results
+
+
 def compare_with_scanpy(
     path: str | Path,
     *,
@@ -127,6 +273,7 @@ def compare_with_scanpy(
 
     timings_streamlined: Dict[str, float] = {}
     timings_reference: Dict[str, float] = {}
+    de_min_cells_expressed = 0
 
     raw = _load_dense(path)
     reference_norm = raw.copy()
@@ -206,6 +353,34 @@ def compare_with_scanpy(
     )
     timings_streamlined["pseudobulk_expression"] = time.perf_counter() - t0
 
+    t0 = time.perf_counter()
+    wald_results = wald_test(
+        qc_result.filtered_path,
+        perturbation_column=perturbation_column,
+        control_label=control_label,
+        gene_name_column=gene_name_column,
+        perturbations=perturbations,
+        min_cells_expressed=de_min_cells_expressed,
+        chunk_size=chunk_size,
+        output_dir=output_dir,
+        data_name=data_name,
+    )
+    timings_streamlined["wald_test"] = time.perf_counter() - t0
+
+    t0 = time.perf_counter()
+    wilcoxon_results = wilcoxon_test(
+        qc_result.filtered_path,
+        perturbation_column=perturbation_column,
+        control_label=control_label,
+        gene_name_column=gene_name_column,
+        perturbations=perturbations,
+        min_cells_expressed=de_min_cells_expressed,
+        chunk_size=chunk_size,
+        output_dir=output_dir,
+        data_name=data_name,
+    )
+    timings_streamlined["wilcoxon_test"] = time.perf_counter() - t0
+
     # Reference QC and effect estimation (Scanpy-style)
     reference_filtered = raw.copy()
     t0 = time.perf_counter()
@@ -240,6 +415,28 @@ def compare_with_scanpy(
         baseline_count=baseline_count,
     )
 
+    t0 = time.perf_counter()
+    reference_wald = _compute_reference_wald(
+        reference_filtered,
+        perturbation_column=perturbation_column,
+        control_label=control_label,
+        gene_name_column=gene_name_column,
+        perturbations=perturbations,
+        min_cells_expressed=de_min_cells_expressed,
+    )
+    timings_reference["wald_test"] = time.perf_counter() - t0
+
+    t0 = time.perf_counter()
+    reference_wilcoxon = _compute_reference_wilcoxon(
+        reference_filtered,
+        perturbation_column=perturbation_column,
+        control_label=control_label,
+        gene_name_column=gene_name_column,
+        perturbations=perturbations,
+        min_cells_expressed=de_min_cells_expressed,
+    )
+    timings_reference["wilcoxon_test"] = time.perf_counter() - t0
+
     aligned_avg, aligned_ref_avg = _align_frames(avg_log_effects, reference_avg)
     aligned_pseudo, aligned_ref_pseudo = _align_frames(
         pseudobulk_effects, reference_pseudo
@@ -248,6 +445,49 @@ def compare_with_scanpy(
     avg_diff = float(np.max(np.abs(aligned_avg.to_numpy() - aligned_ref_avg.to_numpy())))
     pseudo_diff = float(
         np.max(np.abs(aligned_pseudo.to_numpy() - aligned_ref_pseudo.to_numpy()))
+    )
+
+    def _max_abs_diff_from_results(
+        stream_dict: Mapping[str, object],
+        reference_dict: Dict[str, Dict[str, np.ndarray]],
+        stream_attr: str,
+        reference_key: str,
+    ) -> float:
+        max_diff = 0.0
+        for label, stream_result in stream_dict.items():
+            if label not in reference_dict:
+                continue
+            ref_result = reference_dict[label]
+            stream_series = pd.Series(
+                getattr(stream_result, stream_attr), index=stream_result.genes
+            )
+            ref_series = pd.Series(ref_result[reference_key], index=ref_result["genes"])
+            aligned_stream, aligned_ref = stream_series.align(ref_series)
+            if aligned_stream.empty:
+                continue
+            diff = float(
+                np.max(np.abs(aligned_stream.to_numpy() - aligned_ref.to_numpy()))
+            )
+            max_diff = max(max_diff, diff)
+        return max_diff
+
+    wald_effect_diff = _max_abs_diff_from_results(
+        wald_results, reference_wald, "effect_size", "effect"
+    )
+    wald_stat_diff = _max_abs_diff_from_results(
+        wald_results, reference_wald, "statistic", "statistic"
+    )
+    wald_pvalue_diff = _max_abs_diff_from_results(
+        wald_results, reference_wald, "pvalue", "pvalue"
+    )
+    wilcoxon_effect_diff = _max_abs_diff_from_results(
+        wilcoxon_results, reference_wilcoxon, "effect_size", "effect"
+    )
+    wilcoxon_stat_diff = _max_abs_diff_from_results(
+        wilcoxon_results, reference_wilcoxon, "statistic", "statistic"
+    )
+    wilcoxon_pvalue_diff = _max_abs_diff_from_results(
+        wilcoxon_results, reference_wilcoxon, "pvalue", "pvalue"
     )
 
     return ComparisonResult(
@@ -259,6 +499,12 @@ def compare_with_scanpy(
         reference_gene_count=reference_filtered.n_vars,
         avg_log_effect_max_abs_diff=avg_diff,
         pseudobulk_effect_max_abs_diff=pseudo_diff,
+        wald_effect_max_abs_diff=wald_effect_diff,
+        wald_statistic_max_abs_diff=wald_stat_diff,
+        wald_pvalue_max_abs_diff=wald_pvalue_diff,
+        wilcoxon_effect_max_abs_diff=wilcoxon_effect_diff,
+        wilcoxon_statistic_max_abs_diff=wilcoxon_stat_diff,
+        wilcoxon_pvalue_max_abs_diff=wilcoxon_pvalue_diff,
         streamlined_timings=timings_streamlined,
         reference_timings=timings_reference,
         streamlined_effects={
