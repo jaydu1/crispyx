@@ -27,7 +27,7 @@ from streamlined_crispr import (
 )
 from streamlined_crispr.data import iter_matrix_chunks, normalize_total_block
 
-DATA_PATH = Path(__file__).resolve().parents[1] / "data" / "Feng_gw_f-keui_1.h5ad"
+DATA_PATH = Path(__file__).resolve().parents[1] / "data" / "Adamson_subset.h5ad"
 PERTURBATION_COLUMN = "batch_group"
 MIN_GENES = 100
 MIN_CELLS_PER_PERTURBATION = 15

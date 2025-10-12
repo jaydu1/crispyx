@@ -13,14 +13,14 @@ SRC_PATH = PROJECT_ROOT / "src"
 if str(SRC_PATH) not in sys.path:
     sys.path.insert(0, str(SRC_PATH))
     
+import pytest
 import numpy as np
 import pandas as pd
-import pytest
-from scipy.stats import mannwhitneyu, norm
-
+import scipy.sparse as sp
 import anndata as ad
-
-sc = pytest.importorskip("scanpy", reason="scanpy is required for regression tests against the reference workflow")
+import scanpy as sc
+import h5py
+from scipy.stats import mannwhitneyu, norm
 
 from streamlined_crispr.de import wald_test, wilcoxon_test
 from streamlined_crispr.pseudobulk import (

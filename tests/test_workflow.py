@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import sys
-from importlib import import_module
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -12,20 +11,12 @@ SRC_PATH = PROJECT_ROOT / "src"
 if str(SRC_PATH) not in sys.path:
     sys.path.insert(0, str(SRC_PATH))
 
-def _require(module_name: str):
-    try:
-        return import_module(module_name)
-    except ModuleNotFoundError as exc:  # pragma: no cover - defensive branch
-        raise RuntimeError(
-            f"Missing dependency '{module_name}'. Install project test extras via 'pip install .[test]'"
-        ) from exc
-
-
-np = _require("numpy")
-pd = _require("pandas")
-ad = _require("anndata")
-sp = _require("scipy.sparse")
-h5py = _require("h5py")
+import numpy as np
+import pandas as pd
+import scipy.sparse as sp
+import anndata as ad
+import scanpy as sc
+import h5py
 
 from streamlined_crispr import (
     compute_average_log_expression,
