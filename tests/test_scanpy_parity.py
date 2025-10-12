@@ -3,12 +3,6 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-import numpy as np
-import pandas as pd
-import pytest
-import scipy.sparse as sp
-from scipy.stats import mannwhitneyu, norm
-
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
@@ -17,14 +11,12 @@ SRC_PATH = PROJECT_ROOT / "src"
 if str(SRC_PATH) not in sys.path:
     sys.path.insert(0, str(SRC_PATH))
 
-pytest.importorskip("scanpy")
-import scanpy as sc  # noqa: E402  (import after importorskip)
-
-SC_MODULE_PATH = Path(sc.__file__).resolve()
-if PROJECT_ROOT in SC_MODULE_PATH.parents:
-    pytest.skip(
-        "scanpy must be provided by the execution environment; in-repo shims are unsupported"
-    )
+import numpy as np
+import pandas as pd
+import pytest
+import scipy.sparse as sp
+from scipy.stats import mannwhitneyu, norm
+import scanpy as sc
 
 from streamlined_crispr import (
     compute_average_log_expression,
