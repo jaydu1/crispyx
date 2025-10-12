@@ -20,6 +20,7 @@ test = [
     "numpy>=1.23",
     "pandas>=1.5",
     "scipy>=1.10",
+    "scanpy>=1.9",
     "pytest",
 ]
 

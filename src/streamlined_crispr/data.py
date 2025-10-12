@@ -98,6 +98,56 @@ def _to_dense(matrix: np.ndarray) -> np.ndarray:
     return np.asarray(matrix)
 
 
+def normalize_total_block(
+    block: np.ndarray | sp.spmatrix,
+    *,
+    library_size: np.ndarray | None = None,
+    target_sum: float = 1e4,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return a library-size normalised dense view of ``block``.
+
+    Parameters
+    ----------
+    block:
+        A slice of the expression matrix with shape ``(n_cells, n_genes)``.
+    library_size:
+        Optional precomputed library sizes for the cells in ``block``. When
+        ``None`` the library size is computed from ``block`` directly.
+    target_sum:
+        Target total counts per cell after normalisation, matching the default
+        used by :func:`scanpy.pp.normalize_total`.
+
+    Returns
+    -------
+    tuple
+        A tuple ``(normalised, library_size)`` where ``normalised`` is a dense
+        ``float64`` array containing the normalised counts and ``library_size``
+        contains the per-cell library sizes that were used.
+    """
+
+    dense = _to_dense(block).astype(np.float64, copy=True)
+    if dense.ndim != 2:
+        raise ValueError("block must be two-dimensional")
+
+    if library_size is None:
+        library_size = dense.sum(axis=1)
+    else:
+        library_size = np.asarray(library_size, dtype=np.float64)
+        if library_size.shape[0] != dense.shape[0]:
+            raise ValueError(
+                "library_size length does not match the number of cells in block"
+            )
+
+    scale = np.divide(
+        float(target_sum),
+        library_size,
+        out=np.zeros_like(library_size, dtype=np.float64),
+        where=library_size > 0,
+    )
+    dense *= scale[:, None]
+    return dense, library_size
+
+
 def _ensure_csr(matrix: np.ndarray | sp.spmatrix, *, dtype: np.dtype | None = None) -> sp.csr_matrix:
     """Convert the provided matrix to CSR format."""
 

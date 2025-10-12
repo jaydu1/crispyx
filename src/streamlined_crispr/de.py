@@ -11,7 +11,13 @@ import numpy as np
 import pandas as pd
 from scipy.stats import mannwhitneyu, norm
 
-from .data import ensure_gene_symbol_column, iter_matrix_chunks, read_backed, resolve_output_path
+from .data import (
+    ensure_gene_symbol_column,
+    iter_matrix_chunks,
+    normalize_total_block,
+    read_backed,
+    resolve_output_path,
+)
 
 
 @dataclass
@@ -71,7 +77,9 @@ def wald_test(
         expr_counts = {label: np.zeros(n_genes, dtype=np.int64) for label in groups}
         for slc, block in iter_matrix_chunks(backed, axis=0, chunk_size=chunk_size):
             slice_labels = labels[slc]
-            log_block = np.log1p(block)
+            normalised_block, _ = normalize_total_block(block)
+            raw_block = np.asarray(block)
+            log_block = np.log1p(normalised_block)
             for label in groups:
                 mask = slice_labels == label
                 if not np.any(mask):
@@ -80,7 +88,7 @@ def wald_test(
                 counts[label] += int(mask.sum())
                 sums[label] += selected.sum(axis=0)
                 sumsq[label] += np.square(selected).sum(axis=0)
-                expr_counts[label] += np.asarray((block[mask] > 0).sum(axis=0)).ravel()
+                expr_counts[label] += np.asarray((raw_block[mask] > 0).sum(axis=0)).ravel()
     finally:
         backed.file.close()
 
@@ -195,14 +203,24 @@ def wilcoxon_test(
 
     backed = read_backed(path)
     try:
+        library_sizes = np.zeros(backed.n_obs, dtype=np.float64)
+        for slc, block in iter_matrix_chunks(backed, axis=0, chunk_size=chunk_size):
+            _, lib = normalize_total_block(block)
+            library_sizes[slc] = lib
+    finally:
+        backed.file.close()
+
+    backed = read_backed(path)
+    try:
         labels = backed.obs[perturbation_column].astype(str).to_numpy()
         control_mask = labels == control_label
         pert_masks = {label: labels == label for label in candidates}
         for slc, block in iter_matrix_chunks(backed, axis=1, chunk_size=chunk_size):
-            control_values = block[control_mask, :]
+            normalised_block, _ = normalize_total_block(block, library_size=library_sizes)
+            control_values = normalised_block[control_mask, :]
             control_expr = np.count_nonzero(control_values, axis=0)
             for idx, label in enumerate(candidates):
-                pert_values = block[pert_masks[label], :]
+                pert_values = normalised_block[pert_masks[label], :]
                 pert_expr = np.count_nonzero(pert_values, axis=0)
                 total_expr = control_expr + pert_expr
                 for local, gene_idx in enumerate(range(slc.start, slc.stop)):
