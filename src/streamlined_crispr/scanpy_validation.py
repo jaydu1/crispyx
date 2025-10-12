@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
+import importlib
+import multiprocessing as mp
+import traceback
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, Mapping, Optional
 
+import resource
+import sys
 import time
 
 import anndata as ad
@@ -42,10 +47,36 @@ class ComparisonResult:
     wilcoxon_effect_max_abs_diff: float
     wilcoxon_statistic_max_abs_diff: float
     wilcoxon_pvalue_max_abs_diff: float
+    streamlined_peak_memory_mb: float
+    reference_peak_memory_mb: float
     streamlined_timings: Mapping[str, float]
     reference_timings: Mapping[str, float]
     streamlined_effects: Mapping[str, pd.DataFrame]
     reference_effects: Mapping[str, pd.DataFrame]
+
+
+@dataclass
+class _ReferenceComputationResult:
+    normalization_max_abs_diff: float
+    log1p_max_abs_diff: float
+    filtered_cell_count: int
+    filtered_gene_count: int
+    avg_log_effects: pd.DataFrame
+    pseudobulk_effects: pd.DataFrame
+    wald_results: Dict[str, Dict[str, np.ndarray]]
+    wilcoxon_results: Dict[str, Dict[str, np.ndarray]]
+    timings: Dict[str, float]
+    stream_chunk_timing: float
+    peak_memory_mb: float
+
+
+def _get_peak_memory_bytes() -> float:
+    """Return the current process peak RSS in bytes."""
+
+    usage = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    if sys.platform == "darwin":
+        return float(usage)
+    return float(usage) * 1024.0
 
 
 def _normalize_total(matrix: np.ndarray, target_sum: float = 1e4) -> tuple[np.ndarray, np.ndarray]:
@@ -72,6 +103,60 @@ def _filter_cells(matrix: np.ndarray, min_genes: int) -> np.ndarray:
 def _filter_genes(matrix: np.ndarray, min_cells: int) -> np.ndarray:
     expressed = (matrix > 0).sum(axis=0)
     return expressed >= min_cells
+
+
+def _get_peak_memory_mb() -> float:
+    """Return the current process peak RSS in megabytes."""
+
+    return _get_peak_memory_bytes() / (1024.0 * 1024.0)
+
+
+
+def _peak_memory_delta_mb(baseline_bytes: float) -> float:
+    return max(0.0, (_get_peak_memory_bytes() - baseline_bytes) / (1024.0 * 1024.0))
+
+
+
+def _subprocess_worker(pipe, func, args, kwargs):  # type: ignore[override]
+    try:
+        result = func(*args, **kwargs)
+    except Exception as exc:  # pragma: no cover - exercised in error paths
+        exc_type = exc.__class__
+        pipe.send(("error", exc_type.__module__, exc_type.__name__, exc.args, traceback.format_exc()))
+    else:
+        pipe.send(("ok", result))
+    finally:
+        pipe.close()
+
+
+
+def _run_in_subprocess(func, *args, **kwargs):
+    """Execute ``func`` in a fresh process and return its result."""
+
+    available = mp.get_all_start_methods()
+    method = 'fork' if 'fork' in available else 'spawn'
+    ctx = mp.get_context(method)
+    parent_conn, child_conn = ctx.Pipe(duplex=False)
+
+    process = ctx.Process(target=_subprocess_worker, args=(child_conn, func, args, kwargs))
+    process.start()
+    message = parent_conn.recv()
+    process.join()
+
+    status = message[0]
+    if status == 'ok':
+        return message[1]
+
+    _, module, name, exc_args, formatted = message
+    try:
+        exc_module = importlib.import_module(module)
+        exc_type = getattr(exc_module, name)
+    except Exception:  # pragma: no cover - defensive
+        raise RuntimeError(formatted)
+    raise exc_type(*exc_args)
+
+
+
 
 
 def _load_dense(path: Path) -> ad.AnnData:
@@ -263,6 +348,128 @@ def _compute_reference_wilcoxon(
 
     return results
 
+def _compute_reference_pipeline(
+    path: Path,
+    *,
+    perturbation_column: str,
+    control_label: str,
+    min_genes: int,
+    min_cells_per_perturbation: int,
+    min_cells_per_gene: int,
+    gene_name_column: str | None,
+    perturbations: Optional[Iterable[str]],
+    baseline_count: float,
+    chunk_size: int,
+    de_min_cells_expressed: int,
+) -> _ReferenceComputationResult:
+    baseline_bytes = _get_peak_memory_bytes()
+    timings_reference: Dict[str, float] = {}
+
+    raw = _load_dense(path)
+    reference_norm = raw.copy()
+
+    t0 = time.perf_counter()
+    normalised_matrix, _ = _normalize_total(reference_norm.X)
+    timings_reference["normalize_total"] = time.perf_counter() - t0
+    reference_norm.X = normalised_matrix
+
+    t0 = time.perf_counter()
+    log_matrix = _log1p(reference_norm.X)
+    timings_reference["log1p"] = time.perf_counter() - t0
+    reference_norm.X = log_matrix
+
+    max_norm_diff = 0.0
+    max_log_diff = 0.0
+    t0 = time.perf_counter()
+    backed = read_backed(path)
+    try:
+        for slc, block in iter_matrix_chunks(
+            backed, axis=0, chunk_size=chunk_size, convert_to_dense=False
+        ):
+            norm_block, _ = normalize_total_block(block)
+            max_norm_diff = max(
+                max_norm_diff, float(np.max(np.abs(norm_block - normalised_matrix[slc])))
+            )
+            log_block = np.log1p(norm_block)
+            max_log_diff = max(
+                max_log_diff, float(np.max(np.abs(log_block - log_matrix[slc])))
+            )
+    finally:
+        backed.file.close()
+    stream_chunk_timing = time.perf_counter() - t0
+
+    reference_filtered = raw.copy()
+    t0 = time.perf_counter()
+    cell_mask = _filter_cells(reference_filtered.X, min_genes=min_genes)
+    timings_reference["filter_cells"] = time.perf_counter() - t0
+    reference_filtered = reference_filtered[cell_mask].copy()
+
+    labels = reference_filtered.obs[perturbation_column].astype(str)
+    counts = labels.value_counts()
+    keep_mask = labels.eq(control_label) | counts.loc[labels].ge(min_cells_per_perturbation).to_numpy()
+    reference_filtered = reference_filtered[keep_mask].copy()
+
+    t0 = time.perf_counter()
+    gene_mask = _filter_genes(reference_filtered.X, min_cells=min_cells_per_gene)
+    timings_reference["filter_genes"] = time.perf_counter() - t0
+    reference_filtered = reference_filtered[:, gene_mask].copy()
+
+    t0 = time.perf_counter()
+    ref_norm_matrix, _ = _normalize_total(reference_filtered.X)
+    timings_reference["filtered_normalize_total"] = time.perf_counter() - t0
+    reference_filtered.layers["normalized_counts"] = ref_norm_matrix
+    reference_filtered.X = ref_norm_matrix
+
+    t0 = time.perf_counter()
+    reference_filtered.X = _log1p(reference_filtered.X)
+    timings_reference["filtered_log1p"] = time.perf_counter() - t0
+
+    reference_avg, reference_pseudo = _compute_reference_effects(
+        reference_filtered,
+        perturbation_column=perturbation_column,
+        control_label=control_label,
+        baseline_count=baseline_count,
+    )
+
+    t0 = time.perf_counter()
+    reference_wald = _compute_reference_wald(
+        reference_filtered,
+        perturbation_column=perturbation_column,
+        control_label=control_label,
+        gene_name_column=gene_name_column,
+        perturbations=perturbations,
+        min_cells_expressed=de_min_cells_expressed,
+    )
+    timings_reference["wald_test"] = time.perf_counter() - t0
+
+    t0 = time.perf_counter()
+    reference_wilcoxon = _compute_reference_wilcoxon(
+        reference_filtered,
+        perturbation_column=perturbation_column,
+        control_label=control_label,
+        gene_name_column=gene_name_column,
+        perturbations=perturbations,
+        min_cells_expressed=de_min_cells_expressed,
+    )
+    timings_reference["wilcoxon_test"] = time.perf_counter() - t0
+
+    peak_memory_mb = _peak_memory_delta_mb(baseline_bytes)
+
+    return _ReferenceComputationResult(
+        normalization_max_abs_diff=max_norm_diff,
+        log1p_max_abs_diff=max_log_diff,
+        filtered_cell_count=reference_filtered.n_obs,
+        filtered_gene_count=reference_filtered.n_vars,
+        avg_log_effects=reference_avg,
+        pseudobulk_effects=reference_pseudo,
+        wald_results=reference_wald,
+        wilcoxon_results=reference_wilcoxon,
+        timings=timings_reference,
+        stream_chunk_timing=stream_chunk_timing,
+        peak_memory_mb=peak_memory_mb,
+    )
+
+
 
 def compare_with_scanpy(
     path: str | Path,
@@ -284,42 +491,9 @@ def compare_with_scanpy(
     path = Path(path)
 
     timings_streamlined: Dict[str, float] = {}
-    timings_reference: Dict[str, float] = {}
     de_min_cells_expressed = 0
 
-    raw = _load_dense(path)
-    reference_norm = raw.copy()
-
-    t0 = time.perf_counter()
-    normalised_matrix, _ = _normalize_total(reference_norm.X)
-    timings_reference["normalize_total"] = time.perf_counter() - t0
-    reference_norm.X = normalised_matrix
-
-    t0 = time.perf_counter()
-    log_matrix = _log1p(reference_norm.X)
-    timings_reference["log1p"] = time.perf_counter() - t0
-    reference_norm.X = log_matrix
-
-    # Streamed preprocessing comparison
-    backed = read_backed(path)
-    max_norm_diff = 0.0
-    max_log_diff = 0.0
-    t0 = time.perf_counter()
-    try:
-        for slc, block in iter_matrix_chunks(
-            backed, axis=0, chunk_size=chunk_size, convert_to_dense=False
-        ):
-            norm_block, _ = normalize_total_block(block)
-            max_norm_diff = max(
-                max_norm_diff, float(np.max(np.abs(norm_block - normalised_matrix[slc])))
-            )
-            log_block = np.log1p(norm_block)
-            max_log_diff = max(
-                max_log_diff, float(np.max(np.abs(log_block - log_matrix[slc])))
-            )
-    finally:
-        backed.file.close()
-    timings_streamlined["normalize_total+log1p"] = time.perf_counter() - t0
+    baseline_bytes = _get_peak_memory_bytes()
 
     # Streamlined QC and effect estimation
     t0 = time.perf_counter()
@@ -393,61 +567,35 @@ def compare_with_scanpy(
     )
     timings_streamlined["wilcoxon_test"] = time.perf_counter() - t0
 
-    # Reference QC and effect estimation (Scanpy-style)
-    reference_filtered = raw.copy()
-    t0 = time.perf_counter()
-    cell_mask = _filter_cells(reference_filtered.X, min_genes=min_genes)
-    timings_reference["filter_cells"] = time.perf_counter() - t0
-    reference_filtered = reference_filtered[cell_mask].copy()
+    streamlined_peak_memory_mb = _peak_memory_delta_mb(baseline_bytes)
 
-    labels = reference_filtered.obs[perturbation_column].astype(str)
-    counts = labels.value_counts()
-    keep_mask = labels.eq(control_label) | counts.loc[labels].ge(min_cells_per_perturbation).to_numpy()
-    reference_filtered = reference_filtered[keep_mask].copy()
-
-    t0 = time.perf_counter()
-    gene_mask = _filter_genes(reference_filtered.X, min_cells=min_cells_per_gene)
-    timings_reference["filter_genes"] = time.perf_counter() - t0
-    reference_filtered = reference_filtered[:, gene_mask].copy()
-
-    t0 = time.perf_counter()
-    ref_norm_matrix, _ = _normalize_total(reference_filtered.X)
-    timings_reference["filtered_normalize_total"] = time.perf_counter() - t0
-    reference_filtered.layers["normalized_counts"] = ref_norm_matrix
-    reference_filtered.X = ref_norm_matrix
-
-    t0 = time.perf_counter()
-    reference_filtered.X = _log1p(reference_filtered.X)
-    timings_reference["filtered_log1p"] = time.perf_counter() - t0
-
-    reference_avg, reference_pseudo = _compute_reference_effects(
-        reference_filtered,
+    reference_result = _run_in_subprocess(
+        _compute_reference_pipeline,
+        path,
         perturbation_column=perturbation_column,
         control_label=control_label,
+        min_genes=min_genes,
+        min_cells_per_perturbation=min_cells_per_perturbation,
+        min_cells_per_gene=min_cells_per_gene,
+        gene_name_column=gene_name_column,
+        perturbations=perturbations,
         baseline_count=baseline_count,
+        chunk_size=chunk_size,
+        de_min_cells_expressed=de_min_cells_expressed,
     )
+    timings_reference = reference_result.timings
+    timings_streamlined["normalize_total+log1p"] = reference_result.stream_chunk_timing
+    reference_peak_memory_mb = reference_result.peak_memory_mb
 
-    t0 = time.perf_counter()
-    reference_wald = _compute_reference_wald(
-        reference_filtered,
-        perturbation_column=perturbation_column,
-        control_label=control_label,
-        gene_name_column=gene_name_column,
-        perturbations=perturbations,
-        min_cells_expressed=de_min_cells_expressed,
-    )
-    timings_reference["wald_test"] = time.perf_counter() - t0
+    max_norm_diff = reference_result.normalization_max_abs_diff
+    max_log_diff = reference_result.log1p_max_abs_diff
+    reference_cell_count = reference_result.filtered_cell_count
+    reference_gene_count = reference_result.filtered_gene_count
+    reference_avg = reference_result.avg_log_effects
+    reference_pseudo = reference_result.pseudobulk_effects
+    reference_wald = reference_result.wald_results
+    reference_wilcoxon = reference_result.wilcoxon_results
 
-    t0 = time.perf_counter()
-    reference_wilcoxon = _compute_reference_wilcoxon(
-        reference_filtered,
-        perturbation_column=perturbation_column,
-        control_label=control_label,
-        gene_name_column=gene_name_column,
-        perturbations=perturbations,
-        min_cells_expressed=de_min_cells_expressed,
-    )
-    timings_reference["wilcoxon_test"] = time.perf_counter() - t0
 
     aligned_avg, aligned_ref_avg = _align_frames(avg_log_effects, reference_avg)
     aligned_pseudo, aligned_ref_pseudo = _align_frames(
@@ -506,9 +654,9 @@ def compare_with_scanpy(
         normalization_max_abs_diff=max_norm_diff,
         log1p_max_abs_diff=max_log_diff,
         streamlined_cell_count=streamlined_filtered.n_obs,
-        reference_cell_count=reference_filtered.n_obs,
+        reference_cell_count=reference_cell_count,
         streamlined_gene_count=streamlined_filtered.n_vars,
-        reference_gene_count=reference_filtered.n_vars,
+        reference_gene_count=reference_gene_count,
         avg_log_effect_max_abs_diff=avg_diff,
         pseudobulk_effect_max_abs_diff=pseudo_diff,
         wald_effect_max_abs_diff=wald_effect_diff,
@@ -517,6 +665,8 @@ def compare_with_scanpy(
         wilcoxon_effect_max_abs_diff=wilcoxon_effect_diff,
         wilcoxon_statistic_max_abs_diff=wilcoxon_stat_diff,
         wilcoxon_pvalue_max_abs_diff=wilcoxon_pvalue_diff,
+        streamlined_peak_memory_mb=streamlined_peak_memory_mb,
+        reference_peak_memory_mb=reference_peak_memory_mb,
         streamlined_timings=timings_streamlined,
         reference_timings=timings_reference,
         streamlined_effects={
