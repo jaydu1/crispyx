@@ -9,7 +9,13 @@ import anndata as ad
 import numpy as np
 import pandas as pd
 
-from .data import ensure_gene_symbol_column, iter_matrix_chunks, read_backed, resolve_output_path
+from .data import (
+    ensure_gene_symbol_column,
+    iter_matrix_chunks,
+    normalize_total_block,
+    read_backed,
+    resolve_output_path,
+)
 
 
 def _resolve_candidates(
@@ -52,7 +58,8 @@ def compute_average_log_expression(
         counts = {label: 0 for label in groups}
         for slc, block in iter_matrix_chunks(backed, axis=0, chunk_size=chunk_size):
             slice_labels = labels[slc]
-            log_block = np.log1p(block)
+            normalised_block, _ = normalize_total_block(block)
+            log_block = np.log1p(normalised_block)
             for label in groups:
                 mask = slice_labels == label
                 if not np.any(mask):
@@ -124,11 +131,12 @@ def compute_pseudobulk_expression(
         counts = {label: 0 for label in groups}
         for slc, block in iter_matrix_chunks(backed, axis=0, chunk_size=chunk_size):
             slice_labels = labels[slc]
+            normalised_block, _ = normalize_total_block(block)
             for label in groups:
                 mask = slice_labels == label
                 if not np.any(mask):
                     continue
-                sums[label] += block[mask].sum(axis=0)
+                sums[label] += normalised_block[mask].sum(axis=0)
                 counts[label] += int(mask.sum())
     finally:
         backed.file.close()
