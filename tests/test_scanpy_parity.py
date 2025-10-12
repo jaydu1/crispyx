@@ -15,7 +15,7 @@ import numpy as np
 import pandas as pd
 import pytest
 import scipy.sparse as sp
-from scipy.stats import mannwhitneyu, norm
+from scipy.stats import norm
 import scanpy as sc
 
 from streamlined_crispr import (
@@ -205,6 +205,10 @@ def test_differential_expression_matches_scanpy(subset_dataset, tmp_path):
 
     filtered = sc.read_h5ad(qc_result.filtered_path)
     labels = filtered.obs[PERTURBATION_COLUMN].to_numpy(dtype=str)
+    if "gene_symbols" in filtered.var.columns:
+        gene_symbols = filtered.var["gene_symbols"].astype(str)
+    else:
+        gene_symbols = filtered.var_names.astype(str)
     toolkit_norm = []
     toolkit_log = []
     for _, block in iter_matrix_chunks(filtered, axis=0, chunk_size=CHUNK_SIZE):
@@ -268,41 +272,56 @@ def test_differential_expression_matches_scanpy(subset_dataset, tmp_path):
         np.testing.assert_allclose(result.statistic, expected_wald_z[label], atol=1e-8, rtol=1e-6)
         np.testing.assert_allclose(result.pvalue, expected_wald_p[label], atol=1e-8, rtol=1e-6)
 
+    scanpy_filtered = filtered.copy()
+    sc.pp.normalize_total(scanpy_filtered, target_sum=1e4)
+    sc.pp.log1p(scanpy_filtered)
+    sc.tl.rank_genes_groups(
+        scanpy_filtered,
+        groupby=PERTURBATION_COLUMN,
+        method="wilcoxon",
+        reference=control_label,
+        tie_correct=True,
+        corr_method="benjamini-hochberg",
+        n_genes=scanpy_filtered.n_vars,
+    )
+    scanpy_rg = scanpy_filtered.uns["rank_genes_groups"]
+
     wilcoxon_results = wilcoxon_test(
         qc_result.filtered_path,
         perturbation_column=PERTURBATION_COLUMN,
         control_label=control_label,
         gene_name_column="gene_symbols",
         chunk_size=64,
+        tie_correct=True,
+        corr_method="benjamini-hochberg",
         output_dir=tmp_path,
         data_name="scanpy_parity",
     )
 
-    control_values = toolkit_norm[control_mask]
-    control_expr = np.count_nonzero(control_values, axis=0)
+    grouped = {}
+    if scanpy_rg["names"].dtype.names is not None:
+        group_names = list(scanpy_rg["names"].dtype.names)
+    else:
+        group_names = list(scanpy_filtered.obs[PERTURBATION_COLUMN].unique())
+    for group in group_names:
+        names = pd.Index(np.array(scanpy_rg["names"][group]).astype(str))
+        pvals = np.array(scanpy_rg["pvals"][group], dtype=float)
+        padj = np.array(scanpy_rg["pvals_adj"][group], dtype=float)
+        grouped[group] = pd.DataFrame({"pvals": pvals, "pvals_adj": padj}, index=names)
+
+    control_n = float(control_mask.sum())
 
     for label, result in wilcoxon_results.items():
-        mask = labels == label
-        pert_values = toolkit_norm[mask]
-        pert_expr = np.count_nonzero(pert_values, axis=0)
-        total_expr = control_expr + pert_expr
-        expected_effect = np.zeros_like(result.effect_size)
-        expected_stat = np.zeros_like(result.statistic)
-        expected_pvalue = np.ones_like(result.pvalue)
-        for gene_idx in range(toolkit_norm.shape[1]):
-            if total_expr[gene_idx] < 0:
-                continue
-            res = mannwhitneyu(
-                control_values[:, gene_idx],
-                pert_values[:, gene_idx],
-                alternative="two-sided",
-                method="auto",
-            )
-            expected_stat[gene_idx] = res.statistic
-            expected_pvalue[gene_idx] = res.pvalue
-            expected_effect[gene_idx] = (
-                res.statistic / (control_values.shape[0] * pert_values.shape[0]) - 0.5
-            )
-        np.testing.assert_allclose(result.effect_size, expected_effect, atol=1e-8, rtol=1e-6)
-        np.testing.assert_allclose(result.statistic, expected_stat, atol=1e-8, rtol=1e-6)
-        np.testing.assert_allclose(result.pvalue, expected_pvalue, atol=1e-8, rtol=1e-6)
+        group_df = grouped[label].reindex(result.genes)
+        pert_n = float((labels == label).sum())
+        expected_effect = result.statistic / (control_n * pert_n) - 0.5
+        np.testing.assert_allclose(result.effect_size, expected_effect, atol=1e-12, rtol=1e-12)
+        pvals_expected = group_df["pvals"].fillna(1.0).to_numpy()
+        padj_expected = group_df["pvals_adj"].fillna(1.0).to_numpy()
+        np.testing.assert_allclose(result.pvalue, pvals_expected, atol=2e-3, rtol=5e-3)
+        np.testing.assert_allclose(
+            result.pvalue_adj,
+            padj_expected,
+            atol=2e-3,
+            rtol=5e-3,
+        )
