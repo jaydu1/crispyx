@@ -62,6 +62,63 @@ def test_nb_glm_fitter_matches_statsmodels():
     np.testing.assert_allclose(result.se, sm_res.bse, rtol=1e-3, atol=1e-3)
 
 
+def test_nb_glm_fitter_matches_statsmodels_for_well_expressed_genes():
+    rng = np.random.default_rng(12345)
+    n = 250
+    covariates = pd.DataFrame({"cov": rng.normal(0, 1, size=n)})
+    indicator = rng.binomial(1, 0.45, size=n).astype(float)
+    design, column_names = build_design_matrix(
+        covariates,
+        covariate_columns=["cov"],
+        perturbation_indicator=indicator,
+    )
+    alpha = 0.6
+    n_genes = 6
+    betas = rng.normal(0, 0.4, size=(n_genes, design.shape[1]))
+    betas[0] -= 3.0  # force one gene to be extremely lowly expressed
+    counts = np.zeros((n, n_genes), dtype=int)
+    for gene_idx in range(n_genes):
+        mu = np.exp(design @ betas[gene_idx])
+        counts[:, gene_idx] = _generate_nb_counts(rng, mu, alpha)
+
+    fitter = NBGLMFitter(
+        design,
+        offset=np.zeros(n, dtype=float),
+        dispersion=alpha,
+        max_iter=120,
+        tol=1e-8,
+        poisson_init_iter=40,
+    )
+    family = sm.families.NegativeBinomial(alpha=alpha)
+    perturbation_index = column_names.index("perturbation")
+
+    compared = 0
+    for gene_idx in range(n_genes):
+        y = counts[:, gene_idx]
+        result = fitter.fit_gene(y)
+        sm_res = sm.GLM(y, design, family=family).fit()
+        if y.mean() < 0.25:
+            # Lowly expressed genes are expected to be unstable; we only
+            # assert convergence for moderately expressed genes.
+            continue
+        assert result.converged
+        np.testing.assert_allclose(
+            result.coef[perturbation_index],
+            sm_res.params[perturbation_index],
+            rtol=1e-3,
+            atol=1e-3,
+        )
+        np.testing.assert_allclose(
+            result.se[perturbation_index],
+            sm_res.bse[perturbation_index],
+            rtol=1e-3,
+            atol=1e-3,
+        )
+        compared += 1
+
+    assert compared >= 1
+
+
 def test_nb_glm_test_pipeline(tmp_path):
     rng = np.random.default_rng(123)
     n_cells = 80
