@@ -8,7 +8,7 @@ from .qc import (
     quality_control_summary,
 )
 from .pseudobulk import compute_average_log_expression, compute_pseudobulk_expression
-from .de import RankGenesGroupsResult, wald_test, wilcoxon_test
+from .de import RankGenesGroupsResult, nb_glm_test, wald_test, wilcoxon_test
 
 __all__ = [
     "filter_cells_by_gene_count",
@@ -20,6 +20,7 @@ __all__ = [
     "RankGenesGroupsResult",
     "wald_test",
     "wilcoxon_test",
+    "nb_glm_test",
     "ensure_gene_symbol_column",
     "read_backed",
     "resolve_output_path",
