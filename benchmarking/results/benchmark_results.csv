@@ -1,0 +1,6 @@
+method,description,status,elapsed_seconds,max_memory_mb,rows,columns,total_cells,kept_cells,cells_removed,total_genes,kept_genes,genes_removed,output_path,groups,genes
+average_log_expression,Average log-normalised expression per perturbation,success,0.19139047099997697,122.03125,5.0,100.0,,,,,,,,,
+pseudobulk_expression,Pseudo-bulk log fold-change per perturbation,success,0.15484349300004396,122.05078125,5.0,100.0,,,,,,,,,
+quality_control,Streaming quality control filters,success,0.2822694169999522,122.6640625,,,400.0,400.0,0.0,100.0,100.0,0.0,/workspace/Streamlining-CRISPR-Screen-Analysis/benchmarking/results/benchmark_filtered.h5ad,,
+wald_test,Wald differential expression test,success,0.1633853180001097,122.54296875,,,,,,,,,/workspace/Streamlining-CRISPR-Screen-Analysis/benchmarking/results/benchmark_wald_wald_de.h5ad,5.0,100.0
+wilcoxon_test,Wilcoxon rank-sum differential expression,success,0.2799138669997774,125.91796875,,,,,,,,,/workspace/Streamlining-CRISPR-Screen-Analysis/benchmarking/results/benchmark_wilcoxon_wilcoxon_de.h5ad,5.0,100.0
