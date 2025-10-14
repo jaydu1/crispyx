@@ -117,7 +117,8 @@ class NBGLMFitter:
             variance = mu + alpha * (mu**2)
             weights = (mu**2) / np.maximum(variance, self.min_mu)
             z = eta + (y - mu) / np.maximum(mu, self.min_mu)
-            beta_new, cov_beta = self._weighted_least_squares(weights, z)
+            working_response = z - self.offset
+            beta_new, cov_beta = self._weighted_least_squares(weights, working_response)
             if np.max(np.abs(beta_new - beta)) < self.tol:
                 beta = beta_new
                 converged = True
@@ -156,18 +157,19 @@ class NBGLMFitter:
             mu = np.maximum(mu, self.min_mu)
             weights = mu
             z = eta + (y - mu) / np.maximum(mu, self.min_mu)
-            beta_new, _ = self._weighted_least_squares(weights, z)
+            working_response = z - self.offset
+            beta_new, _ = self._weighted_least_squares(weights, working_response)
             if np.max(np.abs(beta_new - beta)) < self.tol:
                 return beta_new
             beta = beta_new
         return beta
 
-    def _weighted_least_squares(self, weights: np.ndarray, z: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    def _weighted_least_squares(self, weights: np.ndarray, y_working: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         if weights.shape != (self.n_samples,):
             raise ValueError("weights must have shape (n_samples,)")
         w_sqrt = np.sqrt(np.clip(weights, self.min_mu, None))
         x_weighted = self.design * w_sqrt[:, None]
-        z_weighted = z * w_sqrt
+        z_weighted = y_working * w_sqrt
         xtwx = x_weighted.T @ x_weighted
         if self.ridge_penalty:
             xtwx = xtwx + self.ridge_penalty * np.eye(self.n_features)
