@@ -20,6 +20,7 @@ from .data import (
     read_backed,
     resolve_output_path,
 )
+from .glm import NBGLMFitter, build_design_matrix
 
 
 @dataclass
@@ -333,6 +334,205 @@ def wald_test(
         result.result_path = output_path
 
     return results
+
+
+def nb_glm_test(
+    path: str | Path,
+    *,
+    perturbation_column: str,
+    control_label: str,
+    covariates: Iterable[str] | None = None,
+    gene_name_column: str | None = None,
+    perturbations: Iterable[str] | None = None,
+    dispersion: float | None = None,
+    max_iter: int = 50,
+    tol: float = 1e-6,
+    poisson_init_iter: int = 15,
+    min_cells_expressed: int = 0,
+    min_total_count: float = 1.0,
+    chunk_size: int = 256,
+    corr_method: Literal["benjamini-hochberg", "bonferroni"] = "benjamini-hochberg",
+    output_dir: str | Path | None = None,
+    data_name: str | None = None,
+) -> RankGenesGroupsResult:
+    """Differential expression using a negative binomial GLM with covariates."""
+
+    covariates = list(covariates or [])
+
+    backed = read_backed(path)
+    try:
+        gene_symbols = ensure_gene_symbol_column(backed, gene_name_column)
+        if perturbation_column not in backed.obs.columns:
+            raise KeyError(
+                f"Perturbation column '{perturbation_column}' was not found in adata.obs. Available columns: {list(backed.obs.columns)}"
+            )
+        obs_df = backed.obs[[perturbation_column] + covariates].copy()
+        labels = obs_df[perturbation_column].astype(str).to_numpy()
+        n_genes = backed.n_vars
+        candidates = _resolve_candidates(labels, control_label, perturbations)
+        control_mask = labels == control_label
+        control_n = int(control_mask.sum())
+        if control_n == 0:
+            raise ValueError("Control group contains no cells")
+        for label in candidates:
+            if not np.any(labels == label):
+                raise ValueError(f"Perturbation '{label}' contains no cells")
+    finally:
+        backed.file.close()
+
+    library_sizes = np.zeros(obs_df.shape[0], dtype=np.float64)
+    backed = read_backed(path)
+    try:
+        for slc, block in iter_matrix_chunks(backed, axis=0, chunk_size=chunk_size):
+            dense = np.asarray(block, dtype=np.float64)
+            library_sizes[slc] = dense.sum(axis=1)
+    finally:
+        backed.file.close()
+
+    offset = np.log(np.clip(library_sizes, 1e-8, None))
+
+    n_groups = len(candidates)
+    effect_matrix = np.zeros((n_groups, n_genes), dtype=np.float64)
+    statistic_matrix = np.zeros_like(effect_matrix)
+    pvalue_matrix = np.ones_like(effect_matrix)
+    logfc_matrix = np.zeros_like(effect_matrix)
+    se_matrix = np.full_like(effect_matrix, np.inf)
+    pts_matrix = np.zeros_like(effect_matrix)
+    pts_rest_matrix = np.zeros_like(effect_matrix)
+    dispersion_matrix = np.zeros_like(effect_matrix)
+    iter_matrix = np.zeros_like(effect_matrix)
+    convergence_matrix = np.zeros_like(effect_matrix, dtype=bool)
+
+    for group_idx, label in enumerate(candidates):
+        group_mask = labels == label
+        subset_mask = control_mask | group_mask
+        subset_obs = obs_df.iloc[subset_mask]
+        indicator = group_mask[subset_mask].astype(np.float64)
+        design, design_columns = build_design_matrix(
+            subset_obs,
+            covariate_columns=covariates,
+            perturbation_indicator=indicator,
+            intercept=True,
+        )
+        perturbation_column_index = design_columns.index("perturbation")
+        fitter = NBGLMFitter(
+            design,
+            offset=offset[subset_mask],
+            dispersion=dispersion,
+            max_iter=max_iter,
+            tol=tol,
+            poisson_init_iter=poisson_init_iter,
+            min_total_count=min_total_count,
+        )
+        control_subset_mask = control_mask[subset_mask]
+        group_subset_mask = group_mask[subset_mask]
+        group_n = int(group_subset_mask.sum())
+
+        backed = read_backed(path)
+        try:
+            for slc, block in iter_matrix_chunks(backed, axis=1, chunk_size=chunk_size):
+                raw_block = np.asarray(block, dtype=np.float64)
+                subset_block = raw_block[subset_mask, :]
+                control_block = subset_block[control_subset_mask, :]
+                group_block = subset_block[group_subset_mask, :]
+                control_expr = np.asarray(np.count_nonzero(control_block, axis=0))
+                group_expr = np.asarray(np.count_nonzero(group_block, axis=0))
+                total_expr = control_expr + group_expr
+                valid_mask = total_expr >= min_cells_expressed
+                chunk_indices = np.arange(slc.start, slc.stop)
+                pts = np.divide(
+                    group_expr,
+                    group_n,
+                    out=np.zeros_like(group_expr, dtype=float),
+                    where=group_n > 0,
+                )
+                pts_rest = np.divide(
+                    control_expr,
+                    control_n,
+                    out=np.zeros_like(control_expr, dtype=float),
+                    where=control_n > 0,
+                )
+                pts_matrix[group_idx, chunk_indices] = np.where(valid_mask, pts, 0.0)
+                pts_rest_matrix[group_idx, chunk_indices] = np.where(valid_mask, pts_rest, 0.0)
+
+                if not np.any(valid_mask):
+                    continue
+
+                fit_block = subset_block[:, valid_mask]
+                gene_results = fitter.fit_matrix(fit_block)
+                result_iter = iter(gene_results)
+
+                for local_idx, gene_idx in enumerate(chunk_indices):
+                    if not valid_mask[local_idx]:
+                        continue
+                    result = next(result_iter)
+                    convergence_matrix[group_idx, gene_idx] = result.converged
+                    iter_matrix[group_idx, gene_idx] = result.n_iter
+                    dispersion_matrix[group_idx, gene_idx] = result.dispersion
+                    coef = float(result.coef[perturbation_column_index])
+                    se = float(result.se[perturbation_column_index])
+                    if not result.converged or not np.isfinite(coef) or not np.isfinite(se) or se <= 0:
+                        continue
+                    statistic = coef / se
+                    pvalue = float(2.0 * norm.sf(abs(statistic)))
+                    effect_matrix[group_idx, gene_idx] = coef
+                    statistic_matrix[group_idx, gene_idx] = statistic
+                    pvalue_matrix[group_idx, gene_idx] = pvalue
+                    logfc_matrix[group_idx, gene_idx] = coef
+                    se_matrix[group_idx, gene_idx] = se
+        finally:
+            backed.file.close()
+
+    gene_symbols = pd.Index(gene_symbols).astype(str)
+    order_matrix = np.argsort(-np.abs(statistic_matrix), axis=1, kind="mergesort")
+    pvalue_adj_matrix = _adjust_pvalue_matrix(pvalue_matrix, corr_method)
+
+    obs_index = pd.Index(candidates, name="perturbation").astype(str)
+    obs = pd.DataFrame({perturbation_column: obs_index.to_list()}, index=obs_index)
+    var = pd.DataFrame(index=gene_symbols)
+
+    adata = ad.AnnData(effect_matrix, obs=obs, var=var)
+    adata.layers["z_score"] = statistic_matrix
+    adata.layers["pvalue"] = pvalue_matrix
+    adata.layers["pvalue_adj"] = pvalue_adj_matrix
+    adata.layers["logfoldchange"] = logfc_matrix
+    adata.layers["standard_error"] = se_matrix
+    adata.layers["dispersion"] = dispersion_matrix
+    adata.layers["converged"] = convergence_matrix.astype(np.float32)
+    adata.layers["iterations"] = iter_matrix.astype(np.float32)
+    adata.layers["pts"] = pts_matrix
+    adata.layers["pts_rest"] = pts_rest_matrix
+    adata.uns["method"] = "nb_glm"
+    adata.uns["control_label"] = control_label
+    adata.uns["covariates"] = covariates
+
+    output_path = resolve_output_path(
+        path,
+        suffix="nb_glm_de",
+        output_dir=output_dir,
+        data_name=data_name,
+    )
+    adata.write(output_path)
+
+    return RankGenesGroupsResult(
+        genes=gene_symbols,
+        groups=candidates,
+        statistics=statistic_matrix,
+        pvalues=pvalue_matrix,
+        pvalues_adj=pvalue_adj_matrix,
+        logfoldchanges=logfc_matrix,
+        effect_size=effect_matrix,
+        u_statistics=np.zeros_like(effect_matrix),
+        pts=pts_matrix,
+        pts_rest=pts_rest_matrix,
+        order=order_matrix,
+        groupby=perturbation_column,
+        method="nb_glm",
+        control_label=control_label,
+        tie_correct=False,
+        pvalue_correction=corr_method,
+        result_path=output_path,
+    )
 
 
 def wilcoxon_test(

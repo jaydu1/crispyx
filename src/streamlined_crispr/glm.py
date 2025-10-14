@@ -1,0 +1,284 @@
+"""Generalized linear models utilities for differential expression."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Sequence
+
+import numpy as np
+from numpy.typing import ArrayLike
+from scipy.linalg import cho_factor, cho_solve
+
+
+@dataclass
+class NBGLMResult:
+    """Result of fitting a negative binomial GLM for a single gene."""
+
+    coef: np.ndarray
+    se: np.ndarray
+    dispersion: float
+    converged: bool
+    n_iter: int
+    deviance: float
+
+
+class NBGLMFitter:
+    """Iteratively re-weighted least squares solver for NB GLMs.
+
+    Parameters
+    ----------
+    design:
+        The design matrix with shape ``(n_samples, n_features)``.
+    offset:
+        Optional log-scale offset (e.g. library size) per sample.
+    dispersion:
+        Optional dispersion (alpha) for the negative binomial. If ``None`` the
+        dispersion is re-estimated at each iteration using a method-of-moments
+        update similar to the one used in statsmodels.
+    max_iter:
+        Maximum number of Fisher scoring iterations for the negative binomial
+        stage.
+    tol:
+        Absolute tolerance on the coefficient updates for convergence.
+    poisson_init_iter:
+        Maximum number of iterations for the Poisson initialisation stage. If
+        set to ``0`` the Poisson warm start is skipped and coefficients are
+        initialised at zero.
+    ridge_penalty:
+        Small diagonal ridge penalty added to the weighted normal equations to
+        improve numerical stability. This does not change the estimator when
+        the system is well conditioned but prevents failures when the Hessian
+        is nearly singular.
+    min_mu:
+        Lower bound on the fitted mean to avoid issues with extremely small
+        predicted counts for lowly expressed genes.
+    min_total_count:
+        Genes with a total count below this threshold are not fitted (the
+        resulting ``NBGLMResult`` will report ``converged=False``).
+    """
+
+    def __init__(
+        self,
+        design: ArrayLike,
+        *,
+        offset: ArrayLike | None = None,
+        dispersion: float | None = None,
+        max_iter: int = 50,
+        tol: float = 1e-6,
+        poisson_init_iter: int = 20,
+        ridge_penalty: float = 1e-8,
+        min_mu: float = 1e-8,
+        min_total_count: float = 1.0,
+    ) -> None:
+        self.design = np.asarray(design, dtype=np.float64)
+        if self.design.ndim != 2:
+            raise ValueError("design must be a 2D array")
+        self.n_samples, self.n_features = self.design.shape
+        self.offset = (
+            np.asarray(offset, dtype=np.float64)
+            if offset is not None
+            else np.zeros(self.n_samples, dtype=np.float64)
+        )
+        if self.offset.shape != (self.n_samples,):
+            raise ValueError("offset must have shape (n_samples,)")
+        self.dispersion = dispersion
+        self.max_iter = int(max_iter)
+        self.tol = tol
+        self.poisson_init_iter = int(max(0, poisson_init_iter))
+        self.ridge_penalty = ridge_penalty
+        self.min_mu = min_mu
+        self.min_total_count = min_total_count
+
+    def fit_gene(self, counts: ArrayLike) -> NBGLMResult:
+        y = np.asarray(counts, dtype=np.float64)
+        if y.shape != (self.n_samples,):
+            raise ValueError("counts must have shape (n_samples,)")
+        total = float(y.sum())
+        if total < self.min_total_count or not np.isfinite(total):
+            zeros = np.zeros(self.n_features, dtype=np.float64)
+            return NBGLMResult(
+                coef=zeros,
+                se=np.full(self.n_features, np.inf, dtype=np.float64),
+                dispersion=float("nan"),
+                converged=False,
+                n_iter=0,
+                deviance=float("nan"),
+            )
+        beta = np.zeros(self.n_features, dtype=np.float64)
+        if self.poisson_init_iter:
+            beta = self._poisson_warm_start(y, beta.copy())
+        alpha = self.dispersion if self.dispersion is not None else 0.0
+        converged = False
+        deviance = np.nan
+        for iteration in range(1, self.max_iter + 1):
+            eta = self.offset + self.design @ beta
+            mu = np.exp(np.clip(eta, a_min=np.log(self.min_mu), a_max=None))
+            mu = np.maximum(mu, self.min_mu)
+            variance = mu + alpha * (mu**2)
+            weights = (mu**2) / np.maximum(variance, self.min_mu)
+            z = eta + (y - mu) / np.maximum(mu, self.min_mu)
+            beta_new, cov_beta = self._weighted_least_squares(weights, z)
+            if np.max(np.abs(beta_new - beta)) < self.tol:
+                beta = beta_new
+                converged = True
+                deviance = self._compute_deviance(y, mu, alpha)
+                break
+            beta = beta_new
+            deviance = self._compute_deviance(y, mu, alpha)
+            if self.dispersion is None:
+                alpha = self._update_alpha(y, mu, alpha)
+        else:
+            # If we exit the loop without breaking we did not converge.
+            cov_beta = self._hessian_inverse(weights)
+        se = np.sqrt(np.maximum(np.diag(cov_beta), self.min_mu))
+        return NBGLMResult(
+            coef=beta,
+            se=se,
+            dispersion=alpha,
+            converged=converged,
+            n_iter=iteration if converged else self.max_iter,
+            deviance=deviance,
+        )
+
+    def fit_matrix(self, matrix: ArrayLike) -> list[NBGLMResult]:
+        y = np.asarray(matrix)
+        if y.ndim != 2 or y.shape[0] != self.n_samples:
+            raise ValueError("matrix must have shape (n_samples, n_genes)")
+        results: list[NBGLMResult] = []
+        for col in range(y.shape[1]):
+            results.append(self.fit_gene(y[:, col]))
+        return results
+
+    def _poisson_warm_start(self, y: np.ndarray, beta: np.ndarray) -> np.ndarray:
+        for _ in range(self.poisson_init_iter):
+            eta = self.offset + self.design @ beta
+            mu = np.exp(np.clip(eta, a_min=np.log(self.min_mu), a_max=None))
+            mu = np.maximum(mu, self.min_mu)
+            weights = mu
+            z = eta + (y - mu) / np.maximum(mu, self.min_mu)
+            beta_new, _ = self._weighted_least_squares(weights, z)
+            if np.max(np.abs(beta_new - beta)) < self.tol:
+                return beta_new
+            beta = beta_new
+        return beta
+
+    def _weighted_least_squares(self, weights: np.ndarray, z: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        if weights.shape != (self.n_samples,):
+            raise ValueError("weights must have shape (n_samples,)")
+        w_sqrt = np.sqrt(np.clip(weights, self.min_mu, None))
+        x_weighted = self.design * w_sqrt[:, None]
+        z_weighted = z * w_sqrt
+        xtwx = x_weighted.T @ x_weighted
+        if self.ridge_penalty:
+            xtwx = xtwx + self.ridge_penalty * np.eye(self.n_features)
+        xtwz = x_weighted.T @ z_weighted
+        try:
+            c, lower = cho_factor(xtwx, overwrite_a=False, check_finite=False)
+            beta = cho_solve((c, lower), xtwz, check_finite=False)
+            inv_hessian = cho_solve((c, lower), np.eye(self.n_features), check_finite=False)
+        except np.linalg.LinAlgError:
+            beta = np.linalg.solve(xtwx, xtwz)
+            inv_hessian = np.linalg.inv(xtwx)
+        return beta, inv_hessian
+
+    def _hessian_inverse(self, weights: np.ndarray) -> np.ndarray:
+        w_sqrt = np.sqrt(np.clip(weights, self.min_mu, None))
+        x_weighted = self.design * w_sqrt[:, None]
+        xtwx = x_weighted.T @ x_weighted
+        if self.ridge_penalty:
+            xtwx = xtwx + self.ridge_penalty * np.eye(self.n_features)
+        try:
+            c, lower = cho_factor(xtwx, overwrite_a=False, check_finite=False)
+            inv_hessian = cho_solve((c, lower), np.eye(self.n_features), check_finite=False)
+        except np.linalg.LinAlgError:
+            inv_hessian = np.linalg.pinv(xtwx)
+        return inv_hessian
+
+    @staticmethod
+    def _compute_deviance(y: np.ndarray, mu: np.ndarray, alpha: float) -> float:
+        mu = np.maximum(mu, 1e-12)
+        if alpha <= 0:
+            with np.errstate(divide="ignore", invalid="ignore"):
+                terms = np.where(y > 0, y * np.log(np.maximum(y, 1e-12) / mu) - (y - mu), -mu)
+            return 2.0 * float(np.nansum(terms))
+        r = 1.0 / alpha
+        with np.errstate(divide="ignore", invalid="ignore"):
+            term1 = y * np.log(np.maximum(y, 1e-12) / mu)
+            term2 = (y + r) * np.log((y + r) / (mu + r))
+            dev = 2.0 * float(np.nansum(term1 - term2))
+        return dev
+
+    def _update_alpha(self, y: np.ndarray, mu: np.ndarray, current_alpha: float) -> float:
+        # Method-of-moments style update used as a cheap approximation to
+        # maximize the profile likelihood for alpha.
+        resid = y - mu
+        denom = np.maximum(mu**2, self.min_mu)
+        numerator = np.sum((resid**2 - y) / denom)
+        dof = max(y.size - self.n_features, 1)
+        alpha = numerator / dof
+        if not np.isfinite(alpha):
+            alpha = current_alpha
+        alpha = float(np.clip(alpha, 1e-8, 1e6))
+        if alpha <= 0:
+            alpha = 1e-8
+        return alpha
+
+
+def build_design_matrix(
+    obs_frame,
+    *,
+    covariate_columns: Sequence[str],
+    perturbation_indicator: np.ndarray,
+    intercept: bool = True,
+) -> tuple[np.ndarray, list[str]]:
+    """Construct a design matrix from covariates and a perturbation indicator.
+
+    Parameters
+    ----------
+    obs_frame:
+        Pandas ``DataFrame`` (preferred) or structured numpy array containing
+        covariate columns.
+    covariate_columns:
+        Columns that should be included in the design matrix. Categorical
+        columns are expanded using one-hot encoding (dropping the first level).
+    perturbation_indicator:
+        Binary array of shape ``(n_samples,)`` marking perturbed cells.
+    intercept:
+        Whether to prepend an intercept column to the design matrix.
+
+    Returns
+    -------
+    design:
+        The numeric design matrix as a ``numpy.ndarray`` of ``float64``.
+    column_names:
+        The column names corresponding to the design matrix.
+    """
+
+    import pandas as pd
+
+    if not isinstance(obs_frame, pd.DataFrame):
+        obs_frame = pd.DataFrame(obs_frame)
+    if len(obs_frame) != perturbation_indicator.shape[0]:
+        raise ValueError("Number of samples in obs_frame and indicator do not match")
+    matrices = []
+    column_names: list[str] = []
+    if intercept:
+        matrices.append(np.ones((len(obs_frame), 1), dtype=np.float64))
+        column_names.append("intercept")
+    matrices.append(perturbation_indicator.reshape(-1, 1).astype(np.float64))
+    column_names.append("perturbation")
+    for column in covariate_columns:
+        if column not in obs_frame.columns:
+            raise KeyError(f"Covariate '{column}' not found in obs_frame")
+        series = obs_frame[column]
+        if series.dtype.kind in {"O", "U"} or str(series.dtype).startswith("category"):
+            dummies = pd.get_dummies(series, prefix=column, drop_first=True, dtype=float)
+            if dummies.shape[1] == 0:
+                continue
+            matrices.append(dummies.to_numpy(dtype=np.float64))
+            column_names.extend(dummies.columns.astype(str).tolist())
+        else:
+            matrices.append(series.to_numpy(dtype=np.float64).reshape(-1, 1))
+            column_names.append(str(column))
+    design = np.hstack(matrices) if matrices else np.empty((len(obs_frame), 0), dtype=np.float64)
+    return design, column_names
