@@ -13,6 +13,7 @@ dependencies = [
     "pandas>=1.5",
     "scipy>=1.10",
     "scanpy>=1.9.2",
+    "pertpy>=0.4",
 ]
 
 [project.optional-dependencies]
@@ -22,6 +23,7 @@ test = [
     "pandas>=1.5",
     "scipy>=1.10",
     "scanpy>=1.9.2",
+    "pertpy>=0.4",
     "pytest",
     "statsmodels>=0.14",
     "pydeseq2>=0.4",
