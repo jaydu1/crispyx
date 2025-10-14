@@ -6,6 +6,7 @@ This package provides a lightweight toolkit for performing key steps of CRISPR s
 - Quality control filters for low quality cells, perturbations, and genes with automatic verification of gene symbol columns. Filtered cell × gene matrices are persisted as `{dataset}_filtered.h5ad`.
 - Pseudo-bulk aggregation for effect size estimation using both averaged log counts and pseudo-bulk counts. Each estimator produces an AnnData file of effect sizes for downstream inspection.
 - Differential expression testing with Wald and Wilcoxon tests that can skip lowly expressed genes for stability. Result matrices are saved as AnnData files containing effect sizes, statistics, and p-values.
+- Negative binomial GLM differential expression that regresses out measured covariates while reusing a streamed design matrix solver optimised for sparse counts. Fits can be initialised via Poisson IRLS, include early stopping for lowly expressed genes, and write results (including convergence diagnostics) to disk.
 
 ## Development
 Run the tests with:

@@ -23,6 +23,7 @@ test = [
     "scipy>=1.10",
     "scanpy>=1.9.2",
     "pytest",
+    "statsmodels>=0.14",
 ]
 
 [tool.pytest.ini_options]
