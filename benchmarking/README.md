@@ -23,6 +23,23 @@ The script enforces configurable CPU-time and memory limits for each
 method. When a method exceeds the requested resources it is terminated
 and the failure is recorded in the output table.
 
+### Comparison groups
+
+In addition to the streaming-only methods, the benchmark now includes
+two categories of parity checks against popular single-cell analysis
+tools:
+
+1. **Quality control and preprocessing comparisons** – run the full
+   streaming pipeline and a Scanpy-based in-memory workflow, recording
+   agreement metrics for filtering, normalisation, and pseudobulk
+   summaries.
+2. **Differential expression comparisons** – contrast the streaming
+   differential expression outputs with reference implementations from
+   Scanpy (t-test and Wilcoxon), as well as GLM-based methods exposed via
+   Pertpy (edgeR, PyDESeq2, and statsmodels). When a particular backend
+   is unavailable, the benchmark reports the attempt with `NA`
+   placeholders instead of failing the full run.
+
 Key command line options:
 
 - `--data-path`: Path to an `.h5ad` file with the same columns as the
