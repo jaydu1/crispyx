@@ -315,15 +315,27 @@ def _run_pertpy_de(
     except ImportError as exc:  # pragma: no cover - optional dependency
         return None, None, str(exc)
 
-    try:
-        result = runner(adata, groupby=perturbation_column, control=control_label)
-    except TypeError:
+    call_attempts = (
+        {"groupby": perturbation_column, "control": control_label},
+        {"group_key": perturbation_column, "control": control_label},
+        {"groupby": perturbation_column, "reference": control_label},
+    )
+    last_type_error: Optional[Exception] = None
+    result = None
+    for kwargs in call_attempts:
         try:
-            result = runner(adata, group_key=perturbation_column, control=control_label)
-        except TypeError:
-            result = runner(adata, groupby=perturbation_column, reference=control_label)
-    except Exception as exc:  # pragma: no cover - defensive
-        return None, None, str(exc)
+            result = runner(adata, **kwargs)
+        except TypeError as exc:
+            last_type_error = exc
+            continue
+        except Exception as exc:  # pragma: no cover - defensive
+            return None, None, str(exc)
+        else:
+            break
+    else:
+        if last_type_error is not None:
+            return None, None, str(last_type_error)
+        return None, None, "Pertpy differential expression runner failed to execute"
 
     df = _convert_reference_result_to_dataframe(result)
     reference_path: Optional[Path] = None
