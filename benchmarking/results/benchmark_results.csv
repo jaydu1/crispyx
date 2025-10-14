@@ -1,6 +1,12 @@
-method,description,status,elapsed_seconds,max_memory_mb,rows,columns,total_cells,kept_cells,cells_removed,total_genes,kept_genes,genes_removed,output_path,groups,genes
-average_log_expression,Average log-normalised expression per perturbation,success,0.19139047099997697,122.03125,5.0,100.0,,,,,,,,,
-pseudobulk_expression,Pseudo-bulk log fold-change per perturbation,success,0.15484349300004396,122.05078125,5.0,100.0,,,,,,,,,
-quality_control,Streaming quality control filters,success,0.2822694169999522,122.6640625,,,400.0,400.0,0.0,100.0,100.0,0.0,/workspace/Streamlining-CRISPR-Screen-Analysis/benchmarking/results/benchmark_filtered.h5ad,,
-wald_test,Wald differential expression test,success,0.1633853180001097,122.54296875,,,,,,,,,/workspace/Streamlining-CRISPR-Screen-Analysis/benchmarking/results/benchmark_wald_wald_de.h5ad,5.0,100.0
-wilcoxon_test,Wilcoxon rank-sum differential expression,success,0.2799138669997774,125.91796875,,,,,,,,,/workspace/Streamlining-CRISPR-Screen-Analysis/benchmarking/results/benchmark_wilcoxon_wilcoxon_de.h5ad,5.0,100.0
+category,method,description,status,runtime_seconds,peak_memory_mb,cells_total,cells_kept,cells_kept_pct,cells_removed,genes_total,genes_kept,genes_kept_pct,genes_removed,rows,columns,groups,genes,comparison_category,test_type,reference_tool,result_path,streaming_result_path,reference_result_path,error
+Streaming pipeline,average_log_expression,Average log-normalised expression per perturbation,success,0.15240699800051516,114.640625,,,,,,,,,5.0,100.0,,,,,,,,,
+Streaming pipeline,pseudobulk_expression,Pseudo-bulk log fold-change per perturbation,success,0.14501455899880966,114.39453125,,,,,,,,,5.0,100.0,,,,,,,,,
+Streaming pipeline,quality_control,Streaming quality control filters,success,0.2659922859966173,116.3203125,400.0,400.0,100.0,0.0,100.0,100.0,100.0,0.0,,,,,,,,benchmark_filtered.h5ad,,,
+Differential expression,wald_test,Wald differential expression test,success,0.1787242860009428,115.3515625,,,,,,,,,,,5.0,100.0,,,,benchmark_wald_wald_de.h5ad,,,
+Differential expression,wilcoxon_test,Wilcoxon rank-sum differential expression,success,0.28245362900634063,118.5234375,,,,,,,,,,,5.0,100.0,,,,benchmark_wilcoxon_wilcoxon_de.h5ad,,,
+Reference: Scanpy,scanpy_quality_control_comparison,Quality control comparison against Scanpy,error,0.8140616550008417,,,,,,,,,,,,,,,,,,,,zero-size array to reduction operation maximum which has no identity
+Reference: Scanpy,scanpy_wald_comparison,Wald/t-test comparison against Scanpy,success,1.8335061379984836,275.484375,,,,,,,,,,,,,differential_expression,wald,scanpy_t-test,,benchmark_scanpy_wald_wald_de.h5ad,benchmark_scanpy_reference_t-test_scanpy_de.csv,
+Reference: Scanpy,scanpy_wilcoxon_comparison,Wilcoxon comparison against Scanpy,success,1.9712636840049527,278.765625,,,,,,,,,,,,,differential_expression,wilcoxon,scanpy_wilcoxon,,benchmark_scanpy_wilcoxon_wilcoxon_de.h5ad,benchmark_scanpy_reference_wilcoxon_scanpy_de.csv,
+Reference: Pertpy,pertpy_edger_comparison,GLM comparison against edgeR via Pertpy,success,0.17754206899553537,115.3515625,,,,,,,,,,,,,differential_expression,glm,pertpy_edger,,benchmark_edger_wald_wald_de.h5ad,,No module named 'pertpy'
+Reference: Pertpy,pertpy_pydeseq2_comparison,GLM comparison against PyDESeq2 via Pertpy,success,0.17983447200094815,115.3515625,,,,,,,,,,,,,differential_expression,glm,pertpy_pydeseq2,,benchmark_pydeseq2_wald_wald_de.h5ad,,No module named 'pertpy'
+Reference: Pertpy,pertpy_statsmodels_comparison,GLM comparison against statsmodels via Pertpy,success,0.16407366299972637,115.35546875,,,,,,,,,,,,,differential_expression,glm,pertpy_statsmodels,,benchmark_statsmodels_wald_wald_de.h5ad,,No module named 'pertpy'

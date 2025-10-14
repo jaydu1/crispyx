@@ -60,9 +60,15 @@ Each benchmark run writes three types of files:
 1. Intermediate `.h5ad` files produced by each method (written directly to
    `<output-dir>`).
 2. A CSV summary (`benchmark_results.csv`) containing timing,
-   memory usage, and high-level result information for each method.
-3. A Markdown table (`benchmark_results.md`) for quick inspection on
-   GitHub.
+   memory usage, retention statistics, and high-level result
+   information for each method. Paths in the CSV are recorded relative
+   to the benchmark output directory so that the report remains stable
+   across machines.
+3. A Markdown report (`benchmark_results.md`) grouped by category
+   (streaming pipeline, differential expression, and reference
+   comparisons). Each section includes only the columns that are
+   relevant for that group, making it easier to scan performance and
+   agreement metrics at a glance when browsing on GitHub.
 
 Example outputs generated with the demo dataset are committed alongside this
 script. They provide a ready-to-view reference when browsing the repository.
