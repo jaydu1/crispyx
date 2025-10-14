@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import json
 import multiprocessing as mp
 import resource
 import sys
@@ -12,7 +11,7 @@ import traceback
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, Mapping, Optional
+from typing import Any, Callable, Dict, Iterable, Optional
 
 import pandas as pd
 
@@ -41,6 +40,7 @@ class BenchmarkMethod:
     function: Callable[..., Any]
     kwargs: Dict[str, Any]
     summary: Callable[[Any, Dict[str, Any]], Dict[str, Any]]
+    category: str = "core"
 
 
 @dataclass
@@ -58,6 +58,159 @@ class DifferentialComparisonSummary:
 
 
 _STANDARD_DE_COLUMNS = ["perturbation", "gene", "effect_size", "statistic", "pvalue"]
+
+_CATEGORY_ORDER = [
+    "Streaming pipeline",
+    "Differential expression",
+    "Reference: Scanpy",
+    "Reference: Pertpy",
+]
+
+
+def _normalise_path(path: str | Path | None, context: Mapping[str, Any]) -> str | None:
+    """Return ``path`` relative to the output directory or repository root."""
+
+    if not path:
+        return None
+
+    path_obj = Path(path)
+    candidates: Iterable[Path] = []
+    output_dir = context.get("output_dir")
+    if output_dir:
+        candidates = [Path(str(output_dir))]
+    repo_candidates = list(candidates) + [REPO_ROOT]
+
+    for base in repo_candidates:
+        try:
+            return str(path_obj.resolve().relative_to(base.resolve()))
+        except Exception:
+            continue
+    return str(path_obj)
+
+
+def _percentage(part: float, total: float) -> float | None:
+    """Return the percentage contribution of ``part`` to ``total``."""
+
+    if total in (0, None):
+        return None
+    try:
+        return (float(part) / float(total)) * 100.0
+    except ZeroDivisionError:  # pragma: no cover - defensive
+        return None
+
+
+def _format_timing_summary(timings: Mapping[str, float]) -> str | None:
+    """Return a compact human-readable summary for ``timings``."""
+
+    if not timings:
+        return None
+    parts = [f"{name}={value:.3f}s" for name, value in sorted(timings.items())]
+    return "; ".join(parts)
+
+
+def _method_sort_key(method: BenchmarkMethod) -> tuple[int, str]:
+    """Return a stable sort key that groups methods by category."""
+
+    try:
+        category_index = _CATEGORY_ORDER.index(method.category)
+    except ValueError:
+        category_index = len(_CATEGORY_ORDER)
+    return (category_index, method.name)
+
+
+def _postprocess_results(df: pd.DataFrame) -> pd.DataFrame:
+    """Return ``df`` with normalised column names, ordering, and sorting."""
+
+    if df.empty:
+        return df
+
+    table = df.copy()
+
+    rename_map = {
+        "elapsed_seconds": "runtime_seconds",
+        "max_memory_mb": "peak_memory_mb",
+    }
+    table = table.rename(columns={k: v for k, v in rename_map.items() if k in table.columns})
+
+    numeric_columns = [
+        "runtime_seconds",
+        "peak_memory_mb",
+        "cells_total",
+        "cells_kept",
+        "cells_removed",
+        "cells_kept_pct",
+        "genes_total",
+        "genes_kept",
+        "genes_removed",
+        "genes_kept_pct",
+        "rows",
+        "columns",
+        "groups",
+        "genes",
+        "effect_max_abs_diff",
+        "statistic_max_abs_diff",
+        "pvalue_max_abs_diff",
+        "stream_total_seconds",
+        "reference_total_seconds",
+        "stream_peak_memory_mb",
+        "reference_peak_memory_mb",
+    ]
+    for column in numeric_columns:
+        if column in table.columns:
+            table[column] = pd.to_numeric(table[column], errors="coerce")
+
+    if "category" in table.columns:
+        categories = table["category"].fillna("Uncategorised").astype(str)
+        extra_categories = sorted({c for c in categories.unique() if c not in _CATEGORY_ORDER})
+        dtype = pd.CategoricalDtype(categories=_CATEGORY_ORDER + extra_categories, ordered=True)
+        table["category"] = categories.astype(dtype)
+        table = table.sort_values(["category", "method"], kind="stable")
+        table["category"] = table["category"].astype(str)
+    else:
+        table = table.sort_values(["method"], kind="stable")
+
+    preferred_order = [
+        "category",
+        "method",
+        "description",
+        "status",
+        "runtime_seconds",
+        "peak_memory_mb",
+        "cells_total",
+        "cells_kept",
+        "cells_kept_pct",
+        "cells_removed",
+        "genes_total",
+        "genes_kept",
+        "genes_kept_pct",
+        "genes_removed",
+        "rows",
+        "columns",
+        "groups",
+        "genes",
+        "comparison_category",
+        "test_type",
+        "reference_tool",
+        "effect_max_abs_diff",
+        "statistic_max_abs_diff",
+        "pvalue_max_abs_diff",
+        "stream_total_seconds",
+        "reference_total_seconds",
+        "stream_peak_memory_mb",
+        "reference_peak_memory_mb",
+        "stream_timing_breakdown",
+        "reference_timing_breakdown",
+        "result_path",
+        "streaming_result_path",
+        "reference_result_path",
+        "error",
+    ]
+    ordered_columns = [col for col in preferred_order if col in table.columns]
+    remaining_columns = [col for col in table.columns if col not in ordered_columns]
+    table = table[ordered_columns + remaining_columns]
+
+    table = table.dropna(axis=1, how="all")
+    return table.reset_index(drop=True)
 
 
 def _streaming_de_to_frame(result: Mapping[str, Any]) -> pd.DataFrame:
@@ -496,18 +649,23 @@ def compare_pertpy_de(
     )
 
 def _summarise_quality_control(result: Any, context: Dict[str, Any]) -> Dict[str, Any]:
-    total_cells = context.get("dataset_cells", 0)
-    total_genes = context.get("dataset_genes", 0)
+    total_cells = int(context.get("dataset_cells", 0))
+    total_genes = int(context.get("dataset_genes", 0))
     kept_cells = int(getattr(result, "cell_mask").sum())
     kept_genes = int(getattr(result, "gene_mask").sum())
+    removed_cells = max(total_cells - kept_cells, 0)
+    removed_genes = max(total_genes - kept_genes, 0)
+    result_path = _normalise_path(getattr(result, "filtered_path", None), context)
     return {
-        "total_cells": total_cells,
-        "kept_cells": kept_cells,
-        "cells_removed": max(total_cells - kept_cells, 0),
-        "total_genes": total_genes,
-        "kept_genes": kept_genes,
-        "genes_removed": max(total_genes - kept_genes, 0),
-        "output_path": str(getattr(result, "filtered_path")),
+        "cells_total": total_cells,
+        "cells_kept": kept_cells,
+        "cells_removed": removed_cells,
+        "cells_kept_pct": _percentage(kept_cells, total_cells) if total_cells else None,
+        "genes_total": total_genes,
+        "genes_kept": kept_genes,
+        "genes_removed": removed_genes,
+        "genes_kept_pct": _percentage(kept_genes, total_genes) if total_genes else None,
+        "result_path": result_path,
     }
 
 
@@ -516,7 +674,10 @@ def _summarise_dataframe(result: Any, context: Dict[str, Any]) -> Dict[str, Any]
         rows, cols = result.shape
     else:
         rows = cols = 0
-    return {"rows": int(rows), "columns": int(cols)}
+    return {
+        "rows": int(rows),
+        "columns": int(cols),
+    }
 
 
 def _summarise_de_mapping(result: Any, context: Dict[str, Any]) -> Dict[str, Any]:
@@ -546,30 +707,39 @@ def _summarise_de_mapping(result: Any, context: Dict[str, Any]) -> Dict[str, Any
         "genes": n_genes,
     }
     if output_path:
-        summary["output_path"] = str(output_path)
+        summary["result_path"] = _normalise_path(output_path, context)
     return summary
 
 
 def _summarise_scanpy_comparison(result: ComparisonResult, context: Dict[str, Any]) -> Dict[str, Any]:
     """Summarise quality control and preprocessing comparisons with Scanpy."""
 
-    summary = {
+    stream_total = sum(result.streamlined_timings.values()) if result.streamlined_timings else None
+    reference_total = sum(result.reference_timings.values()) if result.reference_timings else None
+    return {
         "comparison_category": "quality_control_preprocessing",
         "reference_tool": "scanpy",
         "normalization_max_abs_diff": result.normalization_max_abs_diff,
         "log1p_max_abs_diff": result.log1p_max_abs_diff,
+        "avg_log_effect_max_abs_diff": result.avg_log_effect_max_abs_diff,
+        "pseudobulk_effect_max_abs_diff": result.pseudobulk_effect_max_abs_diff,
+        "wald_effect_max_abs_diff": result.wald_effect_max_abs_diff,
+        "wald_statistic_max_abs_diff": result.wald_statistic_max_abs_diff,
+        "wald_pvalue_max_abs_diff": result.wald_pvalue_max_abs_diff,
+        "wilcoxon_effect_max_abs_diff": result.wilcoxon_effect_max_abs_diff,
+        "wilcoxon_statistic_max_abs_diff": result.wilcoxon_statistic_max_abs_diff,
+        "wilcoxon_pvalue_max_abs_diff": result.wilcoxon_pvalue_max_abs_diff,
         "streamlined_cell_count": result.streamlined_cell_count,
         "reference_cell_count": result.reference_cell_count,
         "streamlined_gene_count": result.streamlined_gene_count,
         "reference_gene_count": result.reference_gene_count,
-        "avg_log_effect_max_abs_diff": result.avg_log_effect_max_abs_diff,
-        "pseudobulk_effect_max_abs_diff": result.pseudobulk_effect_max_abs_diff,
-        "streamlined_peak_memory_mb": result.streamlined_peak_memory_mb,
+        "stream_peak_memory_mb": result.streamlined_peak_memory_mb,
         "reference_peak_memory_mb": result.reference_peak_memory_mb,
-        "stream_timings": json.dumps(result.streamlined_timings),
-        "reference_timings": json.dumps(result.reference_timings),
+        "stream_total_seconds": stream_total,
+        "reference_total_seconds": reference_total,
+        "stream_timing_breakdown": _format_timing_summary(result.streamlined_timings),
+        "reference_timing_breakdown": _format_timing_summary(result.reference_timings),
     }
-    return summary
 
 
 def _summarise_de_comparison(
@@ -584,8 +754,8 @@ def _summarise_de_comparison(
         "effect_max_abs_diff": result.effect_max_abs_diff,
         "statistic_max_abs_diff": result.statistic_max_abs_diff,
         "pvalue_max_abs_diff": result.pvalue_max_abs_diff,
-        "streaming_result_path": result.streaming_result_path,
-        "reference_result_path": result.reference_result_path,
+        "streaming_result_path": _normalise_path(result.streaming_result_path, context),
+        "reference_result_path": _normalise_path(result.reference_result_path, context),
     }
     if result.error:
         summary["error"] = result.error
@@ -731,6 +901,7 @@ def build_methods(dataset_path: Path, output_dir: Path) -> Dict[str, BenchmarkMe
                 "data_name": "benchmark",
             },
             summary=_summarise_quality_control,
+            category="Streaming pipeline",
         ),
         "average_log_expression": BenchmarkMethod(
             name="average_log_expression",
@@ -743,6 +914,7 @@ def build_methods(dataset_path: Path, output_dir: Path) -> Dict[str, BenchmarkMe
                 "data_name": "benchmark_avg_log",
             },
             summary=_summarise_dataframe,
+            category="Streaming pipeline",
         ),
         "pseudobulk_expression": BenchmarkMethod(
             name="pseudobulk_expression",
@@ -755,6 +927,7 @@ def build_methods(dataset_path: Path, output_dir: Path) -> Dict[str, BenchmarkMe
                 "data_name": "benchmark_pseudobulk",
             },
             summary=_summarise_dataframe,
+            category="Streaming pipeline",
         ),
         "wald_test": BenchmarkMethod(
             name="wald_test",
@@ -767,6 +940,7 @@ def build_methods(dataset_path: Path, output_dir: Path) -> Dict[str, BenchmarkMe
                 "data_name": "benchmark_wald",
             },
             summary=_summarise_de_mapping,
+            category="Differential expression",
         ),
         "wilcoxon_test": BenchmarkMethod(
             name="wilcoxon_test",
@@ -779,6 +953,7 @@ def build_methods(dataset_path: Path, output_dir: Path) -> Dict[str, BenchmarkMe
                 "data_name": "benchmark_wilcoxon",
             },
             summary=_summarise_de_mapping,
+            category="Differential expression",
         ),
         "scanpy_quality_control_comparison": BenchmarkMethod(
             name="scanpy_quality_control_comparison",
@@ -795,6 +970,7 @@ def build_methods(dataset_path: Path, output_dir: Path) -> Dict[str, BenchmarkMe
                 "output_dir": output_dir,
             },
             summary=_summarise_scanpy_comparison,
+            category="Reference: Scanpy",
         ),
         "scanpy_wald_comparison": BenchmarkMethod(
             name="scanpy_wald_comparison",
@@ -812,6 +988,7 @@ def build_methods(dataset_path: Path, output_dir: Path) -> Dict[str, BenchmarkMe
                 "test_type": "wald",
             },
             summary=_summarise_de_comparison,
+            category="Reference: Scanpy",
         ),
         "scanpy_wilcoxon_comparison": BenchmarkMethod(
             name="scanpy_wilcoxon_comparison",
@@ -829,6 +1006,7 @@ def build_methods(dataset_path: Path, output_dir: Path) -> Dict[str, BenchmarkMe
                 "test_type": "wilcoxon",
             },
             summary=_summarise_de_comparison,
+            category="Reference: Scanpy",
         ),
         "pertpy_edger_comparison": BenchmarkMethod(
             name="pertpy_edger_comparison",
@@ -846,6 +1024,7 @@ def build_methods(dataset_path: Path, output_dir: Path) -> Dict[str, BenchmarkMe
                 "backend": "edger",
             },
             summary=_summarise_de_comparison,
+            category="Reference: Pertpy",
         ),
         "pertpy_pydeseq2_comparison": BenchmarkMethod(
             name="pertpy_pydeseq2_comparison",
@@ -863,6 +1042,7 @@ def build_methods(dataset_path: Path, output_dir: Path) -> Dict[str, BenchmarkMe
                 "backend": "pydeseq2",
             },
             summary=_summarise_de_comparison,
+            category="Reference: Pertpy",
         ),
         "pertpy_statsmodels_comparison": BenchmarkMethod(
             name="pertpy_statsmodels_comparison",
@@ -880,6 +1060,7 @@ def build_methods(dataset_path: Path, output_dir: Path) -> Dict[str, BenchmarkMe
                 "backend": "statsmodels",
             },
             summary=_summarise_de_comparison,
+            category="Reference: Pertpy",
         ),
     }
     return methods
@@ -921,22 +1102,22 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _dataframe_to_markdown(df: pd.DataFrame) -> str:
-    """Render ``df`` as a GitHub-friendly Markdown table without extra dependencies."""
+def _frame_to_markdown_table(table: pd.DataFrame) -> str:
+    """Render ``table`` as a Markdown table suitable for GitHub."""
 
-    if df.empty:
+    if table.empty:
         return "| |\n|---|\n"
 
-    table = df.copy()
-    numeric_cols = table.select_dtypes(include=["number"]).columns
+    formatted = table.copy()
+    numeric_cols = formatted.select_dtypes(include=["number"]).columns
     if len(numeric_cols) > 0:
-        table[numeric_cols] = table[numeric_cols].round(3)
+        formatted[numeric_cols] = formatted[numeric_cols].round(3)
 
-    headers = list(table.columns)
+    headers = list(formatted.columns)
     header_row = "| " + " | ".join(str(h) for h in headers) + " |"
     separator_row = "| " + " | ".join("---" for _ in headers) + " |"
     data_rows = []
-    for _, row in table.iterrows():
+    for _, row in formatted.iterrows():
         values = []
         for value in row:
             if pd.isna(value):
@@ -945,6 +1126,25 @@ def _dataframe_to_markdown(df: pd.DataFrame) -> str:
                 values.append(str(value))
         data_rows.append("| " + " | ".join(values) + " |")
     return "\n".join([header_row, separator_row, *data_rows]) + "\n"
+
+
+def _dataframe_to_markdown(df: pd.DataFrame) -> str:
+    """Render ``df`` as grouped Markdown tables, one section per category."""
+
+    if df.empty:
+        return "| |\n|---|\n"
+
+    if "category" not in df.columns:
+        return _frame_to_markdown_table(df)
+
+    sections: list[str] = []
+    for category, group in df.groupby("category", sort=False):
+        reduced = group.drop(columns=["category"]).copy()
+        drop_cols = [col for col in reduced.columns if reduced[col].isna().all()]
+        if drop_cols:
+            reduced = reduced.drop(columns=drop_cols)
+        sections.append(f"### {category}\n\n" + _frame_to_markdown_table(reduced))
+    return "\n".join(sections)
 
 
 def main() -> None:
@@ -962,9 +1162,14 @@ def main() -> None:
 
     context = _load_dataset_context(dataset_path)
     context["dataset_path"] = str(dataset_path)
+    context["output_dir"] = output_dir
 
     available_methods = build_methods(dataset_path, output_dir)
-    selected_names = args.methods or sorted(available_methods)
+    if args.methods:
+        selected_names = args.methods
+    else:
+        ordered_methods = sorted(available_methods.values(), key=_method_sort_key)
+        selected_names = [method.name for method in ordered_methods]
 
     rows = []
     memory_limit_bytes = None
@@ -977,6 +1182,7 @@ def main() -> None:
         method = available_methods[name]
         result = _run_with_limits(method, context, memory_limit_bytes, args.time_limit)
         row = {
+            "category": method.category,
             "method": method.name,
             "description": method.description,
             "status": result.get("status"),
@@ -990,7 +1196,7 @@ def main() -> None:
             row["error"] = result["error"]
         rows.append(row)
 
-    df = pd.DataFrame(rows)
+    df = _postprocess_results(pd.DataFrame(rows))
     csv_path = output_dir / "benchmark_results.csv"
     md_path = output_dir / "benchmark_results.md"
     df.to_csv(csv_path, index=False)
