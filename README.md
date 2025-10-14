@@ -14,3 +14,21 @@ Run the tests with:
 ```bash
 pytest
 ```
+
+## Benchmarking
+
+The `benchmarking` directory contains a reusable script for profiling the
+streaming analysis methods. Generate the synthetic demo dataset with
+`python benchmarking/generate_demo_dataset.py` (or provide your own `.h5ad`)
+and then execute `python benchmarking/run_benchmarks.py` to generate CSV and
+Markdown summaries alongside the intermediate `.h5ad` outputs in the selected
+results directory.
+
+## Documentation
+
+Sphinx configuration files live under `docs/` so the package can be published on
+Read the Docs. Build the documentation locally with:
+
+```bash
+sphinx-build docs docs/_build
+```
