@@ -24,6 +24,7 @@ test = [
     "scanpy>=1.9.2",
     "pytest",
     "statsmodels>=0.14",
+    "pydeseq2>=0.4",
 ]
 
 [tool.pytest.ini_options]
