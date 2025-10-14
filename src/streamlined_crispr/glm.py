@@ -119,15 +119,19 @@ class NBGLMFitter:
             z = eta + (y - mu) / np.maximum(mu, self.min_mu)
             working_response = z - self.offset
             beta_new, cov_beta = self._weighted_least_squares(weights, working_response)
-            if np.max(np.abs(beta_new - beta)) < self.tol:
-                beta = beta_new
-                converged = True
-                deviance = self._compute_deviance(y, mu, alpha)
-                break
+            beta_diff = float(np.max(np.abs(beta_new - beta)))
             beta = beta_new
-            deviance = self._compute_deviance(y, mu, alpha)
+            alpha_prev = alpha
             if self.dispersion is None:
                 alpha = self._update_alpha(y, mu, alpha)
+                alpha_diff = abs(alpha - alpha_prev)
+            else:
+                alpha_diff = 0.0
+            deviance = self._compute_deviance(y, mu, alpha)
+            tol_alpha = self.tol * max(1.0, abs(alpha_prev))
+            if beta_diff < self.tol and alpha_diff <= tol_alpha:
+                converged = True
+                break
         else:
             # If we exit the loop without breaking we did not converge.
             cov_beta = self._hessian_inverse(weights)
