@@ -22,7 +22,9 @@ streaming analysis methods. Generate the synthetic demo dataset with
 `python benchmarking/generate_demo_dataset.py` (or provide your own `.h5ad`)
 and then execute `python benchmarking/run_benchmarks.py` to generate CSV and
 Markdown summaries alongside the intermediate `.h5ad` outputs in the selected
-results directory.
+results directory. The Markdown report now opens with a short narrative that
+highlights overall success rates, category-level runtimes, and any dependency
+issues before presenting the detailed tables.
 
 Benchmark outputs report more than the maximum absolute differences between
 streaming and reference pipelines. Each differential expression comparison
@@ -31,6 +33,11 @@ now includes Pearson and Spearman correlations, top-`k` overlaps (by default
 when ground-truth labels are present in the merged results. These metrics
 surface whether rankings agree in addition to absolute magnitudes, making it
 easier to spot systematic discrepancies.
+
+Every run additionally emits a machine-readable
+`benchmark_results_summary.json` containing aggregate counts, runtime averages,
+and grouped error metadata so dashboards can ingest the results directly
+without parsing tables.
 
 ## Documentation
 

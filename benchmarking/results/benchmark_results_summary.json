@@ -1,0 +1,77 @@
+{
+  "average_runtime_seconds": 0.5604430399094286,
+  "categories": [
+    {
+      "average_runtime_seconds": 0.18780461433198067,
+      "category": "Streaming pipeline",
+      "method_count": 3,
+      "status_counts": {
+        "success": 3
+      }
+    },
+    {
+      "average_runtime_seconds": 0.2305889575036417,
+      "category": "Differential expression",
+      "method_count": 2,
+      "status_counts": {
+        "success": 2
+      }
+    },
+    {
+      "average_runtime_seconds": 1.5396104923347596,
+      "category": "Reference: Scanpy",
+      "method_count": 3,
+      "status_counts": {
+        "error": 1,
+        "success": 2
+      }
+    },
+    {
+      "average_runtime_seconds": 0.17381673466540323,
+      "category": "Reference: Pertpy",
+      "method_count": 3,
+      "status_counts": {
+        "success": 3
+      }
+    }
+  ],
+  "dependency_errors": [
+    "No module named 'pertpy'"
+  ],
+  "error_count": 1,
+  "error_details": [
+    {
+      "category": "Reference: Scanpy",
+      "error": "zero-size array to reduction operation maximum which has no identity",
+      "method": "scanpy_quality_control_comparison"
+    },
+    {
+      "category": "Reference: Pertpy",
+      "error": "No module named 'pertpy'",
+      "method": "pertpy_edger_comparison"
+    },
+    {
+      "category": "Reference: Pertpy",
+      "error": "No module named 'pertpy'",
+      "method": "pertpy_pydeseq2_comparison"
+    },
+    {
+      "category": "Reference: Pertpy",
+      "error": "No module named 'pertpy'",
+      "method": "pertpy_statsmodels_comparison"
+    }
+  ],
+  "memory_limit_count": 0,
+  "non_success_count": 1,
+  "other_errors": [
+    "zero-size array to reduction operation maximum which has no identity"
+  ],
+  "status_counts": {
+    "error": 1,
+    "success": 10
+  },
+  "success_count": 10,
+  "success_rate": 0.9090909090909091,
+  "timeout_count": 0,
+  "total_methods": 11
+}
