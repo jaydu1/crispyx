@@ -24,6 +24,11 @@ Outputs
 * A GitHub-friendly table at ``benchmarking/results/benchmark_results.md``.
 * Intermediate AnnData files written directly to ``benchmarking/results`` (or
   any directory provided via ``--output-dir``).
+* Comprehensive differential expression parity metrics: max absolute
+  differences, Pearson/Spearman correlations, top-``k`` overlaps (``k=50`` by
+  default), and AUROC values when ground-truth labels are present. These are
+  captured in both the CSV and Markdown summaries so ranking agreement is easy
+  to audit alongside effect size deviations.
 
 The script accepts additional options to benchmark a subset of methods or to
 redirect outputs to a different directory. Refer to ``benchmarking/README.md``

@@ -25,6 +25,7 @@ from .data import (
     read_backed,
 )
 from .de import _tie_correction, wald_test, wilcoxon_test
+from .metrics import compute_de_comparison_metrics
 from .pseudobulk import compute_average_log_expression, compute_pseudobulk_expression
 from .qc import quality_control_summary
 
@@ -41,18 +42,38 @@ class ComparisonResult:
     reference_gene_count: int
     avg_log_effect_max_abs_diff: float
     pseudobulk_effect_max_abs_diff: float
-    wald_effect_max_abs_diff: float
-    wald_statistic_max_abs_diff: float
-    wald_pvalue_max_abs_diff: float
-    wilcoxon_effect_max_abs_diff: float
-    wilcoxon_statistic_max_abs_diff: float
-    wilcoxon_pvalue_max_abs_diff: float
+    wald_metrics: Mapping[str, Optional[float]]
+    wilcoxon_metrics: Mapping[str, Optional[float]]
     streamlined_peak_memory_mb: float
     reference_peak_memory_mb: float
     streamlined_timings: Mapping[str, float]
     reference_timings: Mapping[str, float]
     streamlined_effects: Mapping[str, pd.DataFrame]
     reference_effects: Mapping[str, pd.DataFrame]
+
+    @property
+    def wald_effect_max_abs_diff(self) -> Optional[float]:
+        return self.wald_metrics.get("effect_max_abs_diff")
+
+    @property
+    def wald_statistic_max_abs_diff(self) -> Optional[float]:
+        return self.wald_metrics.get("statistic_max_abs_diff")
+
+    @property
+    def wald_pvalue_max_abs_diff(self) -> Optional[float]:
+        return self.wald_metrics.get("pvalue_max_abs_diff")
+
+    @property
+    def wilcoxon_effect_max_abs_diff(self) -> Optional[float]:
+        return self.wilcoxon_metrics.get("effect_max_abs_diff")
+
+    @property
+    def wilcoxon_statistic_max_abs_diff(self) -> Optional[float]:
+        return self.wilcoxon_metrics.get("statistic_max_abs_diff")
+
+    @property
+    def wilcoxon_pvalue_max_abs_diff(self) -> Optional[float]:
+        return self.wilcoxon_metrics.get("pvalue_max_abs_diff")
 
 
 @dataclass
@@ -202,6 +223,70 @@ def _align_frames(left: pd.DataFrame, right: pd.DataFrame) -> tuple[pd.DataFrame
         left_aligned.loc[common_rows, common_cols],
         right_aligned.loc[common_rows, common_cols],
     )
+
+
+def _normalise_metric_array(values: object, length: int) -> np.ndarray:
+    if length == 0:
+        return np.array([], dtype=float)
+    if values is None:
+        return np.full(length, np.nan, dtype=float)
+    array = np.asarray(values)
+    if array.ndim == 0:
+        return np.full(length, float(array), dtype=float)
+    array = array.reshape(-1)
+    if array.size >= length:
+        return array[:length].astype(float)
+    padded = np.full(length, np.nan, dtype=float)
+    padded[: array.size] = array.astype(float)
+    return padded
+
+
+def _stream_results_to_frame(results: Mapping[str, object]) -> pd.DataFrame:
+    columns = ["perturbation", "gene", "effect_size", "statistic", "pvalue"]
+    frames: list[pd.DataFrame] = []
+    for label, result in results.items():
+        genes = getattr(result, "genes", None)
+        if genes is None:
+            continue
+        gene_index = pd.Index(genes).astype(str)
+        n_genes = len(gene_index)
+        if n_genes == 0:
+            continue
+        data = {
+            "perturbation": [str(label)] * n_genes,
+            "gene": gene_index,
+            "effect_size": _normalise_metric_array(getattr(result, "effect_size", None), n_genes),
+            "statistic": _normalise_metric_array(getattr(result, "statistic", None), n_genes),
+            "pvalue": _normalise_metric_array(getattr(result, "pvalue", None), n_genes),
+        }
+        frames.append(pd.DataFrame(data))
+    if frames:
+        return pd.concat(frames, ignore_index=True)
+    return pd.DataFrame(columns=columns)
+
+
+def _reference_results_to_frame(reference: Mapping[str, Dict[str, np.ndarray]]) -> pd.DataFrame:
+    columns = ["perturbation", "gene", "effect_size", "statistic", "pvalue"]
+    frames: list[pd.DataFrame] = []
+    for label, payload in reference.items():
+        genes = payload.get("genes")
+        if genes is None:
+            continue
+        gene_index = pd.Index(genes).astype(str)
+        n_genes = len(gene_index)
+        if n_genes == 0:
+            continue
+        data = {
+            "perturbation": [str(label)] * n_genes,
+            "gene": gene_index,
+            "effect_size": _normalise_metric_array(payload.get("effect"), n_genes),
+            "statistic": _normalise_metric_array(payload.get("statistic"), n_genes),
+            "pvalue": _normalise_metric_array(payload.get("pvalue"), n_genes),
+        }
+        frames.append(pd.DataFrame(data))
+    if frames:
+        return pd.concat(frames, ignore_index=True)
+    return pd.DataFrame(columns=columns)
 
 
 def _resolve_reference_candidates(
@@ -607,47 +692,14 @@ def compare_with_scanpy(
         np.max(np.abs(aligned_pseudo.to_numpy() - aligned_ref_pseudo.to_numpy()))
     )
 
-    def _max_abs_diff_from_results(
-        stream_dict: Mapping[str, object],
-        reference_dict: Dict[str, Dict[str, np.ndarray]],
-        stream_attr: str,
-        reference_key: str,
-    ) -> float:
-        max_diff = 0.0
-        for label, stream_result in stream_dict.items():
-            if label not in reference_dict:
-                continue
-            ref_result = reference_dict[label]
-            stream_series = pd.Series(
-                getattr(stream_result, stream_attr), index=stream_result.genes
-            )
-            ref_series = pd.Series(ref_result[reference_key], index=ref_result["genes"])
-            aligned_stream, aligned_ref = stream_series.align(ref_series)
-            if aligned_stream.empty:
-                continue
-            diff = float(
-                np.max(np.abs(aligned_stream.to_numpy() - aligned_ref.to_numpy()))
-            )
-            max_diff = max(max_diff, diff)
-        return max_diff
+    wald_stream_df = _stream_results_to_frame(wald_results)
+    wald_reference_df = _reference_results_to_frame(reference_wald)
+    wald_metrics = compute_de_comparison_metrics(wald_stream_df, wald_reference_df)
 
-    wald_effect_diff = _max_abs_diff_from_results(
-        wald_results, reference_wald, "effect_size", "effect"
-    )
-    wald_stat_diff = _max_abs_diff_from_results(
-        wald_results, reference_wald, "statistic", "statistic"
-    )
-    wald_pvalue_diff = _max_abs_diff_from_results(
-        wald_results, reference_wald, "pvalue", "pvalue"
-    )
-    wilcoxon_effect_diff = _max_abs_diff_from_results(
-        wilcoxon_results, reference_wilcoxon, "effect_size", "effect"
-    )
-    wilcoxon_stat_diff = _max_abs_diff_from_results(
-        wilcoxon_results, reference_wilcoxon, "statistic", "statistic"
-    )
-    wilcoxon_pvalue_diff = _max_abs_diff_from_results(
-        wilcoxon_results, reference_wilcoxon, "pvalue", "pvalue"
+    wilcoxon_stream_df = _stream_results_to_frame(wilcoxon_results)
+    wilcoxon_reference_df = _reference_results_to_frame(reference_wilcoxon)
+    wilcoxon_metrics = compute_de_comparison_metrics(
+        wilcoxon_stream_df, wilcoxon_reference_df
     )
 
     return ComparisonResult(
@@ -659,12 +711,8 @@ def compare_with_scanpy(
         reference_gene_count=reference_gene_count,
         avg_log_effect_max_abs_diff=avg_diff,
         pseudobulk_effect_max_abs_diff=pseudo_diff,
-        wald_effect_max_abs_diff=wald_effect_diff,
-        wald_statistic_max_abs_diff=wald_stat_diff,
-        wald_pvalue_max_abs_diff=wald_pvalue_diff,
-        wilcoxon_effect_max_abs_diff=wilcoxon_effect_diff,
-        wilcoxon_statistic_max_abs_diff=wilcoxon_stat_diff,
-        wilcoxon_pvalue_max_abs_diff=wilcoxon_pvalue_diff,
+        wald_metrics=wald_metrics,
+        wilcoxon_metrics=wilcoxon_metrics,
         streamlined_peak_memory_mb=streamlined_peak_memory_mb,
         reference_peak_memory_mb=reference_peak_memory_mb,
         streamlined_timings=timings_streamlined,

@@ -26,6 +26,7 @@ if str(REPO_ROOT) not in sys.path:
 from benchmarking.generate_demo_dataset import write_demo_dataset
 from streamlined_crispr.data import read_backed
 from streamlined_crispr.de import wald_test, wilcoxon_test
+from streamlined_crispr.metrics import DE_METRIC_KEYS, compute_de_comparison_metrics
 from streamlined_crispr.pseudobulk import (
     compute_average_log_expression,
     compute_pseudobulk_expression,
@@ -52,12 +53,22 @@ class DifferentialComparisonSummary:
 
     test_type: str
     reference_tool: str
-    effect_max_abs_diff: float | None
-    statistic_max_abs_diff: float | None
-    pvalue_max_abs_diff: float | None
+    metrics: Dict[str, Optional[float]]
     streaming_result_path: str | None
     reference_result_path: str | None
     error: Optional[str] = None
+
+    @property
+    def effect_max_abs_diff(self) -> Optional[float]:
+        return self.metrics.get("effect_max_abs_diff")
+
+    @property
+    def statistic_max_abs_diff(self) -> Optional[float]:
+        return self.metrics.get("statistic_max_abs_diff")
+
+    @property
+    def pvalue_max_abs_diff(self) -> Optional[float]:
+        return self.metrics.get("pvalue_max_abs_diff")
 
 
 _STANDARD_DE_COLUMNS = ["perturbation", "gene", "effect_size", "statistic", "pvalue"]
@@ -150,14 +161,14 @@ def _postprocess_results(df: pd.DataFrame) -> pd.DataFrame:
         "columns",
         "groups",
         "genes",
-        "effect_max_abs_diff",
-        "statistic_max_abs_diff",
-        "pvalue_max_abs_diff",
         "stream_total_seconds",
         "reference_total_seconds",
         "stream_peak_memory_mb",
         "reference_peak_memory_mb",
     ]
+    numeric_columns.extend(
+        key for key in DE_METRIC_KEYS if key not in numeric_columns
+    )
     for column in numeric_columns:
         if column in table.columns:
             table[column] = pd.to_numeric(table[column], errors="coerce")
@@ -197,6 +208,17 @@ def _postprocess_results(df: pd.DataFrame) -> pd.DataFrame:
         "effect_max_abs_diff",
         "statistic_max_abs_diff",
         "pvalue_max_abs_diff",
+        "effect_pearson_corr",
+        "effect_spearman_corr",
+        "effect_top_k_overlap",
+        "statistic_pearson_corr",
+        "statistic_spearman_corr",
+        "statistic_top_k_overlap",
+        "pvalue_pearson_corr",
+        "pvalue_spearman_corr",
+        "pvalue_top_k_overlap",
+        "pvalue_stream_auroc",
+        "pvalue_reference_auroc",
         "stream_total_seconds",
         "reference_total_seconds",
         "stream_peak_memory_mb",
@@ -290,26 +312,12 @@ def _standardise_de_dataframe(df: Optional[pd.DataFrame]) -> pd.DataFrame:
     return result
 
 
-def _compare_de_frames(streaming: pd.DataFrame, reference: pd.DataFrame) -> Dict[str, Optional[float]]:
-    """Return max absolute differences between streaming and reference metrics."""
+def _compare_de_frames(
+    streaming: pd.DataFrame, reference: pd.DataFrame
+) -> Dict[str, Optional[float]]:
+    """Return comparison metrics between streaming and reference DE results."""
 
-    if streaming.empty or reference.empty:
-        return {"effect_size": None, "statistic": None, "pvalue": None}
-
-    merged = streaming.merge(reference, on=["perturbation", "gene"], suffixes=("_stream", "_reference"))
-    if merged.empty:
-        return {"effect_size": None, "statistic": None, "pvalue": None}
-
-    metrics: Dict[str, Optional[float]] = {}
-    for column in ["effect_size", "statistic", "pvalue"]:
-        stream_col = f"{column}_stream"
-        ref_col = f"{column}_reference"
-        if stream_col not in merged or ref_col not in merged:
-            metrics[column] = None
-            continue
-        differences = (merged[stream_col] - merged[ref_col]).abs().dropna()
-        metrics[column] = float(differences.max()) if not differences.empty else None
-    return metrics
+    return compute_de_comparison_metrics(streaming, reference)
 
 
 def _prepare_reference_anndata(
@@ -580,16 +588,14 @@ def compare_scanpy_de(
         data_name="benchmark_scanpy_reference",
     )
 
-    metrics = {"effect_size": None, "statistic": None, "pvalue": None}
+    metrics = {key: None for key in DE_METRIC_KEYS}
     if reference_df is not None:
         metrics = _compare_de_frames(streaming_frame, _standardise_de_dataframe(reference_df))
 
     return DifferentialComparisonSummary(
         test_type=test_type,
         reference_tool=f"scanpy_{reference_method}",
-        effect_max_abs_diff=metrics["effect_size"],
-        statistic_max_abs_diff=metrics["statistic"],
-        pvalue_max_abs_diff=metrics["pvalue"],
+        metrics=metrics,
         streaming_result_path=streaming_path,
         reference_result_path=str(reference_path) if reference_path else None,
         error=error,
@@ -636,16 +642,14 @@ def compare_pertpy_de(
         data_name="benchmark_pertpy_reference",
     )
 
-    metrics = {"effect_size": None, "statistic": None, "pvalue": None}
+    metrics = {key: None for key in DE_METRIC_KEYS}
     if reference_df is not None:
         metrics = _compare_de_frames(streaming_frame, _standardise_de_dataframe(reference_df))
 
     return DifferentialComparisonSummary(
         test_type="glm",
         reference_tool=f"pertpy_{backend}",
-        effect_max_abs_diff=metrics["effect_size"],
-        statistic_max_abs_diff=metrics["statistic"],
-        pvalue_max_abs_diff=metrics["pvalue"],
+        metrics=metrics,
         streaming_result_path=streaming_path,
         reference_result_path=str(reference_path) if reference_path else None,
         error=error,
@@ -719,19 +723,13 @@ def _summarise_scanpy_comparison(result: ComparisonResult, context: Dict[str, An
 
     stream_total = sum(result.streamlined_timings.values()) if result.streamlined_timings else None
     reference_total = sum(result.reference_timings.values()) if result.reference_timings else None
-    return {
+    summary = {
         "comparison_category": "quality_control_preprocessing",
         "reference_tool": "scanpy",
         "normalization_max_abs_diff": result.normalization_max_abs_diff,
         "log1p_max_abs_diff": result.log1p_max_abs_diff,
         "avg_log_effect_max_abs_diff": result.avg_log_effect_max_abs_diff,
         "pseudobulk_effect_max_abs_diff": result.pseudobulk_effect_max_abs_diff,
-        "wald_effect_max_abs_diff": result.wald_effect_max_abs_diff,
-        "wald_statistic_max_abs_diff": result.wald_statistic_max_abs_diff,
-        "wald_pvalue_max_abs_diff": result.wald_pvalue_max_abs_diff,
-        "wilcoxon_effect_max_abs_diff": result.wilcoxon_effect_max_abs_diff,
-        "wilcoxon_statistic_max_abs_diff": result.wilcoxon_statistic_max_abs_diff,
-        "wilcoxon_pvalue_max_abs_diff": result.wilcoxon_pvalue_max_abs_diff,
         "streamlined_cell_count": result.streamlined_cell_count,
         "reference_cell_count": result.reference_cell_count,
         "streamlined_gene_count": result.streamlined_gene_count,
@@ -743,6 +741,9 @@ def _summarise_scanpy_comparison(result: ComparisonResult, context: Dict[str, An
         "stream_timing_breakdown": _format_timing_summary(result.streamlined_timings),
         "reference_timing_breakdown": _format_timing_summary(result.reference_timings),
     }
+    summary.update({f"wald_{key}": value for key, value in result.wald_metrics.items()})
+    summary.update({f"wilcoxon_{key}": value for key, value in result.wilcoxon_metrics.items()})
+    return summary
 
 
 def _summarise_de_comparison(
@@ -754,12 +755,10 @@ def _summarise_de_comparison(
         "comparison_category": "differential_expression",
         "test_type": result.test_type,
         "reference_tool": result.reference_tool,
-        "effect_max_abs_diff": result.effect_max_abs_diff,
-        "statistic_max_abs_diff": result.statistic_max_abs_diff,
-        "pvalue_max_abs_diff": result.pvalue_max_abs_diff,
         "streaming_result_path": _normalise_path(result.streaming_result_path, context),
         "reference_result_path": _normalise_path(result.reference_result_path, context),
     }
+    summary.update(result.metrics)
     if result.error:
         summary["error"] = result.error
     return summary
