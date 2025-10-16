@@ -78,9 +78,13 @@ Each benchmark run writes three types of files:
    across machines.
 3. A Markdown report (`benchmark_results.md`) grouped by category
    (streaming pipeline, differential expression, and reference
-   comparisons). Each section includes only the columns that are
-   relevant for that group, making it easier to scan performance and
-   agreement metrics at a glance when browsing on GitHub.
+   comparisons). The report opens with a prose summary covering overall
+   success rates, category-level runtime averages, and any dependency or
+   runtime issues before presenting the detailed tables for each group.
+4. A JSON summary (`benchmark_results_summary.json`) that mirrors the
+   narrative headline figures—status counts, average runtimes, and
+   captured errors—in a machine-readable format ready for dashboards or
+   automated monitoring.
 
 Example outputs generated with the demo dataset are committed alongside this
 script. They provide a ready-to-view reference when browsing the repository.

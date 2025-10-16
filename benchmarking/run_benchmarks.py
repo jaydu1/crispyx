@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import argparse
+import json
 import multiprocessing as mp
 import resource
 import sys
 import time
 import traceback
+from collections import Counter
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -79,6 +81,9 @@ _CATEGORY_ORDER = [
     "Reference: Scanpy",
     "Reference: Pertpy",
 ]
+
+
+_STATUS_ORDER = ["success", "memory_limit", "timeout", "error", "unknown"]
 
 
 def _normalise_path(path: str | Path | None, context: Mapping[str, Any]) -> str | None:
@@ -236,6 +241,128 @@ def _postprocess_results(df: pd.DataFrame) -> pd.DataFrame:
 
     table = table.dropna(axis=1, how="all")
     return table.reset_index(drop=True)
+
+
+def _compute_aggregate_statistics(df: pd.DataFrame) -> Dict[str, Any]:
+    """Return aggregate benchmark statistics derived from ``df``."""
+
+    summary: Dict[str, Any] = {
+        "total_methods": int(len(df)),
+        "status_counts": {},
+        "success_count": 0,
+        "timeout_count": 0,
+        "memory_limit_count": 0,
+        "error_count": 0,
+        "non_success_count": int(len(df)),
+        "success_rate": None,
+        "average_runtime_seconds": None,
+        "categories": [],
+        "dependency_errors": [],
+        "other_errors": [],
+        "error_details": [],
+    }
+
+    if df.empty:
+        return summary
+
+    status_series = df.get("status")
+    if status_series is not None:
+        filled_status = status_series.fillna("unknown").astype(str)
+    else:
+        filled_status = pd.Series(["unknown"] * len(df))
+
+    status_counts = Counter(filled_status)
+    ordered_status_counts: Dict[str, int] = {}
+    for status in _STATUS_ORDER:
+        count = int(status_counts.get(status, 0))
+        if count:
+            ordered_status_counts[status] = count
+    for status, count in status_counts.items():
+        status = str(status)
+        if status not in ordered_status_counts:
+            ordered_status_counts[status] = int(count)
+
+    summary["status_counts"] = ordered_status_counts
+    summary["success_count"] = ordered_status_counts.get("success", 0)
+    summary["timeout_count"] = ordered_status_counts.get("timeout", 0)
+    summary["memory_limit_count"] = ordered_status_counts.get("memory_limit", 0)
+    summary["error_count"] = ordered_status_counts.get("error", 0)
+    summary["non_success_count"] = summary["total_methods"] - summary["success_count"]
+
+    if summary["total_methods"]:
+        summary["success_rate"] = summary["success_count"] / summary["total_methods"]
+
+    runtime_series = df.get("runtime_seconds")
+    if runtime_series is not None:
+        runtimes = pd.to_numeric(runtime_series, errors="coerce").dropna()
+        if not runtimes.empty:
+            summary["average_runtime_seconds"] = float(runtimes.mean())
+
+    category_summaries = []
+    if "category" in df.columns:
+        for category, group in df.groupby("category", sort=False):
+            group_status = group.get("status")
+            if group_status is not None:
+                group_status_counts = Counter(group_status.fillna("unknown").astype(str))
+            else:
+                group_status_counts = Counter()
+
+            ordered_group_counts: Dict[str, int] = {}
+            for status in _STATUS_ORDER:
+                count = int(group_status_counts.get(status, 0))
+                if count:
+                    ordered_group_counts[status] = count
+            for status, count in group_status_counts.items():
+                status = str(status)
+                if status not in ordered_group_counts:
+                    ordered_group_counts[status] = int(count)
+
+            group_runtime = group.get("runtime_seconds")
+            average_runtime = None
+            if group_runtime is not None:
+                group_runtimes = pd.to_numeric(group_runtime, errors="coerce").dropna()
+                if not group_runtimes.empty:
+                    average_runtime = float(group_runtimes.mean())
+
+            category_summaries.append(
+                {
+                    "category": str(category),
+                    "method_count": int(len(group)),
+                    "status_counts": ordered_group_counts,
+                    "average_runtime_seconds": average_runtime,
+                }
+            )
+
+    summary["categories"] = category_summaries
+
+    if "error" in df.columns:
+        error_rows = df[df["error"].notna()]
+        details = []
+        for _, row in error_rows.iterrows():
+            details.append(
+                {
+                    "method": str(row.get("method", "")),
+                    "category": str(row.get("category", "")),
+                    "error": str(row["error"]),
+                }
+            )
+        summary["error_details"] = details
+
+        dependency_keywords = ("importerror", "modulenotfounderror", "no module named")
+        dependency_errors = {
+            detail["error"]
+            for detail in details
+            if any(keyword in detail["error"].lower() for keyword in dependency_keywords)
+        }
+        other_errors = {
+            detail["error"]
+            for detail in details
+            if detail["error"] not in dependency_errors
+        }
+        summary["dependency_errors"] = sorted(dependency_errors)
+        summary["other_errors"] = sorted(other_errors)
+
+    return summary
 
 
 def _streaming_de_to_frame(result: Mapping[str, Any]) -> pd.DataFrame:
@@ -1120,6 +1247,77 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _format_summary_markdown(summary: Dict[str, Any]) -> str:
+    """Return a narrative Markdown summary for ``summary`` statistics."""
+
+    lines: list[str] = ["## Benchmark summary", ""]
+
+    total_methods = summary.get("total_methods", 0)
+    success_count = summary.get("success_count", 0)
+    timeout_count = summary.get("timeout_count", 0)
+    memory_limit_count = summary.get("memory_limit_count", 0)
+    error_count = summary.get("error_count", 0)
+    non_success = summary.get("non_success_count", 0)
+    success_rate = summary.get("success_rate")
+    average_runtime = summary.get("average_runtime_seconds")
+
+    totals_line = f"- **Methods executed:** {total_methods}"
+    lines.append(totals_line)
+
+    success_line = f"- **Succeeded:** {success_count}"
+    if success_rate is not None:
+        success_line += f" ({success_rate * 100:.1f}% success rate)"
+    lines.append(success_line)
+
+    if non_success:
+        lines.append(f"- **Did not succeed:** {non_success}")
+    if timeout_count:
+        lines.append(f"  - Timeouts: {timeout_count}")
+    if memory_limit_count:
+        lines.append(f"  - Memory limit exceeded: {memory_limit_count}")
+    if error_count:
+        lines.append(f"  - Errors: {error_count}")
+
+    if average_runtime is not None:
+        lines.append(f"- **Average runtime:** {average_runtime:.3f}s")
+
+    categories = summary.get("categories", [])
+    if categories:
+        lines.append("- **Average runtime by category:**")
+        for category_summary in categories:
+            category_name = category_summary.get("category", "Uncategorised")
+            method_count = category_summary.get("method_count", 0)
+            category_runtime = category_summary.get("average_runtime_seconds")
+            status_counts = category_summary.get("status_counts", {})
+            runtime_fragment = (
+                f"{category_runtime:.3f}s"
+                if category_runtime is not None
+                else "no runtime recorded"
+            )
+            status_fragments = [f"{status}={count}" for status, count in status_counts.items()]
+            status_clause = f" ({', '.join(status_fragments)})" if status_fragments else ""
+            lines.append(
+                f"  - {category_name}: {runtime_fragment} across {method_count} method(s){status_clause}"
+            )
+
+    dependency_errors = summary.get("dependency_errors", [])
+    other_errors = summary.get("other_errors", [])
+    if dependency_errors or other_errors:
+        lines.append("- **Notable issues:**")
+        if dependency_errors:
+            lines.append("  - Dependency errors detected:")
+            for message in dependency_errors:
+                lines.append(f"    - {message}")
+        if other_errors:
+            lines.append("  - Other errors recorded:")
+            for message in other_errors:
+                lines.append(f"    - {message}")
+    else:
+        lines.append("- **Notable issues:** None")
+
+    return "\n".join(lines).strip() + "\n"
+
+
 def _frame_to_markdown_table(table: pd.DataFrame) -> str:
     """Render ``table`` as a Markdown table suitable for GitHub."""
 
@@ -1146,14 +1344,20 @@ def _frame_to_markdown_table(table: pd.DataFrame) -> str:
     return "\n".join([header_row, separator_row, *data_rows]) + "\n"
 
 
-def _dataframe_to_markdown(df: pd.DataFrame) -> str:
+def _dataframe_to_markdown(
+    df: pd.DataFrame, summary: Optional[Dict[str, Any]] = None
+) -> str:
     """Render ``df`` as grouped Markdown tables, one section per category."""
 
+    computed_summary = summary or _compute_aggregate_statistics(df)
+    narrative = _format_summary_markdown(computed_summary)
+
     if df.empty:
-        return "| |\n|---|\n"
+        return narrative + "\n| |\n|---|\n"
 
     if "category" not in df.columns:
-        return _frame_to_markdown_table(df)
+        tables = _frame_to_markdown_table(df)
+        return narrative + "\n" + tables
 
     sections: list[str] = []
     for category, group in df.groupby("category", sort=False):
@@ -1162,7 +1366,8 @@ def _dataframe_to_markdown(df: pd.DataFrame) -> str:
         if drop_cols:
             reduced = reduced.drop(columns=drop_cols)
         sections.append(f"### {category}\n\n" + _frame_to_markdown_table(reduced))
-    return "\n".join(sections)
+    tables = "\n".join(sections)
+    return narrative + "\n" + tables
 
 
 def main() -> None:
@@ -1220,13 +1425,18 @@ def main() -> None:
         rows.append(row)
 
     df = _postprocess_results(pd.DataFrame(rows))
+    summary = _compute_aggregate_statistics(df)
     csv_path = output_dir / "benchmark_results.csv"
     md_path = output_dir / "benchmark_results.md"
+    summary_json_path = output_dir / "benchmark_results_summary.json"
+
     df.to_csv(csv_path, index=False)
-    md_path.write_text(_dataframe_to_markdown(df))
+    md_path.write_text(_dataframe_to_markdown(df, summary))
+    summary_json_path.write_text(json.dumps(summary, indent=2, sort_keys=True))
 
     print(f"Benchmark complete. Saved results to {csv_path}")
     print(f"Markdown summary written to {md_path}")
+    print(f"Aggregate summary written to {summary_json_path}")
 
 
 if __name__ == "__main__":

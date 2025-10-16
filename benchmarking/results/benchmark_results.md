@@ -1,3 +1,21 @@
+## Benchmark summary
+
+- **Methods executed:** 11
+- **Succeeded:** 10 (90.9% success rate)
+- **Did not succeed:** 1
+  - Errors: 1
+- **Average runtime:** 0.560s
+- **Average runtime by category:**
+  - Streaming pipeline: 0.188s across 3 method(s) (success=3)
+  - Differential expression: 0.231s across 2 method(s) (success=2)
+  - Reference: Scanpy: 1.540s across 3 method(s) (success=2, error=1)
+  - Reference: Pertpy: 0.174s across 3 method(s) (success=3)
+- **Notable issues:**
+  - Dependency errors detected:
+    - No module named 'pertpy'
+  - Other errors recorded:
+    - zero-size array to reduction operation maximum which has no identity
+
 ### Streaming pipeline
 
 | method | description | status | runtime_seconds | peak_memory_mb | cells_total | cells_kept | cells_kept_pct | cells_removed | genes_total | genes_kept | genes_kept_pct | genes_removed | rows | columns | result_path |
