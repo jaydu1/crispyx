@@ -24,6 +24,14 @@ and then execute `python benchmarking/run_benchmarks.py` to generate CSV and
 Markdown summaries alongside the intermediate `.h5ad` outputs in the selected
 results directory.
 
+Benchmark outputs report more than the maximum absolute differences between
+streaming and reference pipelines. Each differential expression comparison
+now includes Pearson and Spearman correlations, top-`k` overlaps (by default
+`k=50`) for effect sizes, statistics, and *p*-values, as well as AUROC scores
+when ground-truth labels are present in the merged results. These metrics
+surface whether rankings agree in addition to absolute magnitudes, making it
+easier to spot systematic discrepancies.
+
 ## Documentation
 
 Sphinx configuration files live under `docs/` so the package can be published on
