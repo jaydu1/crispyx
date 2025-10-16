@@ -20,7 +20,10 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 SRC_PATH = REPO_ROOT / "src"
 if str(SRC_PATH) not in sys.path:
     sys.path.insert(0, str(SRC_PATH))
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
+from benchmarking.generate_demo_dataset import write_demo_dataset
 from streamlined_crispr.data import read_backed
 from streamlined_crispr.de import wald_test, wilcoxon_test
 from streamlined_crispr.pseudobulk import (
@@ -1099,6 +1102,22 @@ def parse_args() -> argparse.Namespace:
         default=4.0,
         help="Maximum memory per method in gigabytes (0 disables the limit)",
     )
+    parser.add_argument(
+        "--generate-demo",
+        action="store_true",
+        help=(
+            "Generate the synthetic demo dataset at --data-path before running the benchmarks. "
+            "This is useful when bootstrapping a fresh checkout."
+        ),
+    )
+    parser.add_argument(
+        "--demo-seed",
+        type=int,
+        default=0,
+        help=(
+            "Random seed used when generating the demo dataset (set to -1 to sample a random seed)."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -1153,10 +1172,15 @@ def main() -> None:
     output_dir: Path = args.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    if args.generate_demo:
+        seed = None if args.demo_seed == -1 else args.demo_seed
+        generated = write_demo_dataset(dataset_path, seed=seed)
+        print(f"Generated demo dataset at {generated}")
+
     if not dataset_path.exists():
         raise FileNotFoundError(
             f"Dataset '{dataset_path}' was not found. "
-            "Generate it with 'python benchmarking/generate_demo_dataset.py' "
+            "Generate it with --generate-demo or 'python benchmarking/generate_demo_dataset.py', "
             "or supply --data-path to an existing .h5ad file."
         )
 

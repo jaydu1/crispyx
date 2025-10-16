@@ -19,6 +19,14 @@ available methods against the generated dataset:
 python benchmarking/run_benchmarks.py
 ```
 
+Alternatively, you can have the benchmark script regenerate the demo
+dataset on demand by providing the ``--generate-demo`` flag. This is
+helpful when bootstrapping a fresh checkout:
+
+```bash
+python benchmarking/run_benchmarks.py --generate-demo
+```
+
 The script enforces configurable CPU-time and memory limits for each
 method. When a method exceeds the requested resources it is terminated
 and the failure is recorded in the output table.
@@ -52,6 +60,10 @@ Key command line options:
   disable the guard).
 - `--memory-limit`: Memory cap per method in GiB (set to `0` to disable
   the guard).
+- `--generate-demo`: Regenerate the bundled synthetic dataset at
+  `--data-path` before running the benchmarks.
+- `--demo-seed`: Random seed to use when generating the demo dataset
+  (set to `-1` to sample a different seed each time).
 
 ## Outputs
 
