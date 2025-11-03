@@ -12,6 +12,7 @@ import traceback
 from collections import Counter
 from collections.abc import Mapping
 from dataclasses import dataclass
+from importlib import import_module
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Optional
 
@@ -537,6 +538,84 @@ def _resolve_pertpy_runner(module: Any, method: str) -> Optional[Callable[..., A
     return None
 
 
+def _resolve_pertpy_class_runner(module: Any, method: str) -> Optional[Callable[..., Any]]:
+    """Return a callable wrapper for class-based Pertpy differential expression APIs."""
+
+    class_aliases = {
+        "edger": ["EdgeR"],
+        "pydeseq2": ["PyDESeq2"],
+        "statsmodels": ["Statsmodels"],
+        "ttest": ["TTest"],
+        "wilcoxon": ["WilcoxonTest"],
+    }
+
+    method_key = method.lower()
+    candidate_names = list(class_aliases.get(method_key, []))
+    candidate_names.extend(
+        name
+        for name in {
+            method,
+            method.capitalize(),
+            method.upper(),
+            method.title(),
+        }
+        if isinstance(name, str)
+    )
+    # Preserve order while removing duplicates
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for name in candidate_names:
+        if not isinstance(name, str):
+            continue
+        if name in seen:
+            continue
+        seen.add(name)
+        deduped.append(name)
+    candidate_names = deduped
+
+    for name in candidate_names:
+        cls = getattr(module, name, None)
+        if cls is None or not isinstance(cls, type):
+            continue
+        compare_groups = getattr(cls, "compare_groups", None)
+        if compare_groups is None or not callable(compare_groups):
+            continue
+
+        current_cls = cls
+
+        def runner(
+            adata,
+            *,
+            groupby=None,
+            group_key=None,
+            control=None,
+            reference=None,
+            **kwargs,
+        ):
+            _ = kwargs  # Allow compatibility with legacy keyword arguments
+            column = groupby or group_key
+            baseline = control if control is not None else reference
+            if column is None:
+                raise TypeError("Pertpy runner requires a groupby column")
+            if baseline is None:
+                raise TypeError("Pertpy runner requires a control/reference label")
+
+            obs_column = adata.obs[column]
+            groups_to_compare = [value for value in obs_column.unique().tolist() if value != baseline]
+            if not groups_to_compare:
+                raise ValueError("No perturbation groups available for comparison")
+
+            return current_cls.compare_groups(
+                adata,
+                column=column,
+                baseline=baseline,
+                groups_to_compare=groups_to_compare,
+            )
+
+        return runner
+    return None
+
+
 def _convert_reference_result_to_dataframe(result: Any) -> Optional[pd.DataFrame]:
     """Normalise a Pertpy reference result to a ``DataFrame`` when possible."""
 
@@ -586,11 +665,26 @@ def _run_pertpy_de(
     module = getattr(pt, "tools", None)
     if module is None:
         return None, None, "pertpy.tools module unavailable"
-    de_module = getattr(module, "differential_expression", None)
-    if de_module is None:
-        return None, None, "pertpy.tools.differential_expression module unavailable"
 
-    runner = _resolve_pertpy_runner(de_module, backend)
+    candidate_modules: list[Any] = []
+    de_module = getattr(module, "differential_expression", None)
+    if de_module is not None:
+        candidate_modules.append(de_module)
+    candidate_modules.append(module)
+    try:
+        candidate_modules.append(import_module("pertpy.tools._differential_gene_expression"))
+    except Exception:  # pragma: no cover - optional dependency handling
+        pass
+
+    runner: Optional[Callable[..., Any]] = None
+    for candidate in candidate_modules:
+        runner = _resolve_pertpy_runner(candidate, backend)
+        if runner is not None:
+            break
+        runner = _resolve_pertpy_class_runner(candidate, backend)
+        if runner is not None:
+            break
+
     if runner is None:
         return None, None, f"Pertpy differential expression runner '{backend}' not found"
 
