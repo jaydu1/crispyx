@@ -14,24 +14,25 @@ Quick start
    import streamlined_crispr as scr
 
    adata_ro = scr.read_h5ad_ondisk("data/demo_benchmark.h5ad")
-   qc = scr.pp.qc_summary(
+   adata_ro = scr.pp.qc_summary(
        adata_ro,
        perturbation_column="perturbation",
        min_genes=100,
        min_cells_per_perturbation=15,
        min_cells_per_gene=10,
    )
-   avg = scr.pb.average_log_expression(
-       qc.filtered,
+   adata_pb = scr.pb.average_log_expression(
+       adata_ro,
        perturbation_column="perturbation",
    )
-   de = scr.tl.rank_genes_groups(
-       qc.filtered,
+   adata_ro = scr.tl.rank_genes_groups(
+       adata_ro,
        perturbation_column="perturbation",
        method="wilcoxon",
    )
-   qc.filtered.close()
-   adata_ro.close()
+   print(adata_ro.uns["rank_genes_groups"])  # preview without loading everything
+   de_full = adata_ro.uns["rank_genes_groups"].load()
+   var_table = adata_ro.var.load()
 
 Setting up
 ----------
@@ -58,11 +59,11 @@ Quality control
 ---------------
 
 Call :func:`streamlined_crispr.pp.qc_summary` to filter cells, perturbations,
-and genes. The function returns masks describing the retained entries and
-writes a filtered AnnData file to disk, exposing the backed result via the
-``filtered`` attribute as a :class:`scr.AnnData` wrapper. When ``control_label``
-is omitted, perturbations containing strings such as ``ctrl`` or ``nontarget``
-are chosen automatically and logged for reproducibility. Likewise, omitting
+and genes. The function writes a filtered AnnData file to disk and returns a
+new :class:`scr.AnnData` view pointing at the result so the next step can reuse
+the same handle without reopening the path. When ``control_label`` is omitted,
+perturbations containing strings such as ``ctrl`` or ``nontarget`` are chosen
+automatically and logged for reproducibility. Likewise, omitting
 ``gene_name_column`` falls back to ``adata.var_names`` with a helpful message.
 Individual helpers such as :func:`streamlined_crispr.pp.filter_cells` are also
 available for customised pipelines.
@@ -80,7 +81,8 @@ containing the effect sizes per perturbation. The control label inference and
 gene name fallbacks described above apply here as well, so these functions can
 operate with minimal boilerplate on well-annotated datasets. Passing a
 ``scr.AnnData`` instance from the QC step avoids reopening the file path
-manually.
+manually, and the returned wrappers expose ``.obs``/``.var`` tables with
+``.load()`` helpers for materialising the full metadata only when requested.
 
 Differential expression
 -----------------------
@@ -92,8 +94,9 @@ default) for a Mann-Whitney U test, ``method="wald"`` for the streaming Wald
 test, or ``method="nb_glm"`` to fit the negative binomial GLM that supports
 covariates. The helper reuses the automatic control inference so a missing
 ``control_label`` triggers the same adaptive search used earlier, and the
-returned :class:`scr.AnnData` wrapper keeps the differential expression output
-available for downstream inspection.
+returned :class:`scr.AnnData` wrapper stores previews of the results in
+``.uns`` so printing ``adata.uns["rank_genes_groups"]`` shows the top genes
+per perturbation while ``.load()`` retrieves the full tables on demand.
 
 Benchmarking
 ------------

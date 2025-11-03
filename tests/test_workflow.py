@@ -188,8 +188,16 @@ def test_downstream_effect_outputs(tmp_path):
         data_name="wilcoxon",
     )
 
-    assert set(avg.index) == {"KO1", "KO2"}
-    assert set(pseudo.index) == {"KO1", "KO2"}
+    assert isinstance(avg, scr.AnnData)
+    assert isinstance(pseudo, scr.AnnData)
+    avg_mem = avg.to_memory()
+    pseudo_mem = pseudo.to_memory()
+    avg_df = pd.DataFrame(avg_mem.X, index=avg_mem.obs.index, columns=avg_mem.var_names)
+    pseudo_df = pd.DataFrame(
+        pseudo_mem.X, index=pseudo_mem.obs.index, columns=pseudo_mem.var_names
+    )
+    assert set(avg_df.index) == {"KO1", "KO2"}
+    assert set(pseudo_df.index) == {"KO1", "KO2"}
     assert set(wald.keys()) == {"KO1", "KO2"}
     assert set(wilcoxon.keys()) == {"KO1", "KO2"}
 
@@ -201,7 +209,7 @@ def test_downstream_effect_outputs(tmp_path):
     ctrl = log_block[ctrl_mask, 0]
     ko1 = log_block[ko1_mask, 0]
     expected = ko1.mean() - ctrl.mean()
-    assert np.isclose(avg.loc["KO1", "gene0"], expected)
+    assert np.isclose(avg_df.loc["KO1", "gene0"], expected)
 
     assert (tmp_path / "avg_effects_avg_log_effects.h5ad").exists()
     assert (tmp_path / "pseudo_effects_pseudobulk_effects.h5ad").exists()
@@ -214,6 +222,8 @@ def test_downstream_effect_outputs(tmp_path):
     ko2_result = wilcoxon["KO2"]
     assert ko2_result.pvalue.shape[0] == 4
     assert ko2_result.method == "wilcoxon"
+    avg.close()
+    pseudo.close()
     qc_result.filtered.close()
 
 
@@ -247,11 +257,14 @@ def test_scanpy_style_namespaces_match_direct(tmp_path):
         data_name="direct",
     )
 
-    np.testing.assert_array_equal(qc_wrapped.cell_mask, qc_direct.cell_mask)
-    np.testing.assert_array_equal(qc_wrapped.gene_mask, qc_direct.gene_mask)
+    assert isinstance(qc_wrapped, scr.AnnData)
+    qc_wrapped_mem = qc_wrapped.to_memory()
+    filtered_direct = qc_direct.filtered.to_memory()
+    pd.testing.assert_index_equal(qc_wrapped_mem.obs.index, filtered_direct.obs.index)
+    pd.testing.assert_index_equal(qc_wrapped_mem.var_names, filtered_direct.var_names)
 
     avg_wrapped = scr.pb.average_log_expression(
-        qc_wrapped.filtered,
+        qc_wrapped,
         perturbation_column="perturbation",
         control_label="ctrl",
         gene_name_column="gene_symbols",
@@ -266,10 +279,14 @@ def test_scanpy_style_namespaces_match_direct(tmp_path):
         output_dir=tmp_path,
         data_name="direct_avg",
     )
-    pd.testing.assert_frame_equal(avg_wrapped, avg_direct)
+    avg_wrapped_mem = avg_wrapped.to_memory()
+    avg_direct_mem = avg_direct.to_memory()
+    np.testing.assert_allclose(avg_wrapped_mem.X, avg_direct_mem.X)
+    pd.testing.assert_index_equal(avg_wrapped_mem.obs.index, avg_direct_mem.obs.index)
+    pd.testing.assert_index_equal(avg_wrapped_mem.var_names, avg_direct_mem.var_names)
 
     pseudo_wrapped = scr.pb.pseudobulk(
-        qc_wrapped.filtered,
+        qc_wrapped,
         perturbation_column="perturbation",
         control_label="ctrl",
         gene_name_column="gene_symbols",
@@ -284,10 +301,18 @@ def test_scanpy_style_namespaces_match_direct(tmp_path):
         output_dir=tmp_path,
         data_name="direct_pseudo",
     )
-    pd.testing.assert_frame_equal(pseudo_wrapped, pseudo_direct)
+    pseudo_wrapped_mem = pseudo_wrapped.to_memory()
+    pseudo_direct_mem = pseudo_direct.to_memory()
+    np.testing.assert_allclose(pseudo_wrapped_mem.X, pseudo_direct_mem.X)
+    pd.testing.assert_index_equal(
+        pseudo_wrapped_mem.obs.index, pseudo_direct_mem.obs.index
+    )
+    pd.testing.assert_index_equal(
+        pseudo_wrapped_mem.var_names, pseudo_direct_mem.var_names
+    )
 
     wald_wrapped = scr.tl.rank_genes_groups(
-        qc_wrapped.filtered,
+        qc_wrapped,
         perturbation_column="perturbation",
         method="wald",
         control_label="ctrl",
@@ -305,16 +330,18 @@ def test_scanpy_style_namespaces_match_direct(tmp_path):
         data_name="direct_wald",
         min_cells_expressed=0,
     )
-    assert set(wald_wrapped.groups) == set(wald_direct.keys())
-    for group in wald_wrapped.groups:
-        direct = wald_direct[group]
-        idx = wald_wrapped.groups.index(group)
-        np.testing.assert_allclose(wald_wrapped.logfoldchanges[idx], direct.effect_size)
-        np.testing.assert_allclose(wald_wrapped.statistics[idx], direct.statistic)
-        np.testing.assert_allclose(wald_wrapped.pvalues[idx], direct.pvalue)
+    wald_wrapped_uns = wald_wrapped.uns["rank_genes_groups"].load()
+    wald_wrapped_full = wald_wrapped.uns["rank_genes_groups_full"].load()
+    wrapped_groups = list(wald_wrapped_uns["names"].dtype.names)
+    direct_effect = np.vstack([wald_direct[group].effect_size for group in wrapped_groups])
+    direct_stat = np.vstack([wald_direct[group].statistic for group in wrapped_groups])
+    direct_p = np.vstack([wald_direct[group].pvalue for group in wrapped_groups])
+    np.testing.assert_allclose(wald_wrapped_full["logfoldchanges"], direct_effect)
+    np.testing.assert_allclose(wald_wrapped_full["scores"], direct_stat)
+    np.testing.assert_allclose(wald_wrapped_full["pvals"], direct_p)
 
     wilcoxon_wrapped = scr.tl.rank_genes_groups(
-        qc_wrapped.filtered,
+        qc_wrapped,
         perturbation_column="perturbation",
         method="wilcoxon",
         control_label="ctrl",
@@ -332,7 +359,23 @@ def test_scanpy_style_namespaces_match_direct(tmp_path):
         data_name="direct_wilcoxon",
         min_cells_expressed=0,
     )
-    np.testing.assert_allclose(wilcoxon_wrapped.statistics, wilcoxon_direct.statistics)
-    np.testing.assert_allclose(wilcoxon_wrapped.pvalues, wilcoxon_direct.pvalues)
-    qc_wrapped.filtered.close()
+    wilcoxon_wrapped_uns = wilcoxon_wrapped.uns["rank_genes_groups"].load()
+    wrapped_groups = list(wilcoxon_wrapped_uns["names"].dtype.names)
+    direct_order = wilcoxon_direct.to_full_order_dict()
+    np.testing.assert_allclose(
+        wilcoxon_wrapped.uns["rank_genes_groups_full"].load()["scores"],
+        direct_order["scores"],
+    )
+    np.testing.assert_allclose(
+        wilcoxon_wrapped.uns["rank_genes_groups_full"].load()["pvals"],
+        direct_order["pvals"],
+    )
+    assert set(wrapped_groups) == set(wilcoxon_direct.groups)
+    avg_wrapped.close()
+    avg_direct.close()
+    pseudo_wrapped.close()
+    pseudo_direct.close()
+    wald_wrapped.close()
+    wilcoxon_wrapped.close()
+    qc_wrapped.close()
     qc_direct.filtered.close()

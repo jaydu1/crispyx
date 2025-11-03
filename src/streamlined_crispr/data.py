@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Iterator, Sequence
+from typing import Any, Iterator, Mapping, Sequence
 
 import h5py
 import anndata as ad
@@ -17,6 +17,134 @@ logger = logging.getLogger(__name__)
 ENSEMBL_PREFIXES = ("ENS", "FBgn", "YAL", "YBL", "YCL", "YDL", "YEL", "YFL", "YGL", "YHL", "YIL", "YJL", "YKL", "YLL", "YML", "YNL", "YOL", "YPL", "YQL", "YRL", "YSL", "YTL", "YUL", "YVL", "YWL", "YXL")
 
 
+_MISSING = object()
+
+
+class _LazyFrameAccessor:
+    """Provide a read-friendly view over ``obs``/``var`` tables with ``.load``."""
+
+    def __init__(self, parent: "AnnData", attr: str) -> None:
+        self._parent = parent
+        self._attr = attr
+        self._cache: pd.DataFrame | None = None
+
+    def load(self) -> pd.DataFrame:
+        if self._cache is None:
+            loaded = getattr(self._parent.to_memory(), self._attr)
+            if isinstance(loaded, pd.DataFrame):
+                loaded = loaded.copy()
+            else:
+                loaded = pd.DataFrame(loaded)
+            self._cache = loaded
+        return self._cache
+
+    def head(self, n: int = 5) -> pd.DataFrame:
+        return self.load().head(n)
+
+    def __len__(self) -> int:
+        return len(self.load())
+
+    def __iter__(self):  # pragma: no cover - passthrough for convenience
+        return iter(self.load())
+
+    def __getitem__(self, item):  # pragma: no cover - passthrough for convenience
+        return self.load().__getitem__(item)
+
+    def __getattr__(self, name: str):  # pragma: no cover - passthrough for convenience
+        return getattr(self.load(), name)
+
+    def __repr__(self) -> str:  # pragma: no cover - display preview
+        frame = self.head()
+        if frame.empty:
+            return f"<{self._attr}: empty DataFrame>"
+        return f"<{self._attr} preview>\n{frame}"
+
+
+def _preview_uns_value(value: Any, n: int = 5) -> Any:
+    if isinstance(value, pd.DataFrame):
+        return value.head(n)
+    if isinstance(value, np.ndarray):
+        return value[:n]
+    if isinstance(value, Mapping):
+        preview: dict[Any, Any] = {}
+        for idx, (key, item) in enumerate(value.items()):
+            if idx >= n:
+                preview["…"] = "…"
+                break
+            preview[key] = _preview_uns_value(item, n)
+        return preview
+    if isinstance(value, (list, tuple)):
+        return type(value)(value[:n])
+    return value
+
+
+class _LazyUnsEntry:
+    """Deferred loader for a single ``uns`` key."""
+
+    def __init__(self, parent: "AnnData", key: str) -> None:
+        self._parent = parent
+        self._key = key
+        self._cache: Any = _MISSING
+
+    def load(self) -> Any:
+        if self._cache is _MISSING:
+            self._cache = self._parent.to_memory().uns[self._key]
+        return self._cache
+
+    def preview(self, n: int = 5) -> Any:
+        return _preview_uns_value(self.load(), n)
+
+    def __getattr__(self, name: str):  # pragma: no cover - passthrough for convenience
+        return getattr(self.load(), name)
+
+    def __getitem__(self, item):  # pragma: no cover - passthrough for convenience
+        return self.load()[item]
+
+    def __repr__(self) -> str:  # pragma: no cover - display preview
+        return repr(self.preview())
+
+
+class _LazyUnsMapping(Mapping[str, _LazyUnsEntry]):
+    """Mapping-style accessor exposing ``uns`` keys with lazy loading."""
+
+    def __init__(self, parent: "AnnData") -> None:
+        self._parent = parent
+        self._cache: dict[str, _LazyUnsEntry] = {}
+
+    def _keys(self) -> list[str]:
+        try:
+            return list(self._parent.backed.uns_keys())
+        except AttributeError:
+            return []
+
+    def __getitem__(self, key: str) -> _LazyUnsEntry:
+        keys = self._keys()
+        if key not in keys:
+            raise KeyError(key)
+        if key not in self._cache:
+            self._cache[key] = _LazyUnsEntry(self._parent, key)
+        return self._cache[key]
+
+    def __iter__(self):  # pragma: no cover - passthrough for convenience
+        return iter(self._keys())
+
+    def __len__(self) -> int:
+        return len(self._keys())
+
+    def keys(self):  # pragma: no cover - convenience mirror
+        return self._keys()
+
+    def items(self):  # pragma: no cover - convenience mirror
+        return [(key, self[key]) for key in self._keys()]
+
+    def __repr__(self) -> str:  # pragma: no cover - display preview
+        keys = self._keys()
+        if not keys:
+            return "<uns: empty>"
+        previews = {key: self[key].preview() for key in keys}
+        return repr(previews)
+
+
 class AnnData:
     """Thin wrapper around a backed :class:`anndata.AnnData` handle."""
 
@@ -24,6 +152,9 @@ class AnnData:
         self.path = Path(path)
         self._mode = mode
         self._backed: ad.AnnData | None = None
+        self._obs_view: _LazyFrameAccessor | None = None
+        self._var_view: _LazyFrameAccessor | None = None
+        self._uns_view: _LazyUnsMapping | None = None
 
     @property
     def filename(self) -> str:
@@ -53,11 +184,32 @@ class AnnData:
                 self._backed.file.close()
             finally:
                 self._backed = None
+        self._obs_view = None
+        self._var_view = None
+        self._uns_view = None
 
     def to_memory(self) -> ad.AnnData:
         """Materialise the backed AnnData into memory."""
 
         return ad.read_h5ad(str(self.path))
+
+    @property
+    def obs(self) -> _LazyFrameAccessor:
+        if self._obs_view is None:
+            self._obs_view = _LazyFrameAccessor(self, "obs")
+        return self._obs_view
+
+    @property
+    def var(self) -> _LazyFrameAccessor:
+        if self._var_view is None:
+            self._var_view = _LazyFrameAccessor(self, "var")
+        return self._var_view
+
+    @property
+    def uns(self) -> _LazyUnsMapping:
+        if self._uns_view is None:
+            self._uns_view = _LazyUnsMapping(self)
+        return self._uns_view
 
     def __enter__(self) -> "AnnData":
         self.backed  # ensure handle is opened

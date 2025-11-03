@@ -89,5 +89,9 @@ def test_compute_average_log_expression_infers_control(tmp_path, caplog):
         gene_name_column="gene_symbol",
     )
 
-    assert set(result.index) == {"KO1", "KO2"}
+    assert isinstance(result, AnnData)
+    assert set(result.obs.index) == {"KO1", "KO2"}
+    loaded_var = result.var.load()
+    assert list(loaded_var.index) == ["gene0", "gene1", "gene2"]
     assert "Inferred control label" in caplog.text
+    result.close()

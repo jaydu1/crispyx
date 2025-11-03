@@ -14,24 +14,24 @@ This package provides a lightweight toolkit for performing key steps of CRISPR s
 import streamlined_crispr as scr
 
 adata_ro = scr.read_h5ad_ondisk("data/demo_benchmark.h5ad")
-qc = scr.pp.qc_summary(
+adata_ro = scr.pp.qc_summary(
     adata_ro,
     perturbation_column="perturbation",
     min_genes=5,
     min_cells_per_perturbation=5,
 )
-avg_effects = scr.pb.average_log_expression(
-    qc.filtered,
+adata_pb = scr.pb.average_log_expression(
+    adata_ro,
     perturbation_column="perturbation",
 )
-wilcoxon = scr.tl.rank_genes_groups(
-    qc.filtered,
+adata_ro = scr.tl.rank_genes_groups(
+    adata_ro,
     perturbation_column="perturbation",
     method="wilcoxon",
 )
-wilcoxon_table = wilcoxon.to_rank_genes_groups_dict()
-qc.filtered.close()
-adata_ro.close()
+print(adata_ro.uns["rank_genes_groups"])  # preview top hits per perturbation
+de_results = adata_ro.uns["rank_genes_groups"].load()
+var_table = adata_ro.var.load()
 ```
 
 ## Development

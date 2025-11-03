@@ -610,7 +610,7 @@ def compare_with_scanpy(
     streamlined_filtered = ad.read_h5ad(str(qc_result.filtered_path))
 
     t0 = time.perf_counter()
-    avg_log_effects = compute_average_log_expression(
+    avg_log_effects_handle = compute_average_log_expression(
         qc_result.filtered_path,
         perturbation_column=perturbation_column,
         control_label=control_label,
@@ -620,10 +620,17 @@ def compare_with_scanpy(
         output_dir=output_dir,
         data_name=data_name,
     )
+    avg_log_mem = avg_log_effects_handle.to_memory()
+    avg_log_effects = pd.DataFrame(
+        avg_log_mem.X,
+        index=avg_log_mem.obs.index,
+        columns=avg_log_mem.var_names,
+    )
+    avg_log_effects_handle.close()
     timings_streamlined["average_log_expression"] = time.perf_counter() - t0
 
     t0 = time.perf_counter()
-    pseudobulk_effects = compute_pseudobulk_expression(
+    pseudobulk_effects_handle = compute_pseudobulk_expression(
         qc_result.filtered_path,
         perturbation_column=perturbation_column,
         control_label=control_label,
@@ -634,6 +641,13 @@ def compare_with_scanpy(
         output_dir=output_dir,
         data_name=data_name,
     )
+    pseudobulk_mem = pseudobulk_effects_handle.to_memory()
+    pseudobulk_effects = pd.DataFrame(
+        pseudobulk_mem.X,
+        index=pseudobulk_mem.obs.index,
+        columns=pseudobulk_mem.var_names,
+    )
+    pseudobulk_effects_handle.close()
     timings_streamlined["pseudobulk_expression"] = time.perf_counter() - t0
 
     t0 = time.perf_counter()
