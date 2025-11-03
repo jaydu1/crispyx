@@ -73,6 +73,11 @@ def test_average_log_expression_matches_scanpy(small_adata, tmp_path):
     output_path = tmp_path / "small_avg_log_effects.h5ad"
     assert output_path.exists()
 
+    result_mem = result.to_memory()
+    result_df = pd.DataFrame(
+        result_mem.X, index=result_mem.obs.index, columns=result_mem.var_names
+    )
+
     sc_adata = adata.copy()
     sc.pp.normalize_total(sc_adata, target_sum=1e4)
     sc.pp.log1p(sc_adata)
@@ -80,15 +85,16 @@ def test_average_log_expression_matches_scanpy(small_adata, tmp_path):
     ctrl_mask = sc_adata.obs["perturbation"] == "ctrl"
     ctrl_mean = np.asarray(sc_adata[ctrl_mask].X).mean(axis=0)
     expected = {}
-    for label in result.index:
+    for label in result_df.index:
         mask = sc_adata.obs["perturbation"] == label
         mean = np.asarray(sc_adata[mask].X).mean(axis=0)
         expected[label] = mean - ctrl_mean
     expected_df = pd.DataFrame(expected).T
     expected_df.columns = sc_adata.var["gene_symbols"].to_list()
-    expected_df = expected_df.loc[result.index, result.columns]
+    expected_df = expected_df.loc[result_df.index, result_df.columns]
 
-    np.testing.assert_allclose(result.to_numpy(), expected_df.to_numpy(), rtol=1e-8, atol=1e-8)
+    np.testing.assert_allclose(result_df.to_numpy(), expected_df.to_numpy(), rtol=1e-8, atol=1e-8)
+    result.close()
 
 
 def test_pseudobulk_expression_matches_scanpy(small_adata, tmp_path):
@@ -105,21 +111,27 @@ def test_pseudobulk_expression_matches_scanpy(small_adata, tmp_path):
     output_path = tmp_path / "small_pseudobulk_effects.h5ad"
     assert output_path.exists()
 
+    result_mem = result.to_memory()
+    result_df = pd.DataFrame(
+        result_mem.X, index=result_mem.obs.index, columns=result_mem.var_names
+    )
+
     sc_adata = adata.copy()
     sc.pp.normalize_total(sc_adata, target_sum=1e4)
 
     ctrl_mask = sc_adata.obs["perturbation"] == "ctrl"
     ctrl_mean = np.asarray(sc_adata[ctrl_mask].X).mean(axis=0)
     expected = {}
-    for label in result.index:
+    for label in result_df.index:
         mask = sc_adata.obs["perturbation"] == label
         mean = np.asarray(sc_adata[mask].X).mean(axis=0)
         expected[label] = np.log1p(mean) - np.log1p(ctrl_mean)
     expected_df = pd.DataFrame(expected).T
     expected_df.columns = sc_adata.var["gene_symbols"].to_list()
-    expected_df = expected_df.loc[result.index, result.columns]
+    expected_df = expected_df.loc[result_df.index, result_df.columns]
 
-    np.testing.assert_allclose(result.to_numpy(), expected_df.to_numpy(), rtol=1e-8, atol=1e-8)
+    np.testing.assert_allclose(result_df.to_numpy(), expected_df.to_numpy(), rtol=1e-8, atol=1e-8)
+    result.close()
 
 
 def test_wald_test_matches_scanpy(small_adata, tmp_path):

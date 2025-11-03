@@ -10,10 +10,12 @@ import numpy as np
 import pandas as pd
 
 from .data import (
+    AnnData,
     ensure_gene_symbol_column,
     iter_matrix_chunks,
     normalize_total_block,
     read_backed,
+    resolve_control_label,
     resolve_output_path,
 )
 
@@ -34,13 +36,13 @@ def compute_average_log_expression(
     path: str | Path,
     *,
     perturbation_column: str,
-    control_label: str,
+    control_label: str | None = None,
     gene_name_column: str | None = None,
     perturbations: Iterable[str] | None = None,
     chunk_size: int = 2048,
     output_dir: str | Path | None = None,
     data_name: str | None = None,
-) -> pd.DataFrame:
+) -> AnnData:
     """Compute average log-normalised expression per perturbation relative to control."""
 
     backed = read_backed(path)
@@ -51,6 +53,7 @@ def compute_average_log_expression(
                 f"Perturbation column '{perturbation_column}' was not found in adata.obs. Available columns: {list(backed.obs.columns)}"
             )
         labels = backed.obs[perturbation_column].astype(str).to_numpy()
+        control_label = resolve_control_label(labels, control_label)
         n_genes = backed.n_vars
         candidates = _resolve_candidates(labels, control_label, perturbations)
         groups = [control_label] + candidates
@@ -83,12 +86,20 @@ def compute_average_log_expression(
         effect_matrix.append(mean - control_mean)
 
     if not effect_matrix:
-        return pd.DataFrame(columns=gene_symbols, dtype=float)
+        obs_index = pd.Index([], name="perturbation")
+        adata = ad.AnnData(
+            np.zeros((0, gene_symbols.shape[0])),
+            obs=pd.DataFrame(index=obs_index),
+            var=pd.DataFrame(index=gene_symbols),
+        )
+        output_path = resolve_output_path(
+            path, suffix="avg_log_effects", output_dir=output_dir, data_name=data_name
+        )
+        adata.write(output_path)
+        return AnnData(output_path)
 
     effect_matrix_np = np.vstack(effect_matrix)
     gene_symbols = pd.Index(gene_symbols).astype(str)
-    effect_df = pd.DataFrame(effect_matrix_np, index=candidates, columns=gene_symbols)
-
     obs_index = pd.Index(candidates, name="perturbation").astype(str)
     obs = pd.DataFrame({perturbation_column: obs_index.to_list()}, index=obs_index)
     var = pd.DataFrame(index=gene_symbols)
@@ -97,22 +108,21 @@ def compute_average_log_expression(
     adata.uns["control_mean"] = control_mean
     output_path = resolve_output_path(path, suffix="avg_log_effects", output_dir=output_dir, data_name=data_name)
     adata.write(output_path)
-
-    return effect_df
+    return AnnData(output_path)
 
 
 def compute_pseudobulk_expression(
     path: str | Path,
     *,
     perturbation_column: str,
-    control_label: str,
+    control_label: str | None = None,
     gene_name_column: str | None = None,
     perturbations: Iterable[str] | None = None,
     baseline_count: float = 1.0,
     chunk_size: int = 2048,
     output_dir: str | Path | None = None,
     data_name: str | None = None,
-) -> pd.DataFrame:
+) -> AnnData:
     """Compute pseudo-bulk log-fold changes relative to control."""
 
     if baseline_count <= 0:
@@ -126,6 +136,7 @@ def compute_pseudobulk_expression(
                 f"Perturbation column '{perturbation_column}' was not found in adata.obs. Available columns: {list(backed.obs.columns)}"
             )
         labels = backed.obs[perturbation_column].astype(str).to_numpy()
+        control_label = resolve_control_label(labels, control_label)
         n_genes = backed.n_vars
         candidates = _resolve_candidates(labels, control_label, perturbations)
         groups = [control_label] + candidates
@@ -157,12 +168,22 @@ def compute_pseudobulk_expression(
         effect_matrix.append(bulk - control_bulk)
 
     if not effect_matrix:
-        return pd.DataFrame(columns=gene_symbols, dtype=float)
+        obs_index = pd.Index([], name="perturbation")
+        adata = ad.AnnData(
+            np.zeros((0, gene_symbols.shape[0])),
+            obs=pd.DataFrame(index=obs_index),
+            var=pd.DataFrame(index=gene_symbols),
+        )
+        adata.uns["control_bulk"] = control_bulk
+        adata.uns["baseline_count"] = float(baseline_count)
+        output_path = resolve_output_path(
+            path, suffix="pseudobulk_effects", output_dir=output_dir, data_name=data_name
+        )
+        adata.write(output_path)
+        return AnnData(output_path)
 
     effect_matrix_np = np.vstack(effect_matrix)
     gene_symbols = pd.Index(gene_symbols).astype(str)
-    effect_df = pd.DataFrame(effect_matrix_np, index=candidates, columns=gene_symbols)
-
     obs_index = pd.Index(candidates, name="perturbation").astype(str)
     obs = pd.DataFrame({perturbation_column: obs_index.to_list()}, index=obs_index)
     var = pd.DataFrame(index=gene_symbols)
@@ -172,6 +193,5 @@ def compute_pseudobulk_expression(
     adata.uns["baseline_count"] = float(baseline_count)
     output_path = resolve_output_path(path, suffix="pseudobulk_effects", output_dir=output_dir, data_name=data_name)
     adata.write(output_path)
-
-    return effect_df
+    return AnnData(output_path)
 

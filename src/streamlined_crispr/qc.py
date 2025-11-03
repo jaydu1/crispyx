@@ -11,9 +11,11 @@ import pandas as pd
 import scipy.sparse as sp
 
 from .data import (
+    AnnData,
     ensure_gene_symbol_column,
     iter_matrix_chunks,
     read_backed,
+    resolve_control_label,
     resolve_output_path,
     write_filtered_subset,
 )
@@ -26,9 +28,15 @@ class QualityControlResult:
     cell_mask: np.ndarray
     gene_mask: np.ndarray
     perturbation_keep: Dict[str, bool]
-    filtered_path: Path
+    filtered: AnnData
     cell_gene_counts: np.ndarray
     gene_cell_counts: np.ndarray
+
+    @property
+    def filtered_path(self) -> Path:
+        """Compatibility accessor exposing the on-disk filename."""
+
+        return self.filtered.path
 
 
 def filter_cells_by_gene_count(
@@ -58,7 +66,7 @@ def filter_perturbations_by_cell_count(
     path: str | Path,
     *,
     perturbation_column: str,
-    control_label: str,
+    control_label: str | None = None,
     min_cells: int = 50,
     base_mask: np.ndarray | None = None,
 ) -> np.ndarray:
@@ -71,6 +79,7 @@ def filter_perturbations_by_cell_count(
                 f"Perturbation column '{perturbation_column}' was not found in adata.obs. Available columns: {list(backed.obs.columns)}"
             )
         labels = backed.obs[perturbation_column].astype(str).to_numpy()
+        control_label = resolve_control_label(labels, control_label)
     finally:
         backed.file.close()
 
@@ -124,7 +133,7 @@ def quality_control_summary(
     min_cells_per_perturbation: int = 50,
     min_cells_per_gene: int = 100,
     perturbation_column: str,
-    control_label: str,
+    control_label: str | None = None,
     gene_name_column: str | None = None,
     chunk_size: int = 2048,
     output_dir: str | Path | None = None,
@@ -135,6 +144,12 @@ def quality_control_summary(
     backed = read_backed(path)
     try:
         gene_names = ensure_gene_symbol_column(backed, gene_name_column)
+        if perturbation_column not in backed.obs.columns:
+            raise KeyError(
+                f"Perturbation column '{perturbation_column}' was not found in adata.obs. Available columns: {list(backed.obs.columns)}"
+            )
+        labels = backed.obs[perturbation_column].astype(str).to_numpy()
+        control_label = resolve_control_label(labels, control_label)
     finally:
         backed.file.close()
 
@@ -190,11 +205,8 @@ def quality_control_summary(
         var_assignments={"gene_symbols": gene_names[gene_mask]},
     )
 
-    filtered_backed = read_backed(filtered_path)
-    try:
-        labels = filtered_backed.obs[perturbation_column].astype(str)
-    finally:
-        filtered_backed.file.close()
+    filtered = AnnData(filtered_path)
+    labels = filtered.obs[perturbation_column].astype(str)
     perturbation_keep = {
         label: (label == control_label) or (labels[labels == label].shape[0] >= min_cells_per_perturbation)
         for label in labels.unique()
@@ -204,7 +216,7 @@ def quality_control_summary(
         cell_mask=combined_cell_mask,
         gene_mask=gene_mask,
         perturbation_keep=perturbation_keep,
-        filtered_path=filtered_path,
+        filtered=filtered,
         cell_gene_counts=gene_counts_per_cell,
         gene_cell_counts=counts,
     )
