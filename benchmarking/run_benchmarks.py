@@ -26,7 +26,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from benchmarking.generate_demo_dataset import write_demo_dataset
-from streamlined_crispr.data import read_backed
+from streamlined_crispr.data import read_backed, resolve_control_label
 from streamlined_crispr.de import wald_test, wilcoxon_test
 from streamlined_crispr.metrics import DE_METRIC_KEYS, compute_de_comparison_metrics
 from streamlined_crispr.pseudobulk import (
@@ -1026,9 +1026,22 @@ def build_methods(dataset_path: Path, output_dir: Path) -> Dict[str, BenchmarkMe
     min_cells_per_perturbation = 5
     min_cells_per_gene = 5
 
+    backed = read_backed(dataset_path)
+    try:
+        perturbation_column = "perturbation"
+        if perturbation_column not in backed.obs.columns:
+            raise KeyError(
+                "Perturbation column 'perturbation' was not found in adata.obs. "
+                f"Available columns: {list(backed.obs.columns)}"
+            )
+        labels = backed.obs[perturbation_column].astype(str).to_numpy()
+        control_label = resolve_control_label(labels, None, verbose=False)
+    finally:
+        backed.file.close()
+
     shared_kwargs = {
         "perturbation_column": "perturbation",
-        "control_label": "ctrl",
+        "control_label": control_label,
         "gene_name_column": "gene_symbols",
     }
 

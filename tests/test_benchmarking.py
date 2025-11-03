@@ -17,11 +17,11 @@ SRC_PATH = PROJECT_ROOT / "src"
 if str(SRC_PATH) not in sys.path:
     sys.path.insert(0, str(SRC_PATH))
 
-from benchmarking.run_benchmarks import _summarise_dataframe
+from benchmarking.run_benchmarks import _summarise_dataframe, build_methods
 from streamlined_crispr import compute_average_log_expression
 
 
-def _create_demo_dataset(tmp_path: Path) -> Path:
+def _create_demo_dataset(tmp_path: Path, control_label: str = "ctrl") -> Path:
     matrix = np.array(
         [
             [0, 0, 0, 0],
@@ -34,7 +34,7 @@ def _create_demo_dataset(tmp_path: Path) -> Path:
         dtype=float,
     )
     obs = pd.DataFrame(
-        {"perturbation": ["ctrl", "ctrl", "KO1", "KO1", "KO2", "KO2"]},
+        {"perturbation": [control_label, control_label, "KO1", "KO1", "KO2", "KO2"]},
         index=[f"cell_{idx}" for idx in range(matrix.shape[0])],
     )
     var = pd.DataFrame({"gene_symbol": [f"gene{idx}" for idx in range(matrix.shape[1])]})
@@ -64,3 +64,15 @@ def test_summarise_dataframe_includes_result_path(tmp_path: Path) -> None:
     assert summary["result_path"] == "summary_test_avg_log_effects.h5ad"
 
     result.close()
+
+
+def test_build_methods_infers_control_label(tmp_path: Path) -> None:
+    dataset_path = _create_demo_dataset(tmp_path, control_label="non_target_control")
+
+    methods = build_methods(dataset_path, tmp_path)
+
+    assert methods  # sanity check
+    control_labels = {
+        method.kwargs.get("control_label") for method in methods.values()
+    }
+    assert control_labels == {"non_target_control"}
