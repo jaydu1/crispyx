@@ -1,8 +1,8 @@
 {
-  "average_runtime_seconds": 0.5604430399094286,
+  "average_runtime_seconds": 6.299786606183096,
   "categories": [
     {
-      "average_runtime_seconds": 0.18780461433198067,
+      "average_runtime_seconds": 0.37999256966577377,
       "category": "Streaming pipeline",
       "method_count": 3,
       "status_counts": {
@@ -10,7 +10,7 @@
       }
     },
     {
-      "average_runtime_seconds": 0.2305889575036417,
+      "average_runtime_seconds": 1.3703773960005492,
       "category": "Differential expression",
       "method_count": 2,
       "status_counts": {
@@ -18,16 +18,15 @@
       }
     },
     {
-      "average_runtime_seconds": 1.5396104923347596,
+      "average_runtime_seconds": 4.225592583335431,
       "category": "Reference: Scanpy",
       "method_count": 3,
       "status_counts": {
-        "error": 1,
-        "success": 2
+        "success": 3
       }
     },
     {
-      "average_runtime_seconds": 0.17381673466540323,
+      "average_runtime_seconds": 17.580047472336446,
       "category": "Reference: Pertpy",
       "method_count": 3,
       "status_counts": {
@@ -35,43 +34,35 @@
       }
     }
   ],
-  "dependency_errors": [
-    "No module named 'pertpy'"
-  ],
-  "error_count": 1,
+  "dependency_errors": [],
+  "error_count": 0,
   "error_details": [
     {
-      "category": "Reference: Scanpy",
-      "error": "zero-size array to reduction operation maximum which has no identity",
-      "method": "scanpy_quality_control_comparison"
-    },
-    {
       "category": "Reference: Pertpy",
-      "error": "No module named 'pertpy'",
+      "error": "pertpy.tools.differential_expression module unavailable",
       "method": "pertpy_edger_comparison"
     },
     {
       "category": "Reference: Pertpy",
-      "error": "No module named 'pertpy'",
+      "error": "pertpy.tools.differential_expression module unavailable",
       "method": "pertpy_pydeseq2_comparison"
     },
     {
       "category": "Reference: Pertpy",
-      "error": "No module named 'pertpy'",
+      "error": "pertpy.tools.differential_expression module unavailable",
       "method": "pertpy_statsmodels_comparison"
     }
   ],
   "memory_limit_count": 0,
-  "non_success_count": 1,
+  "non_success_count": 0,
   "other_errors": [
-    "zero-size array to reduction operation maximum which has no identity"
+    "pertpy.tools.differential_expression module unavailable"
   ],
   "status_counts": {
-    "error": 1,
-    "success": 10
+    "success": 11
   },
-  "success_count": 10,
-  "success_rate": 0.9090909090909091,
+  "success_count": 11,
+  "success_rate": 1.0,
   "timeout_count": 0,
   "total_methods": 11
 }
