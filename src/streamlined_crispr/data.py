@@ -45,10 +45,14 @@ def ensure_gene_symbol_column(
         raw_names = adata.var_names
     else:
         if gene_name_column not in adata.var.columns:
-            raise KeyError(
-                f"Gene name column '{gene_name_column}' was not found in adata.var. Available columns: {list(adata.var.columns)}"
-            )
-        raw_names = adata.var[gene_name_column]
+            if gene_name_column == "gene_symbols":
+                raw_names = adata.var_names
+            else:
+                raise KeyError(
+                    f"Gene name column '{gene_name_column}' was not found in adata.var. Available columns: {list(adata.var.columns)}"
+                )
+        else:
+            raw_names = adata.var[gene_name_column]
     names = pd.Index(raw_names).astype(str)
     _validate_gene_symbols(names)
     return names

@@ -22,7 +22,7 @@ import scanpy as sc
 import h5py
 from scipy.stats import norm, rankdata
 
-from streamlined_crispr.data import normalize_total_block
+from streamlined_crispr.data import ensure_gene_symbol_column, normalize_total_block
 from streamlined_crispr.de import _tie_correction, wald_test, wilcoxon_test
 from streamlined_crispr.pseudobulk import (
     compute_average_log_expression,
@@ -224,3 +224,17 @@ def test_wilcoxon_test_matches_scanpy(small_adata, tmp_path):
         np.testing.assert_allclose(result.statistic, np.asarray(stats), atol=1e-12, rtol=1e-12)
         np.testing.assert_allclose(result.pvalue, np.asarray(pvals), atol=1e-9, rtol=1e-7)
         assert result.result_path == output_path
+
+
+def test_ensure_gene_symbol_column_fallback_to_index():
+    counts = np.zeros((2, 2))
+    obs = pd.DataFrame(index=["cell1", "cell2"])
+    var = pd.DataFrame(
+        {"Ensembl_ID": ["ENS0001", "ENS0002"]},
+        index=["GeneA", "GeneB"],
+    )
+    adata = ad.AnnData(counts, obs=obs, var=var)
+
+    names = ensure_gene_symbol_column(adata, "gene_symbols")
+
+    assert list(names) == ["GeneA", "GeneB"]
