@@ -1,6 +1,12 @@
 """Streamlined CRISPR screen analysis toolkit."""
 
-from .data import ensure_gene_symbol_column, read_backed, resolve_output_path
+from .data import (
+    ensure_gene_symbol_column,
+    preview_backed,
+    read_backed,
+    resolve_control_label,
+    resolve_output_path,
+)
 from .qc import (
     filter_cells_by_gene_count,
     filter_genes_by_cell_count,
@@ -22,6 +28,8 @@ __all__ = [
     "wilcoxon_test",
     "nb_glm_test",
     "ensure_gene_symbol_column",
+    "preview_backed",
     "read_backed",
+    "resolve_control_label",
     "resolve_output_path",
 ]
