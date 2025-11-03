@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Iterator, Sequence
 
@@ -11,7 +12,71 @@ import numpy as np
 import pandas as pd
 import scipy.sparse as sp
 
+logger = logging.getLogger(__name__)
+
 ENSEMBL_PREFIXES = ("ENS", "FBgn", "YAL", "YBL", "YCL", "YDL", "YEL", "YFL", "YGL", "YHL", "YIL", "YJL", "YKL", "YLL", "YML", "YNL", "YOL", "YPL", "YQL", "YRL", "YSL", "YTL", "YUL", "YVL", "YWL", "YXL")
+
+
+class AnnData:
+    """Thin wrapper around a backed :class:`anndata.AnnData` handle."""
+
+    def __init__(self, path: str | Path, *, mode: str = "r") -> None:
+        self.path = Path(path)
+        self._mode = mode
+        self._backed: ad.AnnData | None = None
+
+    @property
+    def filename(self) -> str:
+        """Return the underlying filename for compatibility with Scanpy."""
+
+        return str(self.path)
+
+    def __fspath__(self) -> str:  # pragma: no cover - filesystem protocol
+        return str(self.path)
+
+    def __str__(self) -> str:  # pragma: no cover - helpful when printing paths
+        return str(self.path)
+
+    @property
+    def backed(self) -> ad.AnnData:
+        """Return the lazily opened backed AnnData handle."""
+
+        if self._backed is None:
+            self._backed = ad.read_h5ad(str(self.path), backed=self._mode)
+        return self._backed
+
+    def close(self) -> None:
+        """Close the underlying file handle if it is open."""
+
+        if self._backed is not None:
+            try:
+                self._backed.file.close()
+            finally:
+                self._backed = None
+
+    def to_memory(self) -> ad.AnnData:
+        """Materialise the backed AnnData into memory."""
+
+        return ad.read_h5ad(str(self.path))
+
+    def __enter__(self) -> "AnnData":
+        self.backed  # ensure handle is opened
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
+
+    def __getattr__(self, name: str):  # pragma: no cover - delegation helper
+        return getattr(self.backed, name)
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging helper
+        return f"AnnData(path={self.path!s}, mode='{self._mode}')"
+
+    def __del__(self) -> None:  # pragma: no cover - defensive cleanup
+        try:
+            self.close()
+        except Exception:
+            pass
 
 
 def read_backed(path: str | Path) -> ad.AnnData:
@@ -43,10 +108,17 @@ def ensure_gene_symbol_column(
 
     if gene_name_column is None:
         raw_names = adata.var_names
+        logger.info(
+            "No gene_name_column provided; using adata.var_names for gene identifiers."
+        )
     else:
         if gene_name_column not in adata.var.columns:
             if gene_name_column == "gene_symbols":
                 raw_names = adata.var_names
+                logger.info(
+                    "Column 'gene_symbols' not found in adata.var; "
+                    "using adata.var_names for gene identifiers."
+                )
             else:
                 raise KeyError(
                     f"Gene name column '{gene_name_column}' was not found in adata.var. Available columns: {list(adata.var.columns)}"
@@ -71,6 +143,73 @@ def _validate_gene_symbols(names: Sequence[str]) -> None:
             "The majority of provided gene identifiers appear to be Ensembl-style IDs. "
             "Please supply a column containing gene symbols."
         )
+
+
+def resolve_control_label(
+    labels: Sequence[str],
+    control_label: str | None,
+    *,
+    verbose: bool = True,
+) -> str:
+    """Return an explicit control label, inferring one when necessary."""
+
+    if control_label is not None:
+        return str(control_label)
+
+    index = pd.Index(labels).astype(str)
+    if index.empty:
+        raise ValueError(
+            "Cannot infer control label because no perturbation labels were provided."
+        )
+    lower = index.str.lower()
+
+    exact_terms = {"ctrl", "control", "nontarget", "non-target", "non_target"}
+    substring_terms = ("ctrl", "control", "nontarget", "non-target", "non_target")
+
+    def _select(predicate) -> str | None:
+        for label, lowered in zip(index, lower):
+            if predicate(lowered):
+                return str(label)
+        return None
+
+    candidate = _select(lambda text: text in exact_terms)
+    if candidate is None:
+        candidate = _select(lambda text: any(term in text for term in substring_terms))
+    if candidate is None:
+        candidate = _select(lambda text: ("non" in text) and ("target" in text))
+
+    if candidate is None:
+        raise ValueError(
+            "Unable to infer control label automatically. Please provide 'control_label' explicitly."
+        )
+
+    if verbose:
+        logger.info("Inferred control label '%s' from perturbation labels.", candidate)
+    return candidate
+
+
+def read_h5ad_ondisk(
+    path: str | Path,
+    *,
+    n_obs: int = 5,
+    n_vars: int = 5,
+) -> AnnData:
+    """Open an ``.h5ad`` file on disk, print a preview, and return a read-only view."""
+
+    adata_ro = AnnData(path)
+    backed = adata_ro.backed
+    try:
+        print(backed)
+        if n_obs > 0 and backed.n_obs > 0:
+            print("First obs rows:")
+            print(backed.obs.head(n_obs))
+        if n_vars > 0 and backed.n_vars > 0:
+            print("First var rows:")
+            print(backed.var.head(n_vars))
+    except Exception:
+        adata_ro.close()
+        raise
+    return adata_ro
 
 
 def iter_matrix_chunks(

@@ -14,10 +14,12 @@ import pandas as pd
 from scipy.stats import norm, rankdata
 
 from .data import (
+    AnnData,
     ensure_gene_symbol_column,
     iter_matrix_chunks,
     normalize_total_block,
     read_backed,
+    resolve_control_label,
     resolve_output_path,
 )
 from .glm import NBGLMFitter, build_design_matrix
@@ -31,8 +33,14 @@ class DifferentialExpressionResult:
     pvalue: np.ndarray
     method: str
     perturbation: str
-    result_path: Path
     pvalue_adj: np.ndarray | None = None
+    result: AnnData | None = field(default=None, repr=False)
+
+    @property
+    def result_path(self) -> Path:
+        if self.result is None:
+            raise AttributeError("Result AnnData has not been initialised.")
+        return self.result.path
 
 
 @dataclass
@@ -53,7 +61,7 @@ class RankGenesGroupsResult(Mapping[str, DifferentialExpressionResult]):
     control_label: str
     tie_correct: bool
     pvalue_correction: Literal["benjamini-hochberg", "bonferroni"]
-    result_path: Path
+    result: AnnData | None = field(default=None, repr=False)
     _group_cache: Dict[str, DifferentialExpressionResult] = field(
         init=False, repr=False, default_factory=dict
     )
@@ -61,6 +69,12 @@ class RankGenesGroupsResult(Mapping[str, DifferentialExpressionResult]):
     def __post_init__(self) -> None:
         self.genes = pd.Index(self.genes).astype(str)
         self.groups = [str(group) for group in self.groups]
+
+    @property
+    def result_path(self) -> Path:
+        if self.result is None:
+            raise AttributeError("Result AnnData has not been initialised.")
+        return self.result.path
 
     def _ensure_cache(self) -> None:
         if self._group_cache:
@@ -73,8 +87,8 @@ class RankGenesGroupsResult(Mapping[str, DifferentialExpressionResult]):
                 pvalue=self.pvalues[idx],
                 method=self.method,
                 perturbation=group,
-                result_path=self.result_path,
                 pvalue_adj=self.pvalues_adj[idx],
+                result=self.result,
             )
 
     def __getitem__(self, key: str) -> DifferentialExpressionResult:
@@ -221,7 +235,7 @@ def wald_test(
     path: str | Path,
     *,
     perturbation_column: str,
-    control_label: str,
+    control_label: str | None = None,
     gene_name_column: str | None = None,
     perturbations: Iterable[str] | None = None,
     min_cells_expressed: int = 0,
@@ -239,6 +253,7 @@ def wald_test(
                 f"Perturbation column '{perturbation_column}' was not found in adata.obs. Available columns: {list(backed.obs.columns)}"
             )
         labels = backed.obs[perturbation_column].astype(str).to_numpy()
+        control_label = resolve_control_label(labels, control_label)
         n_genes = backed.n_vars
         candidates = _resolve_candidates(labels, control_label, perturbations)
         groups = [control_label] + candidates
@@ -305,7 +320,6 @@ def wald_test(
             pvalue=pvalue,
             method="wald",
             perturbation=label,
-            result_path=Path(),  # placeholder updated after writing file
         )
 
     gene_symbols = pd.Index(gene_symbols).astype(str)
@@ -330,8 +344,9 @@ def wald_test(
     output_path = resolve_output_path(path, suffix="wald_de", output_dir=output_dir, data_name=data_name)
     adata.write(output_path)
 
+    result_view = AnnData(output_path)
     for label, result in results.items():
-        result.result_path = output_path
+        result.result = result_view
 
     return results
 
@@ -340,7 +355,7 @@ def nb_glm_test(
     path: str | Path,
     *,
     perturbation_column: str,
-    control_label: str,
+    control_label: str | None = None,
     covariates: Iterable[str] | None = None,
     gene_name_column: str | None = None,
     perturbations: Iterable[str] | None = None,
@@ -368,6 +383,7 @@ def nb_glm_test(
             )
         obs_df = backed.obs[[perturbation_column] + covariates].copy()
         labels = obs_df[perturbation_column].astype(str).to_numpy()
+        control_label = resolve_control_label(labels, control_label)
         n_genes = backed.n_vars
         candidates = _resolve_candidates(labels, control_label, perturbations)
         control_mask = labels == control_label
@@ -514,7 +530,7 @@ def nb_glm_test(
     )
     adata.write(output_path)
 
-    return RankGenesGroupsResult(
+    result = RankGenesGroupsResult(
         genes=gene_symbols,
         groups=candidates,
         statistics=statistic_matrix,
@@ -531,15 +547,16 @@ def nb_glm_test(
         control_label=control_label,
         tie_correct=False,
         pvalue_correction=corr_method,
-        result_path=output_path,
+        result=AnnData(output_path),
     )
+    return result
 
 
 def wilcoxon_test(
     path: str | Path,
     *,
     perturbation_column: str,
-    control_label: str,
+    control_label: str | None = None,
     gene_name_column: str | None = None,
     perturbations: Iterable[str] | None = None,
     min_cells_expressed: int = 0,
@@ -560,6 +577,7 @@ def wilcoxon_test(
                 f"Perturbation column '{perturbation_column}' was not found in adata.obs. Available columns: {list(backed.obs.columns)}"
             )
         labels = backed.obs[perturbation_column].astype(str).to_numpy()
+        control_label = resolve_control_label(labels, control_label)
         n_genes = backed.n_vars
         candidates = _resolve_candidates(labels, control_label, perturbations)
         control_mask = labels == control_label
@@ -732,7 +750,6 @@ def wilcoxon_test(
         control_label=control_label,
         tie_correct=tie_correct,
         pvalue_correction=corr_method,
-        result_path=Path(),
     )
 
     obs_index = pd.Index(candidates, name="perturbation").astype(str)
@@ -746,7 +763,7 @@ def wilcoxon_test(
     adata.uns["pvalue_correction"] = corr_method
     output_path = resolve_output_path(path, suffix="wilcoxon_de", output_dir=output_dir, data_name=data_name)
     adata.write(output_path)
-    result.result_path = output_path
+    result.result = AnnData(output_path)
 
     return result
 

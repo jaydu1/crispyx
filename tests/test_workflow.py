@@ -18,6 +18,8 @@ import anndata as ad
 import scanpy as sc
 import h5py
 
+import streamlined_crispr as scr
+
 from streamlined_crispr import (
     compute_average_log_expression,
     compute_pseudobulk_expression,
@@ -87,11 +89,13 @@ def test_quality_control_writes_filtered_dataset(tmp_path):
         output_dir=tmp_path,
         data_name="qc_test",
     )
+    assert isinstance(result.filtered, scr.AnnData)
     assert result.filtered_path.exists()
-    filtered = ad.read_h5ad(result.filtered_path)
+    filtered = result.filtered.to_memory()
     assert filtered.n_obs == int(result.cell_mask.sum())
     assert filtered.n_vars == int(result.gene_mask.sum())
     assert filtered.var["gene_symbols"].tolist() == adata.var["gene_symbol"].tolist()
+    result.filtered.close()
 
 
 def test_quality_control_sparse_roundtrip(tmp_path):
@@ -107,11 +111,12 @@ def test_quality_control_sparse_roundtrip(tmp_path):
         output_dir=tmp_path,
         data_name="qc_sparse",
     )
-    filtered = ad.read_h5ad(result.filtered_path)
+    filtered = result.filtered.to_memory()
     expected = adata[result.cell_mask, result.gene_mask]
     np.testing.assert_array_equal(filtered.X.toarray(), expected.X.toarray())
     with h5py.File(result.filtered_path) as handle:
         assert handle["X"].attrs["encoding-type"] == b"csr_matrix"
+    result.filtered.close()
 
 
 def test_gene_symbol_validation(tmp_path):
@@ -151,7 +156,7 @@ def test_downstream_effect_outputs(tmp_path):
         data_name="de",
     )
     avg = compute_average_log_expression(
-        qc_result.filtered_path,
+        qc_result.filtered,
         perturbation_column="perturbation",
         control_label="ctrl",
         gene_name_column="gene_symbols",
@@ -159,7 +164,7 @@ def test_downstream_effect_outputs(tmp_path):
         data_name="avg_effects",
     )
     pseudo = compute_pseudobulk_expression(
-        qc_result.filtered_path,
+        qc_result.filtered,
         perturbation_column="perturbation",
         control_label="ctrl",
         gene_name_column="gene_symbols",
@@ -167,7 +172,7 @@ def test_downstream_effect_outputs(tmp_path):
         data_name="pseudo_effects",
     )
     wald = wald_test(
-        qc_result.filtered_path,
+        qc_result.filtered,
         perturbation_column="perturbation",
         control_label="ctrl",
         gene_name_column="gene_symbols",
@@ -175,7 +180,7 @@ def test_downstream_effect_outputs(tmp_path):
         data_name="wald",
     )
     wilcoxon = wilcoxon_test(
-        qc_result.filtered_path,
+        qc_result.filtered,
         perturbation_column="perturbation",
         control_label="ctrl",
         gene_name_column="gene_symbols",
@@ -188,7 +193,7 @@ def test_downstream_effect_outputs(tmp_path):
     assert set(wald.keys()) == {"KO1", "KO2"}
     assert set(wilcoxon.keys()) == {"KO1", "KO2"}
 
-    filtered = ad.read_h5ad(qc_result.filtered_path)
+    filtered = qc_result.filtered.to_memory()
     ctrl_mask = (filtered.obs["perturbation"] == "ctrl").to_numpy()
     ko1_mask = (filtered.obs["perturbation"] == "KO1").to_numpy()
     normalised, _ = normalize_total_block(filtered.X)
@@ -209,4 +214,125 @@ def test_downstream_effect_outputs(tmp_path):
     ko2_result = wilcoxon["KO2"]
     assert ko2_result.pvalue.shape[0] == 4
     assert ko2_result.method == "wilcoxon"
+    qc_result.filtered.close()
 
+
+def test_scanpy_style_namespaces_match_direct(tmp_path):
+    path, _ = create_test_dataset(tmp_path)
+    adata_ro = ad.read_h5ad(path, backed="r")
+    try:
+        qc_wrapped = scr.pp.qc_summary(
+            adata_ro,
+            min_genes=1,
+            min_cells_per_perturbation=2,
+            min_cells_per_gene=1,
+            perturbation_column="perturbation",
+            control_label="ctrl",
+            gene_name_column="gene_symbol",
+            output_dir=tmp_path,
+            data_name="wrapped",
+        )
+    finally:
+        adata_ro.file.close()
+
+    qc_direct = quality_control_summary(
+        path,
+        min_genes=1,
+        min_cells_per_perturbation=2,
+        min_cells_per_gene=1,
+        perturbation_column="perturbation",
+        control_label="ctrl",
+        gene_name_column="gene_symbol",
+        output_dir=tmp_path,
+        data_name="direct",
+    )
+
+    np.testing.assert_array_equal(qc_wrapped.cell_mask, qc_direct.cell_mask)
+    np.testing.assert_array_equal(qc_wrapped.gene_mask, qc_direct.gene_mask)
+
+    avg_wrapped = scr.pb.average_log_expression(
+        qc_wrapped.filtered,
+        perturbation_column="perturbation",
+        control_label="ctrl",
+        gene_name_column="gene_symbols",
+        output_dir=tmp_path,
+        data_name="wrapped_avg",
+    )
+    avg_direct = compute_average_log_expression(
+        qc_direct.filtered,
+        perturbation_column="perturbation",
+        control_label="ctrl",
+        gene_name_column="gene_symbols",
+        output_dir=tmp_path,
+        data_name="direct_avg",
+    )
+    pd.testing.assert_frame_equal(avg_wrapped, avg_direct)
+
+    pseudo_wrapped = scr.pb.pseudobulk(
+        qc_wrapped.filtered,
+        perturbation_column="perturbation",
+        control_label="ctrl",
+        gene_name_column="gene_symbols",
+        output_dir=tmp_path,
+        data_name="wrapped_pseudo",
+    )
+    pseudo_direct = compute_pseudobulk_expression(
+        qc_direct.filtered,
+        perturbation_column="perturbation",
+        control_label="ctrl",
+        gene_name_column="gene_symbols",
+        output_dir=tmp_path,
+        data_name="direct_pseudo",
+    )
+    pd.testing.assert_frame_equal(pseudo_wrapped, pseudo_direct)
+
+    wald_wrapped = scr.tl.rank_genes_groups(
+        qc_wrapped.filtered,
+        perturbation_column="perturbation",
+        method="wald",
+        control_label="ctrl",
+        gene_name_column="gene_symbols",
+        output_dir=tmp_path,
+        data_name="wrapped_wald",
+        min_cells_expressed=0,
+    )
+    wald_direct = wald_test(
+        qc_direct.filtered,
+        perturbation_column="perturbation",
+        control_label="ctrl",
+        gene_name_column="gene_symbols",
+        output_dir=tmp_path,
+        data_name="direct_wald",
+        min_cells_expressed=0,
+    )
+    assert set(wald_wrapped.groups) == set(wald_direct.keys())
+    for group in wald_wrapped.groups:
+        direct = wald_direct[group]
+        idx = wald_wrapped.groups.index(group)
+        np.testing.assert_allclose(wald_wrapped.logfoldchanges[idx], direct.effect_size)
+        np.testing.assert_allclose(wald_wrapped.statistics[idx], direct.statistic)
+        np.testing.assert_allclose(wald_wrapped.pvalues[idx], direct.pvalue)
+
+    wilcoxon_wrapped = scr.tl.rank_genes_groups(
+        qc_wrapped.filtered,
+        perturbation_column="perturbation",
+        method="wilcoxon",
+        control_label="ctrl",
+        gene_name_column="gene_symbols",
+        output_dir=tmp_path,
+        data_name="wrapped_wilcoxon",
+        min_cells_expressed=0,
+    )
+    wilcoxon_direct = wilcoxon_test(
+        qc_direct.filtered,
+        perturbation_column="perturbation",
+        control_label="ctrl",
+        gene_name_column="gene_symbols",
+        output_dir=tmp_path,
+        data_name="direct_wilcoxon",
+        min_cells_expressed=0,
+    )
+    np.testing.assert_allclose(wilcoxon_wrapped.statistics, wilcoxon_direct.statistics)
+    np.testing.assert_allclose(wilcoxon_wrapped.pvalues, wilcoxon_direct.pvalues)
+    qc_wrapped.filtered.close()
+    qc_direct.filtered.close()

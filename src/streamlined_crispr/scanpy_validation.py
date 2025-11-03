@@ -23,6 +23,7 @@ from .data import (
     iter_matrix_chunks,
     normalize_total_block,
     read_backed,
+    resolve_control_label,
 )
 from .de import _tie_correction, wald_test, wilcoxon_test
 from .metrics import compute_de_comparison_metrics
@@ -560,7 +561,7 @@ def compare_with_scanpy(
     path: str | Path,
     *,
     perturbation_column: str,
-    control_label: str,
+    control_label: str | None = None,
     min_genes: int = 100,
     min_cells_per_perturbation: int = 50,
     min_cells_per_gene: int = 100,
@@ -577,6 +578,17 @@ def compare_with_scanpy(
 
     timings_streamlined: Dict[str, float] = {}
     de_min_cells_expressed = 0
+
+    backed = read_backed(path)
+    try:
+        if perturbation_column not in backed.obs.columns:
+            raise KeyError(
+                f"Perturbation column '{perturbation_column}' was not found in adata.obs. Available columns: {list(backed.obs.columns)}"
+            )
+        labels = backed.obs[perturbation_column].astype(str).to_numpy()
+        control_label = resolve_control_label(labels, control_label)
+    finally:
+        backed.file.close()
 
     baseline_bytes = _get_peak_memory_bytes()
 
