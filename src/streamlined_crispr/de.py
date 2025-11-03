@@ -18,6 +18,7 @@ from .data import (
     iter_matrix_chunks,
     normalize_total_block,
     read_backed,
+    resolve_control_label,
     resolve_output_path,
 )
 from .glm import NBGLMFitter, build_design_matrix
@@ -221,7 +222,7 @@ def wald_test(
     path: str | Path,
     *,
     perturbation_column: str,
-    control_label: str,
+    control_label: str | None = None,
     gene_name_column: str | None = None,
     perturbations: Iterable[str] | None = None,
     min_cells_expressed: int = 0,
@@ -239,6 +240,7 @@ def wald_test(
                 f"Perturbation column '{perturbation_column}' was not found in adata.obs. Available columns: {list(backed.obs.columns)}"
             )
         labels = backed.obs[perturbation_column].astype(str).to_numpy()
+        control_label = resolve_control_label(labels, control_label)
         n_genes = backed.n_vars
         candidates = _resolve_candidates(labels, control_label, perturbations)
         groups = [control_label] + candidates
@@ -340,7 +342,7 @@ def nb_glm_test(
     path: str | Path,
     *,
     perturbation_column: str,
-    control_label: str,
+    control_label: str | None = None,
     covariates: Iterable[str] | None = None,
     gene_name_column: str | None = None,
     perturbations: Iterable[str] | None = None,
@@ -368,6 +370,7 @@ def nb_glm_test(
             )
         obs_df = backed.obs[[perturbation_column] + covariates].copy()
         labels = obs_df[perturbation_column].astype(str).to_numpy()
+        control_label = resolve_control_label(labels, control_label)
         n_genes = backed.n_vars
         candidates = _resolve_candidates(labels, control_label, perturbations)
         control_mask = labels == control_label
@@ -539,7 +542,7 @@ def wilcoxon_test(
     path: str | Path,
     *,
     perturbation_column: str,
-    control_label: str,
+    control_label: str | None = None,
     gene_name_column: str | None = None,
     perturbations: Iterable[str] | None = None,
     min_cells_expressed: int = 0,
@@ -560,6 +563,7 @@ def wilcoxon_test(
                 f"Perturbation column '{perturbation_column}' was not found in adata.obs. Available columns: {list(backed.obs.columns)}"
             )
         labels = backed.obs[perturbation_column].astype(str).to_numpy()
+        control_label = resolve_control_label(labels, control_label)
         n_genes = backed.n_vars
         candidates = _resolve_candidates(labels, control_label, perturbations)
         control_mask = labels == control_label
