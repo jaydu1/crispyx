@@ -13,24 +13,26 @@ Quick start
 
    import streamlined_crispr as scr
 
-   adata_ro = scr.preview_backed("data/demo_benchmark.h5ad")
-   qc = scr.pp.qc_summary(
+   adata_ro = scr.read_h5ad_ondisk("data/demo_benchmark.h5ad")
+   adata_ro = scr.pp.qc_summary(
        adata_ro,
        perturbation_column="perturbation",
        min_genes=100,
        min_cells_per_perturbation=15,
        min_cells_per_gene=10,
    )
-   avg = scr.pb.average_log_expression(
-       qc.filtered_path,
+   adata_pb = scr.pb.average_log_expression(
+       adata_ro,
        perturbation_column="perturbation",
    )
-   de = scr.tl.rank_genes_groups(
-       qc.filtered_path,
+   adata_ro = scr.tl.rank_genes_groups(
+       adata_ro,
        perturbation_column="perturbation",
        method="wilcoxon",
    )
-   adata_ro.file.close()
+   print(adata_ro.uns["rank_genes_groups"])  # preview without loading everything
+   de_full = adata_ro.uns["rank_genes_groups"].load()
+   var_table = adata_ro.var.load()
 
 Setting up
 ----------
@@ -44,20 +46,22 @@ Install the project in editable mode with optional dependencies:
 Loading data
 ------------
 
-Use :func:`streamlined_crispr.preview_backed` to open a dataset without
+Use :func:`streamlined_crispr.read_h5ad_ondisk` to open a dataset without
 materialising the expression matrix and print the first few rows of metadata.
 A synthetic demo dataset can be generated via
 ``python benchmarking/generate_demo_dataset.py`` and stored at
-``data/demo_benchmark.h5ad``. The returned AnnData object remains backed, so
-close ``adata.file`` once you have inspected the preview or completed the
-pipeline.
+``data/demo_benchmark.h5ad``. The returned :class:`scr.AnnData` object keeps a
+backed AnnData handle alive lazily and automatically closes it when the wrapper
+is garbage collected. Explicitly call ``adata.close()`` to release the file as
+soon as you finish the preview.
 
 Quality control
 ---------------
 
 Call :func:`streamlined_crispr.pp.qc_summary` to filter cells, perturbations,
-and genes. The function returns masks describing the retained entries and
-writes a filtered AnnData file to disk. When ``control_label`` is omitted,
+and genes. The function writes a filtered AnnData file to disk and returns a
+new :class:`scr.AnnData` view pointing at the result so the next step can reuse
+the same handle without reopening the path. When ``control_label`` is omitted,
 perturbations containing strings such as ``ctrl`` or ``nontarget`` are chosen
 automatically and logged for reproducibility. Likewise, omitting
 ``gene_name_column`` falls back to ``adata.var_names`` with a helpful message.
@@ -75,7 +79,10 @@ Two complementary estimators are exposed through :mod:`streamlined_crispr.pb`:
 Each operates on the filtered dataset and produces an AnnData artifact
 containing the effect sizes per perturbation. The control label inference and
 gene name fallbacks described above apply here as well, so these functions can
-operate with minimal boilerplate on well-annotated datasets.
+operate with minimal boilerplate on well-annotated datasets. Passing a
+``scr.AnnData`` instance from the QC step avoids reopening the file path
+manually, and the returned wrappers expose ``.obs``/``.var`` tables with
+``.load()`` helpers for materialising the full metadata only when requested.
 
 Differential expression
 -----------------------
@@ -86,7 +93,10 @@ against the control population while matching the familiar
 default) for a Mann-Whitney U test, ``method="wald"`` for the streaming Wald
 test, or ``method="nb_glm"`` to fit the negative binomial GLM that supports
 covariates. The helper reuses the automatic control inference so a missing
-``control_label`` triggers the same adaptive search used earlier.
+``control_label`` triggers the same adaptive search used earlier, and the
+returned :class:`scr.AnnData` wrapper stores previews of the results in
+``.uns`` so printing ``adata.uns["rank_genes_groups"]`` shows the top genes
+per perturbation while ``.load()`` retrieves the full tables on demand.
 
 Benchmarking
 ------------

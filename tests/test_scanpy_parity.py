@@ -152,7 +152,7 @@ def test_normalisation_and_pseudobulk_match_scanpy(subset_dataset, tmp_path):
     control_mean_log = toolkit_log[control_mask].mean(axis=0)
     control_bulk = np.log1p(toolkit_norm[control_mask].mean(axis=0))
 
-    avg_effects = compute_average_log_expression(
+    avg_effects_handle = compute_average_log_expression(
         qc_result.filtered_path,
         perturbation_column=PERTURBATION_COLUMN,
         control_label=control_label,
@@ -161,7 +161,14 @@ def test_normalisation_and_pseudobulk_match_scanpy(subset_dataset, tmp_path):
         output_dir=tmp_path,
         data_name="scanpy_parity",
     )
-    pseudo_effects = compute_pseudobulk_expression(
+    avg_effects_mem = avg_effects_handle.to_memory()
+    avg_effects = pd.DataFrame(
+        avg_effects_mem.X,
+        index=avg_effects_mem.obs.index,
+        columns=avg_effects_mem.var_names,
+    )
+
+    pseudo_effects_handle = compute_pseudobulk_expression(
         qc_result.filtered_path,
         perturbation_column=PERTURBATION_COLUMN,
         control_label=control_label,
@@ -169,6 +176,12 @@ def test_normalisation_and_pseudobulk_match_scanpy(subset_dataset, tmp_path):
         chunk_size=CHUNK_SIZE,
         output_dir=tmp_path,
         data_name="scanpy_parity",
+    )
+    pseudo_effects_mem = pseudo_effects_handle.to_memory()
+    pseudo_effects = pd.DataFrame(
+        pseudo_effects_mem.X,
+        index=pseudo_effects_mem.obs.index,
+        columns=pseudo_effects_mem.var_names,
     )
 
     expected_avg = {}
@@ -187,6 +200,9 @@ def test_normalisation_and_pseudobulk_match_scanpy(subset_dataset, tmp_path):
         np.testing.assert_allclose(
             pseudo_effects.loc[label].to_numpy(), expected_pseudo[label], atol=1e-8, rtol=1e-6
         )
+
+    avg_effects_handle.close()
+    pseudo_effects_handle.close()
 
 
 def test_differential_expression_matches_scanpy(subset_dataset, tmp_path):

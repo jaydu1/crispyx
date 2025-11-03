@@ -11,6 +11,7 @@ import pandas as pd
 import scipy.sparse as sp
 
 from .data import (
+    AnnData,
     ensure_gene_symbol_column,
     iter_matrix_chunks,
     read_backed,
@@ -27,9 +28,15 @@ class QualityControlResult:
     cell_mask: np.ndarray
     gene_mask: np.ndarray
     perturbation_keep: Dict[str, bool]
-    filtered_path: Path
+    filtered: AnnData
     cell_gene_counts: np.ndarray
     gene_cell_counts: np.ndarray
+
+    @property
+    def filtered_path(self) -> Path:
+        """Compatibility accessor exposing the on-disk filename."""
+
+        return self.filtered.path
 
 
 def filter_cells_by_gene_count(
@@ -198,11 +205,8 @@ def quality_control_summary(
         var_assignments={"gene_symbols": gene_names[gene_mask]},
     )
 
-    filtered_backed = read_backed(filtered_path)
-    try:
-        labels = filtered_backed.obs[perturbation_column].astype(str)
-    finally:
-        filtered_backed.file.close()
+    filtered = AnnData(filtered_path)
+    labels = filtered.obs[perturbation_column].astype(str)
     perturbation_keep = {
         label: (label == control_label) or (labels[labels == label].shape[0] >= min_cells_per_perturbation)
         for label in labels.unique()
@@ -212,7 +216,7 @@ def quality_control_summary(
         cell_mask=combined_cell_mask,
         gene_mask=gene_mask,
         perturbation_keep=perturbation_keep,
-        filtered_path=filtered_path,
+        filtered=filtered,
         cell_gene_counts=gene_counts_per_cell,
         gene_cell_counts=counts,
     )

@@ -9,8 +9,9 @@ import anndata as ad
 import numpy as np
 
 from .data import (
+    AnnData,
     ensure_gene_symbol_column,
-    preview_backed,
+    read_h5ad_ondisk,
     read_backed,
     resolve_control_label,
     resolve_output_path,
@@ -34,11 +35,13 @@ from .qc import (
 )
 
 
-def _resolve_backed_path(data: str | Path | ad.AnnData) -> Path:
+def _resolve_backed_path(data: str | Path | ad.AnnData | AnnData) -> Path:
     """Return the on-disk path for a backed AnnData object or path-like input."""
 
     if isinstance(data, (str, Path)):
         return Path(data)
+    if isinstance(data, AnnData):
+        return data.path
     if isinstance(data, ad.AnnData):
         filename = getattr(data, "filename", None)
         if filename:
@@ -89,7 +92,7 @@ def _wald_results_to_rank_genes(
         effect_matrix = np.vstack([results[group].effect_size for group in groups])
         statistic_matrix = np.vstack([results[group].statistic for group in groups])
         pvalue_matrix = np.vstack([results[group].pvalue for group in groups])
-        result_path = first.result_path
+        result_view = first.result
     else:
         backed = read_backed(path)
         try:
@@ -108,6 +111,7 @@ def _wald_results_to_rank_genes(
             output_dir=output_dir,
             data_name=data_name,
         )
+        result_view = AnnData(result_path)
 
     if corr_method not in {"benjamini-hochberg", "bonferroni"}:
         raise ValueError(
@@ -126,7 +130,7 @@ def _wald_results_to_rank_genes(
     )
     zeros = np.zeros_like(statistic_matrix)
 
-    return RankGenesGroupsResult(
+    result = RankGenesGroupsResult(
         genes=genes,
         groups=groups,
         statistics=statistic_matrix,
@@ -143,8 +147,21 @@ def _wald_results_to_rank_genes(
         control_label=control_label,
         tie_correct=False,
         pvalue_correction=corr_method,
-        result_path=result_path,
+        result=result_view,
     )
+    if result.result is not None:
+        memory = result.result.to_memory()
+        memory.uns["rank_genes_groups"] = result.to_rank_genes_groups_dict()
+        memory.uns["rank_genes_groups_full"] = result.to_full_order_dict()
+        memory.uns["genes"] = genes.to_numpy()
+        memory.uns["method"] = "wald"
+        memory.uns["control_label"] = control_label
+        memory.uns["tie_correct"] = False
+        memory.uns["pvalue_correction"] = corr_method
+        memory.write(result.result.path)
+        result.result.close()
+        result.result = AnnData(result.result.path)
+    return result
 
 
 class _PreprocessingNamespace:
@@ -217,7 +234,7 @@ class _PreprocessingNamespace:
         data_name: str | None = None,
     ):
         path = _resolve_backed_path(data)
-        return quality_control_summary(
+        result = quality_control_summary(
             path,
             min_genes=min_genes,
             min_cells_per_perturbation=min_cells_per_perturbation,
@@ -229,6 +246,7 @@ class _PreprocessingNamespace:
             output_dir=output_dir,
             data_name=data_name,
         )
+        return result.filtered
 
 
 class _PseudobulkNamespace:
@@ -334,12 +352,15 @@ class _ToolsNamespace:
                     % ", ".join(sorted(unexpected))
                 )
             method_kwargs = {key: kwargs[key] for key in allowed if key in kwargs}
-            return wilcoxon_test(
+            result = wilcoxon_test(
                 path,
                 corr_method=corr_method,
                 **base_kwargs,
                 **method_kwargs,
             )
+            if result.result is None:
+                raise RuntimeError("Wilcoxon test did not produce an AnnData result.")
+            return result.result
 
         if normalised == "nb_glm":
             allowed = {
@@ -359,12 +380,15 @@ class _ToolsNamespace:
                     % ", ".join(sorted(unexpected))
                 )
             method_kwargs = {key: kwargs[key] for key in allowed if key in kwargs}
-            return nb_glm_test(
+            result = nb_glm_test(
                 path,
                 corr_method=corr_method,
                 **base_kwargs,
                 **method_kwargs,
             )
+            if result.result is None:
+                raise RuntimeError("NB-GLM test did not produce an AnnData result.")
+            return result.result
 
         if normalised == "wald":
             allowed = {"min_cells_expressed", "chunk_size"}
@@ -380,7 +404,7 @@ class _ToolsNamespace:
                 **base_kwargs,
                 **method_kwargs,
             )
-            return _wald_results_to_rank_genes(
+            mapped = _wald_results_to_rank_genes(
                 path,
                 results,
                 gene_name_column=gene_name_column,
@@ -390,6 +414,9 @@ class _ToolsNamespace:
                 output_dir=output_dir,
                 data_name=data_name,
             )
+            if mapped.result is None:
+                raise RuntimeError("Wald test did not produce an AnnData result.")
+            return mapped.result
 
         raise ValueError(
             f"Unsupported differential expression method: {method}. "
@@ -416,7 +443,8 @@ __all__ = [
     "wilcoxon_test",
     "nb_glm_test",
     "ensure_gene_symbol_column",
-    "preview_backed",
+    "AnnData",
+    "read_h5ad_ondisk",
     "read_backed",
     "resolve_control_label",
     "resolve_output_path",
