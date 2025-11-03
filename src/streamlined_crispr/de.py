@@ -139,6 +139,7 @@ class RankGenesGroupsResult(Mapping[str, DifferentialExpressionResult]):
             "auc": to_recarray(sorted_effect),
             "u_stat": to_recarray(sorted_u),
         }
+        rank_genes_groups["full"] = self.to_full_order_dict()
         return rank_genes_groups
 
     def to_full_order_dict(self) -> dict:
@@ -755,7 +756,6 @@ def wilcoxon_test(
     obs_index = pd.Index(candidates, name="perturbation").astype(str)
     adata = ad.AnnData(np.zeros((len(candidates), 0)), obs=pd.DataFrame(index=obs_index))
     adata.uns["rank_genes_groups"] = result.to_rank_genes_groups_dict()
-    adata.uns["rank_genes_groups_full"] = result.to_full_order_dict()
     adata.uns["genes"] = gene_array
     adata.uns["method"] = "wilcoxon"
     adata.uns["control_label"] = control_label

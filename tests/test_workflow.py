@@ -331,7 +331,7 @@ def test_scanpy_style_namespaces_match_direct(tmp_path):
         min_cells_expressed=0,
     )
     wald_wrapped_uns = wald_wrapped.uns["rank_genes_groups"].load()
-    wald_wrapped_full = wald_wrapped.uns["rank_genes_groups_full"].load()
+    wald_wrapped_full = wald_wrapped_uns["full"]
     wrapped_groups = list(wald_wrapped_uns["names"].dtype.names)
     direct_effect = np.vstack([wald_direct[group].effect_size for group in wrapped_groups])
     direct_stat = np.vstack([wald_direct[group].statistic for group in wrapped_groups])
@@ -362,14 +362,9 @@ def test_scanpy_style_namespaces_match_direct(tmp_path):
     wilcoxon_wrapped_uns = wilcoxon_wrapped.uns["rank_genes_groups"].load()
     wrapped_groups = list(wilcoxon_wrapped_uns["names"].dtype.names)
     direct_order = wilcoxon_direct.to_full_order_dict()
-    np.testing.assert_allclose(
-        wilcoxon_wrapped.uns["rank_genes_groups_full"].load()["scores"],
-        direct_order["scores"],
-    )
-    np.testing.assert_allclose(
-        wilcoxon_wrapped.uns["rank_genes_groups_full"].load()["pvals"],
-        direct_order["pvals"],
-    )
+    full_wrapped = wilcoxon_wrapped_uns["full"]
+    np.testing.assert_allclose(full_wrapped["scores"], direct_order["scores"])
+    np.testing.assert_allclose(full_wrapped["pvals"], direct_order["pvals"])
     assert set(wrapped_groups) == set(wilcoxon_direct.groups)
     avg_wrapped.close()
     avg_direct.close()

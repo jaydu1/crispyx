@@ -152,7 +152,6 @@ def _wald_results_to_rank_genes(
     if result.result is not None:
         memory = result.result.to_memory()
         memory.uns["rank_genes_groups"] = result.to_rank_genes_groups_dict()
-        memory.uns["rank_genes_groups_full"] = result.to_full_order_dict()
         memory.uns["genes"] = genes.to_numpy()
         memory.uns["method"] = "wald"
         memory.uns["control_label"] = control_label

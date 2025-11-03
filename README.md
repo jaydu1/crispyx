@@ -31,6 +31,7 @@ adata_ro = scr.tl.rank_genes_groups(
 )
 print(adata_ro.uns["rank_genes_groups"])  # preview top hits per perturbation
 de_results = adata_ro.uns["rank_genes_groups"].load()
+full_tables = de_results["full"]
 var_table = adata_ro.var.load()
 ```
 

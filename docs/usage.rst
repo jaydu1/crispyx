@@ -31,7 +31,8 @@ Quick start
        method="wilcoxon",
    )
    print(adata_ro.uns["rank_genes_groups"])  # preview without loading everything
-   de_full = adata_ro.uns["rank_genes_groups"].load()
+   de_results = adata_ro.uns["rank_genes_groups"].load()
+   de_full = de_results["full"]
    var_table = adata_ro.var.load()
 
 Setting up
