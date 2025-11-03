@@ -3,9 +3,10 @@
 This package provides a lightweight toolkit for performing key steps of CRISPR screen analysis without loading the entire dataset into memory. It operates directly on standard AnnData `.h5ad` files using backed access so that large cell-by-gene matrices remain on disk while QC, pseudo-bulk aggregation, and differential expression calculations stream across the data.
 
 ## Features
-- Quality control filters for low quality cells, perturbations, and genes with automatic verification of gene symbol columns. Filtered cell × gene matrices are persisted as `{dataset}_filtered.h5ad`.
+- Quality control filters for low quality cells, perturbations, and genes with automatic verification of gene symbol columns. When a gene column is not provided the toolkit falls back to `adata.var_names` and logs the decision, and control labels such as `ctrl`/`nontarget` are detected automatically. Filtered cell × gene matrices are persisted as `{dataset}_filtered.h5ad`.
 - Pseudo-bulk aggregation for effect size estimation using both averaged log counts and pseudo-bulk counts. Each estimator produces an AnnData file of effect sizes for downstream inspection.
-- Differential expression testing with Wald and Wilcoxon tests that can skip lowly expressed genes for stability. Result matrices are saved as AnnData files containing effect sizes, statistics, and p-values.
+- Differential expression testing with Wald and Wilcoxon tests that can skip lowly expressed genes for stability. Result matrices are saved as AnnData files containing effect sizes, statistics, and p-values, and they inherit the same automatic control selection used in the earlier steps.
+- Lightweight `preview_backed` helper that opens a backed AnnData file, prints a small metadata summary, and returns the read-only object for further inspection without fully materialising the matrix.
 - Negative binomial GLM differential expression that regresses out measured covariates while reusing a streamed design matrix solver optimised for sparse counts. Fits can be initialised via Poisson IRLS, include early stopping for lowly expressed genes, and write results (including convergence diagnostics) to disk.
 
 ## Development
