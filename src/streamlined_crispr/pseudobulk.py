@@ -14,6 +14,7 @@ from .data import (
     iter_matrix_chunks,
     normalize_total_block,
     read_backed,
+    resolve_control_label,
     resolve_output_path,
 )
 
@@ -34,7 +35,7 @@ def compute_average_log_expression(
     path: str | Path,
     *,
     perturbation_column: str,
-    control_label: str,
+    control_label: str | None = None,
     gene_name_column: str | None = None,
     perturbations: Iterable[str] | None = None,
     chunk_size: int = 2048,
@@ -51,6 +52,7 @@ def compute_average_log_expression(
                 f"Perturbation column '{perturbation_column}' was not found in adata.obs. Available columns: {list(backed.obs.columns)}"
             )
         labels = backed.obs[perturbation_column].astype(str).to_numpy()
+        control_label = resolve_control_label(labels, control_label)
         n_genes = backed.n_vars
         candidates = _resolve_candidates(labels, control_label, perturbations)
         groups = [control_label] + candidates
@@ -105,7 +107,7 @@ def compute_pseudobulk_expression(
     path: str | Path,
     *,
     perturbation_column: str,
-    control_label: str,
+    control_label: str | None = None,
     gene_name_column: str | None = None,
     perturbations: Iterable[str] | None = None,
     baseline_count: float = 1.0,
@@ -126,6 +128,7 @@ def compute_pseudobulk_expression(
                 f"Perturbation column '{perturbation_column}' was not found in adata.obs. Available columns: {list(backed.obs.columns)}"
             )
         labels = backed.obs[perturbation_column].astype(str).to_numpy()
+        control_label = resolve_control_label(labels, control_label)
         n_genes = backed.n_vars
         candidates = _resolve_candidates(labels, control_label, perturbations)
         groups = [control_label] + candidates

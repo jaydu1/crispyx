@@ -14,6 +14,7 @@ from .data import (
     ensure_gene_symbol_column,
     iter_matrix_chunks,
     read_backed,
+    resolve_control_label,
     resolve_output_path,
     write_filtered_subset,
 )
@@ -58,7 +59,7 @@ def filter_perturbations_by_cell_count(
     path: str | Path,
     *,
     perturbation_column: str,
-    control_label: str,
+    control_label: str | None = None,
     min_cells: int = 50,
     base_mask: np.ndarray | None = None,
 ) -> np.ndarray:
@@ -71,6 +72,7 @@ def filter_perturbations_by_cell_count(
                 f"Perturbation column '{perturbation_column}' was not found in adata.obs. Available columns: {list(backed.obs.columns)}"
             )
         labels = backed.obs[perturbation_column].astype(str).to_numpy()
+        control_label = resolve_control_label(labels, control_label)
     finally:
         backed.file.close()
 
@@ -124,7 +126,7 @@ def quality_control_summary(
     min_cells_per_perturbation: int = 50,
     min_cells_per_gene: int = 100,
     perturbation_column: str,
-    control_label: str,
+    control_label: str | None = None,
     gene_name_column: str | None = None,
     chunk_size: int = 2048,
     output_dir: str | Path | None = None,
@@ -135,6 +137,12 @@ def quality_control_summary(
     backed = read_backed(path)
     try:
         gene_names = ensure_gene_symbol_column(backed, gene_name_column)
+        if perturbation_column not in backed.obs.columns:
+            raise KeyError(
+                f"Perturbation column '{perturbation_column}' was not found in adata.obs. Available columns: {list(backed.obs.columns)}"
+            )
+        labels = backed.obs[perturbation_column].astype(str).to_numpy()
+        control_label = resolve_control_label(labels, control_label)
     finally:
         backed.file.close()
 
