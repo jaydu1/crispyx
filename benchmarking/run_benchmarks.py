@@ -804,14 +804,31 @@ def _summarise_quality_control(result: Any, context: Dict[str, Any]) -> Dict[str
 
 
 def _summarise_dataframe(result: Any, context: Dict[str, Any]) -> Dict[str, Any]:
+    """Summarise tabular results, including on-disk export paths when available."""
+
+    rows = cols = 0
     if hasattr(result, "shape"):
-        rows, cols = result.shape
-    else:
-        rows = cols = 0
-    return {
+        try:
+            rows, cols = result.shape
+        except Exception:  # pragma: no cover - defensive fallback
+            rows = cols = 0
+
+    path_candidate: str | Path | None = None
+    for attr in ("path", "filename", "result_path"):
+        candidate = getattr(result, attr, None)
+        if candidate:
+            path_candidate = candidate
+            break
+
+    summary: Dict[str, Any] = {
         "rows": int(rows),
         "columns": int(cols),
     }
+
+    if path_candidate:
+        summary["result_path"] = _normalise_path(path_candidate, context)
+
+    return summary
 
 
 def _summarise_de_mapping(result: Any, context: Dict[str, Any]) -> Dict[str, Any]:
