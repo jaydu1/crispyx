@@ -210,6 +210,5 @@ __marimo__/
 
 
 tutorial_outputs/
-benchmarking/results/*.h5ad
-benchmarking/results/benchmark_*_reference_*.csv
+benchmarking/results/
 data/demo_benchmark.h5ad
