@@ -14,7 +14,7 @@ if str(SRC_PATH) not in sys.path:
 with (PROJECT_ROOT / "pyproject.toml").open("rb") as fh:
     project_meta = tomllib.load(fh)
 
-project = "Streamlined CRISPR Screen Analysis"
+project = "CRISPYx"
 version = project_meta.get("project", {}).get("version", "0.0.0")
 release = version
 copyright = "2024, Streamlining CRISPR Team"

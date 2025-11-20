@@ -18,16 +18,16 @@ import anndata as ad
 import scanpy as sc
 import h5py
 
-import streamlined_crispr as scr
+import crispyx as cx
 
-from streamlined_crispr import (
+from crispyx import (
     compute_average_log_expression,
     compute_pseudobulk_expression,
     quality_control_summary,
     wald_test,
     wilcoxon_test,
 )
-from streamlined_crispr.data import normalize_total_block
+from crispyx.data import normalize_total_block
 
 
 def create_test_dataset(tmp_path):
@@ -89,7 +89,7 @@ def test_quality_control_writes_filtered_dataset(tmp_path):
         output_dir=tmp_path,
         data_name="qc_test",
     )
-    assert isinstance(result.filtered, scr.AnnData)
+    assert isinstance(result.filtered, cx.AnnData)
     assert result.filtered_path.exists()
     filtered = result.filtered.to_memory()
     assert filtered.n_obs == int(result.cell_mask.sum())
@@ -188,8 +188,8 @@ def test_downstream_effect_outputs(tmp_path):
         data_name="wilcoxon",
     )
 
-    assert isinstance(avg, scr.AnnData)
-    assert isinstance(pseudo, scr.AnnData)
+    assert isinstance(avg, cx.AnnData)
+    assert isinstance(pseudo, cx.AnnData)
     avg_mem = avg.to_memory()
     pseudo_mem = pseudo.to_memory()
     avg_df = pd.DataFrame(avg_mem.X, index=avg_mem.obs.index, columns=avg_mem.var_names)
@@ -213,8 +213,8 @@ def test_downstream_effect_outputs(tmp_path):
 
     assert (tmp_path / "avg_effects_avg_log_effects.h5ad").exists()
     assert (tmp_path / "pseudo_effects_pseudobulk_effects.h5ad").exists()
-    assert (tmp_path / "wald_wald_de.h5ad").exists()
-    assert (tmp_path / "wilcoxon_wilcoxon_de.h5ad").exists()
+    assert (tmp_path / "wald_wald.h5ad").exists()
+    assert (tmp_path / "wilcoxon_wilcoxon.h5ad").exists()
 
     ko1_result = wald["KO1"]
     assert ko1_result.effect_size.shape[0] == 4
@@ -231,7 +231,7 @@ def test_scanpy_style_namespaces_match_direct(tmp_path):
     path, _ = create_test_dataset(tmp_path)
     adata_ro = ad.read_h5ad(path, backed="r")
     try:
-        qc_wrapped = scr.pp.qc_summary(
+        qc_wrapped = cx.pp.qc_summary(
             adata_ro,
             min_genes=1,
             min_cells_per_perturbation=2,
@@ -257,13 +257,13 @@ def test_scanpy_style_namespaces_match_direct(tmp_path):
         data_name="direct",
     )
 
-    assert isinstance(qc_wrapped, scr.AnnData)
+    assert isinstance(qc_wrapped, cx.AnnData)
     qc_wrapped_mem = qc_wrapped.to_memory()
     filtered_direct = qc_direct.filtered.to_memory()
     pd.testing.assert_index_equal(qc_wrapped_mem.obs.index, filtered_direct.obs.index)
     pd.testing.assert_index_equal(qc_wrapped_mem.var_names, filtered_direct.var_names)
 
-    avg_wrapped = scr.pb.average_log_expression(
+    avg_wrapped = cx.pb.average_log_expression(
         qc_wrapped,
         perturbation_column="perturbation",
         control_label="ctrl",
@@ -285,7 +285,7 @@ def test_scanpy_style_namespaces_match_direct(tmp_path):
     pd.testing.assert_index_equal(avg_wrapped_mem.obs.index, avg_direct_mem.obs.index)
     pd.testing.assert_index_equal(avg_wrapped_mem.var_names, avg_direct_mem.var_names)
 
-    pseudo_wrapped = scr.pb.pseudobulk(
+    pseudo_wrapped = cx.pb.pseudobulk(
         qc_wrapped,
         perturbation_column="perturbation",
         control_label="ctrl",
@@ -311,7 +311,7 @@ def test_scanpy_style_namespaces_match_direct(tmp_path):
         pseudo_wrapped_mem.var_names, pseudo_direct_mem.var_names
     )
 
-    wald_wrapped = scr.tl.rank_genes_groups(
+    wald_wrapped = cx.tl.rank_genes_groups(
         qc_wrapped,
         perturbation_column="perturbation",
         method="wald",
@@ -340,7 +340,7 @@ def test_scanpy_style_namespaces_match_direct(tmp_path):
     np.testing.assert_allclose(wald_wrapped_full["scores"], direct_stat)
     np.testing.assert_allclose(wald_wrapped_full["pvals"], direct_p)
 
-    wilcoxon_wrapped = scr.tl.rank_genes_groups(
+    wilcoxon_wrapped = cx.tl.rank_genes_groups(
         qc_wrapped,
         perturbation_column="perturbation",
         method="wilcoxon",

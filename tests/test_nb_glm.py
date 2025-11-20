@@ -22,8 +22,8 @@ SRC_PATH = PROJECT_ROOT / "src"
 if str(SRC_PATH) not in sys.path:
     sys.path.insert(0, str(SRC_PATH))
 
-from streamlined_crispr.glm import NBGLMFitter, build_design_matrix
-from streamlined_crispr.de import nb_glm_test
+from crispyx.glm import NBGLMFitter, build_design_matrix
+from crispyx.de import nb_glm_test
 
 
 def _generate_nb_counts(rng, mu, alpha):

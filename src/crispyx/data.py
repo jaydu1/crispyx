@@ -579,3 +579,300 @@ def write_filtered_subset(
             backed.file.close()
 
 
+def calculate_optimal_chunk_size(
+    n_obs: int,
+    n_vars: int,
+    available_memory_gb: float | None = None,
+    safety_factor: float = 4.0,
+    min_chunk: int = 512,
+    max_chunk: int = 8192,
+) -> int:
+    """Calculate optimal chunk size based on dataset dimensions and available memory.
+    
+    Parameters
+    ----------
+    n_obs
+        Number of observations (cells) in the dataset.
+    n_vars
+        Number of variables (genes) in the dataset.
+    available_memory_gb
+        Available memory in gigabytes. If None, auto-detects using psutil.
+    safety_factor
+        Safety multiplier to account for overhead (default 4.0 for backed operations).
+    min_chunk
+        Minimum chunk size to return (default 512).
+    max_chunk
+        Maximum chunk size to return (default 8192).
+    
+    Returns
+    -------
+    int
+        Recommended chunk size, clamped to [min_chunk, max_chunk].
+    
+    Examples
+    --------
+    >>> calculate_optimal_chunk_size(100000, 20000, available_memory_gb=32)
+    2048
+    """
+    if available_memory_gb is None:
+        try:
+            import psutil
+            available_memory_gb = psutil.virtual_memory().available / 1e9
+        except ImportError:
+            logger.warning(
+                "psutil not installed, using default 16GB for chunk size calculation. "
+                "Install with: pip install psutil"
+            )
+            available_memory_gb = 16.0
+    
+    # Calculate chunk size based on memory
+    # Each chunk uses approximately: chunk_size * n_vars * 8 bytes (float64)
+    # Multiply by safety_factor for overhead
+    bytes_per_chunk = n_vars * 8 * safety_factor
+    max_chunk_from_memory = int((available_memory_gb * 1e9) / bytes_per_chunk)
+    
+    # Clamp to reasonable range
+    chunk_size = max(min_chunk, min(max_chunk, max_chunk_from_memory))
+    
+    logger.info(
+        f"Calculated chunk size: {chunk_size} "
+        f"(dataset: {n_obs} cells × {n_vars} genes, "
+        f"available memory: {available_memory_gb:.1f}GB)"
+    )
+    
+    return chunk_size
+
+
+def calculate_adaptive_qc_thresholds(
+    adata: ad.AnnData,
+    perturbation_column: str,
+    mode: str = "conservative",
+    sample_size: int = 10000,
+) -> dict:
+    """Calculate adaptive QC thresholds based on data distribution.
+    
+    Uses percentile-based approach to determine appropriate QC parameters
+    that retain most of the data while filtering outliers.
+    
+    Parameters
+    ----------
+    adata
+        AnnData object (can be backed).
+    perturbation_column
+        Column in adata.obs containing perturbation labels.
+    mode
+        'conservative' (10th percentile, retains ~90%) or 
+        'aggressive' (5th percentile, retains ~95%).
+    sample_size
+        Maximum number of cells to sample for gene expression analysis.
+    
+    Returns
+    -------
+    dict
+        Dictionary with keys: min_genes, min_cells_per_perturbation,
+        min_cells_per_gene, chunk_size.
+    
+    Examples
+    --------
+    >>> adata = ad.read_h5ad("data.h5ad", backed='r')
+    >>> thresholds = calculate_adaptive_qc_thresholds(adata, "perturbation")
+    >>> adata.file.close()
+    """
+    percentile = 10.0 if mode == "conservative" else 5.0
+    
+    # Analyze perturbation sizes
+    if perturbation_column not in adata.obs.columns:
+        raise KeyError(
+            f"Perturbation column '{perturbation_column}' not found in adata.obs. "
+            f"Available columns: {list(adata.obs.columns)}"
+        )
+    
+    pert_counts = adata.obs[perturbation_column].value_counts()
+    p_percentile = pert_counts.quantile(percentile / 100.0)
+    min_cells_per_pert = int(max(5, min(50, p_percentile)))
+    
+    # Analyze gene expression (sample if dataset is large)
+    n_sample = min(sample_size, adata.n_obs)
+    if n_sample < adata.n_obs:
+        sample_idx = np.random.choice(adata.n_obs, n_sample, replace=False)
+        X_sample = adata[sample_idx, :].X
+    else:
+        X_sample = adata.X
+    
+    # Convert to dense if sparse
+    if sp.issparse(X_sample):
+        X_sample = X_sample.toarray()
+    
+    # Calculate cells expressing each gene
+    cells_per_gene = (X_sample > 0).sum(axis=0)
+    if isinstance(cells_per_gene, np.matrix):
+        cells_per_gene = np.asarray(cells_per_gene).ravel()
+    elif cells_per_gene.ndim > 1:
+        cells_per_gene = cells_per_gene.ravel()
+    
+    gene_percentile = np.percentile(cells_per_gene, percentile)
+    min_cells_per_gene = int(max(5, min(100, gene_percentile)))
+    
+    # Calculate genes per cell (standard threshold)
+    genes_per_cell = (X_sample > 0).sum(axis=1)
+    if isinstance(genes_per_cell, np.matrix):
+        genes_per_cell = np.asarray(genes_per_cell).ravel()
+    elif genes_per_cell.ndim > 1:
+        genes_per_cell = genes_per_cell.ravel()
+    
+    median_genes = int(np.median(genes_per_cell))
+    min_genes = max(5, min(50, median_genes // 10))  # 10% of median
+    
+    # Calculate optimal chunk size
+    chunk_size = calculate_optimal_chunk_size(adata.n_obs, adata.n_vars)
+    
+    thresholds = {
+        "min_genes": min_genes,
+        "min_cells_per_perturbation": min_cells_per_pert,
+        "min_cells_per_gene": min_cells_per_gene,
+        "chunk_size": chunk_size,
+    }
+    
+    logger.info(
+        f"Adaptive QC thresholds ({mode} mode):\n"
+        f"  - min_genes: {min_genes}\n"
+        f"  - min_cells_per_perturbation: {min_cells_per_pert} "
+        f"({percentile}th percentile: {p_percentile:.1f})\n"
+        f"  - min_cells_per_gene: {min_cells_per_gene} "
+        f"({percentile}th percentile: {gene_percentile:.1f})\n"
+        f"  - chunk_size: {chunk_size}"
+    )
+    
+    return thresholds
+
+
+def standardize_dataset(
+    dataset_path: Path | str,
+    perturbation_column: str,
+    control_label: str | None,
+    gene_name_column: str | None,
+    output_dir: Path | str,
+    force: bool = False,
+) -> Path:
+    """Standardize dataset column names and control labels with caching.
+    
+    Creates a standardized copy of the dataset with:
+    - perturbation_column renamed to 'perturbation'
+    - control labels standardized to 'control'
+    - gene_name_column set as var.index if specified
+    
+    Standardized files are cached in {output_dir}/.cache/ and reused
+    unless force=True.
+    
+    Parameters
+    ----------
+    dataset_path
+        Path to original dataset (.h5ad file).
+    perturbation_column
+        Name of perturbation column in original dataset.
+    control_label
+        Control label to standardize. If None, auto-detects.
+    gene_name_column
+        Gene name column to use as var.index. If None, uses existing var.index.
+    output_dir
+        Directory for cached standardized files.
+    force
+        If True, regenerate standardized file even if cache exists.
+    
+    Returns
+    -------
+    Path
+        Path to standardized dataset (either cached or newly created).
+    
+    Examples
+    --------
+    >>> standardized_path = standardize_dataset(
+    ...     "data/original.h5ad",
+    ...     perturbation_column="gene",
+    ...     control_label=None,
+    ...     gene_name_column="gene_symbols",
+    ...     output_dir="results",
+    ...     force=False
+    ... )
+    """
+    import datetime
+    
+    dataset_path = Path(dataset_path)
+    output_dir = Path(output_dir)
+    cache_dir = output_dir / ".cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    
+    standardized_path = cache_dir / f"standardized_{dataset_path.stem}.h5ad"
+    
+    # Check if cached version exists
+    if standardized_path.exists() and not force:
+        logger.info(f"Using cached standardized dataset: {standardized_path}")
+        return standardized_path
+    
+    logger.info(f"Standardizing dataset: {dataset_path.name}")
+    logger.info(f"  - Perturbation column: '{perturbation_column}' → 'perturbation'")
+    
+    # Load dataset
+    adata = ad.read_h5ad(dataset_path, backed='r')
+    adata_mem = adata.to_memory()
+    adata.file.close()
+    
+    # Track standardization metadata
+    metadata = {
+        "original_path": str(dataset_path),
+        "standardization_timestamp": datetime.datetime.now().isoformat(),
+        "column_mappings": {},
+        "label_mappings": {},
+    }
+    
+    # Standardize perturbation column
+    if perturbation_column != "perturbation":
+        if perturbation_column not in adata_mem.obs.columns:
+            raise KeyError(
+                f"Perturbation column '{perturbation_column}' not found. "
+                f"Available: {list(adata_mem.obs.columns)}"
+            )
+        adata_mem.obs.rename(columns={perturbation_column: "perturbation"}, inplace=True)
+        metadata["column_mappings"]["perturbation"] = perturbation_column
+        logger.info(f"  - Renamed '{perturbation_column}' → 'perturbation'")
+    
+    # Standardize control label
+    labels = adata_mem.obs["perturbation"].astype(str).to_numpy()
+    detected_control = resolve_control_label(labels, control_label, verbose=False)
+    
+    if detected_control != "control":
+        adata_mem.obs["perturbation"] = (
+            adata_mem.obs["perturbation"]
+            .astype(str)
+            .replace({detected_control: "control"})
+        )
+        metadata["label_mappings"][detected_control] = "control"
+        logger.info(f"  - Standardized control: '{detected_control}' → 'control'")
+    else:
+        logger.info(f"  - Control label already standardized: 'control'")
+    
+    # Standardize gene names
+    if gene_name_column is not None:
+        if gene_name_column in adata_mem.var.columns:
+            if not (adata_mem.var.index == adata_mem.var[gene_name_column]).all():
+                adata_mem.var.index = adata_mem.var[gene_name_column].values
+                metadata["column_mappings"]["var.index"] = gene_name_column
+                logger.info(f"  - Set var.index from '{gene_name_column}'")
+        else:
+            logger.warning(
+                f"Gene column '{gene_name_column}' not found in var. "
+                f"Using existing var.index."
+            )
+    
+    # Store metadata
+    if "standardization_metadata" not in adata_mem.uns:
+        adata_mem.uns["standardization_metadata"] = {}
+    adata_mem.uns["standardization_metadata"].update(metadata)
+    
+    # Save standardized dataset
+    adata_mem.write(standardized_path)
+    logger.info(f"Saved standardized dataset: {standardized_path}")
+    
+    return standardized_path
+
+

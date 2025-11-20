@@ -22,9 +22,9 @@ import scanpy as sc
 import h5py
 from scipy.stats import norm, rankdata
 
-from streamlined_crispr.data import ensure_gene_symbol_column, normalize_total_block
-from streamlined_crispr.de import _tie_correction, wald_test, wilcoxon_test
-from streamlined_crispr.pseudobulk import (
+from crispyx.data import ensure_gene_symbol_column, normalize_total_block
+from crispyx.de import _tie_correction, wald_test, wilcoxon_test
+from crispyx.pseudobulk import (
     compute_average_log_expression,
     compute_pseudobulk_expression,
 )
@@ -145,7 +145,7 @@ def test_wald_test_matches_scanpy(small_adata, tmp_path):
         output_dir=tmp_path,
     )
 
-    output_path = tmp_path / "small_wald_de.h5ad"
+    output_path = tmp_path / "small_wald.h5ad"
     assert output_path.exists()
 
     sc_adata = adata.copy()
@@ -196,7 +196,7 @@ def test_wilcoxon_test_matches_scanpy(small_adata, tmp_path):
         output_dir=tmp_path,
     )
 
-    output_path = tmp_path / "small_wilcoxon_de.h5ad"
+    output_path = tmp_path / "small_wilcoxon.h5ad"
     assert output_path.exists()
 
     raw = np.asarray(adata.X)
@@ -250,3 +250,105 @@ def test_ensure_gene_symbol_column_fallback_to_index():
     names = ensure_gene_symbol_column(adata, "gene_symbols")
 
     assert list(names) == ["GeneA", "GeneB"]
+
+
+def test_wald_test_with_n_jobs(small_adata, tmp_path):
+    """Test that wald_test works with n_jobs parameter."""
+    path, adata = small_adata
+    
+    # Run with n_jobs=2
+    results_parallel = wald_test(
+        path,
+        perturbation_column="perturbation",
+        control_label="ctrl",
+        gene_name_column="gene_symbols",
+        chunk_size=2,
+        output_dir=tmp_path,
+        data_name="parallel",
+        n_jobs=2,
+    )
+    
+    # Run without parallelization
+    results_serial = wald_test(
+        path,
+        perturbation_column="perturbation",
+        control_label="ctrl",
+        gene_name_column="gene_symbols",
+        chunk_size=2,
+        output_dir=tmp_path,
+        data_name="serial",
+        n_jobs=1,
+    )
+    
+    # Results should be identical
+    assert set(results_parallel.keys()) == set(results_serial.keys())
+    for label in results_parallel.keys():
+        np.testing.assert_allclose(
+            results_parallel[label].effect_size,
+            results_serial[label].effect_size,
+            rtol=1e-10,
+            atol=1e-10,
+        )
+        np.testing.assert_allclose(
+            results_parallel[label].statistic,
+            results_serial[label].statistic,
+            rtol=1e-10,
+            atol=1e-10,
+        )
+        np.testing.assert_allclose(
+            results_parallel[label].pvalue,
+            results_serial[label].pvalue,
+            rtol=1e-10,
+            atol=1e-10,
+        )
+
+
+def test_wilcoxon_test_with_n_jobs(small_adata, tmp_path):
+    """Test that wilcoxon_test works with n_jobs parameter."""
+    path, adata = small_adata
+    
+    # Run with n_jobs=2
+    results_parallel = wilcoxon_test(
+        path,
+        perturbation_column="perturbation",
+        control_label="ctrl",
+        gene_name_column="gene_symbols",
+        chunk_size=2,
+        output_dir=tmp_path,
+        data_name="parallel_wilcoxon",
+        n_jobs=2,
+    )
+    
+    # Run without parallelization
+    results_serial = wilcoxon_test(
+        path,
+        perturbation_column="perturbation",
+        control_label="ctrl",
+        gene_name_column="gene_symbols",
+        chunk_size=2,
+        output_dir=tmp_path,
+        data_name="serial_wilcoxon",
+        n_jobs=1,
+    )
+    
+    # Results should be identical
+    assert set(results_parallel.keys()) == set(results_serial.keys())
+    for label in results_parallel.keys():
+        np.testing.assert_allclose(
+            results_parallel[label].effect_size,
+            results_serial[label].effect_size,
+            rtol=1e-10,
+            atol=1e-10,
+        )
+        np.testing.assert_allclose(
+            results_parallel[label].statistic,
+            results_serial[label].statistic,
+            rtol=1e-10,
+            atol=1e-10,
+        )
+        np.testing.assert_allclose(
+            results_parallel[label].pvalue,
+            results_serial[label].pvalue,
+            rtol=1e-10,
+            atol=1e-10,
+        )

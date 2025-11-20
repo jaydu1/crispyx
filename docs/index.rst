@@ -1,7 +1,7 @@
-Streamlined CRISPR Screen Analysis
-==================================
+CRISPYx
+=======
 
-Welcome to the documentation for the ``streamlined_crispr`` package. The
+Welcome to the documentation for the ``crispyx`` package. The
 library provides memory-efficient utilities for loading, filtering, and
 analysing CRISPR screen datasets stored as AnnData ``.h5ad`` files.
 

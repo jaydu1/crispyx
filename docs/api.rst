@@ -1,22 +1,22 @@
 API Reference
 =============
 
-.. automodule:: streamlined_crispr.qc
+.. automodule:: crispyx.qc
    :members:
    :undoc-members:
    :show-inheritance:
 
-.. automodule:: streamlined_crispr.pseudobulk
+.. automodule:: crispyx.pseudobulk
    :members:
    :undoc-members:
    :show-inheritance:
 
-.. automodule:: streamlined_crispr.de
+.. automodule:: crispyx.de
    :members:
    :undoc-members:
    :show-inheritance:
 
-.. automodule:: streamlined_crispr.glm
+.. automodule:: crispyx.glm
    :members:
    :undoc-members:
    :show-inheritance:

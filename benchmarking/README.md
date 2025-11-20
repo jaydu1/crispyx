@@ -1,90 +1,281 @@
-# Benchmarking utilities
+# Benchmarking
 
-This directory contains scripts and example outputs for comparing the
-streaming CRISPR screen analysis methods provided by this project.
+Scripts for profiling CRISPYx streaming methods against reference implementations (Scanpy, Pertpy, edgeR, PyDESeq2).
 
-## Quick start
+## Quick Start
 
-First generate the synthetic demo dataset (or point the benchmarks at one
-of your own ``.h5ad`` files):
-
+### Single Dataset
 ```bash
-python benchmarking/generate_demo_dataset.py
+./run_benchmark.sh config/Adamson.yaml
 ```
 
-Then run the benchmark script from the repository root to execute all
-available methods against the generated dataset:
-
+### Multiple Datasets
 ```bash
-python benchmarking/run_benchmarks.py
+# Run specific datasets
+./run_benchmark.sh config/Adamson.yaml config/Frangieh.yaml
+
+# Run all datasets in config directory
+./run_benchmark.sh config/*.yaml
 ```
 
-Alternatively, you can have the benchmark script regenerate the demo
-dataset on demand by providing the ``--generate-demo`` flag. This is
-helpful when bootstrapping a fresh checkout:
-
+### Generate Configs for All Datasets
 ```bash
-python benchmarking/run_benchmarks.py --generate-demo
+# Auto-generates individual config files (one per dataset)
+./inspect_datasets.sh
+
+# Or with custom memory limit
+./inspect_datasets.sh --memory-limit 64
+
+# Or using reference config for memory limit
+./inspect_datasets.sh --reference-config benchmark_config.yaml
+
+# Then run all
+./run_benchmark.sh config/*.yaml
 ```
 
-The script enforces configurable CPU-time and memory limits for each
-method. When a method exceeds the requested resources it is terminated
-and the failure is recorded in the output table.
+## Configuration
 
-### Comparison groups
+Each dataset has its own YAML config file with all parameters.
 
-In addition to the streaming-only methods, the benchmark now includes
-two categories of parity checks against popular single-cell analysis
-tools:
+### Single-Dataset Config (Recommended)
+```yaml
+dataset_path: "/data/projects/SeqExpDesign/data/origin/Adamson.h5ad"
+output_dir: "benchmarking/results/Adamson"
 
-1. **Quality control and preprocessing comparisons** – run the full
-   streaming pipeline and a Scanpy-based in-memory workflow, recording
-   agreement metrics for filtering, normalisation, and pseudobulk
-   summaries.
-2. **Differential expression comparisons** – contrast the streaming
-   differential expression outputs with reference implementations from
-   Scanpy (t-test and Wilcoxon), as well as GLM-based methods exposed via
-   Pertpy (edgeR, PyDESeq2, and statsmodels). When a particular backend
-   is unavailable, the benchmark reports the attempt with `NA`
-   placeholders instead of failing the full run.
+# Dataset column configuration
+perturbation_column: "gene"
+control_label: null           # Auto-detect
+gene_name_column: "gene_symbols"
 
-Key command line options:
+# Quality control parameters
+qc_params: null               # null = adaptive calculation
+adaptive_qc_mode: conservative
 
-- `--data-path`: Path to an `.h5ad` file with the same columns as the
-  generated demo dataset. Any dataset with `perturbation`, `celltype`, and
-  `gene_symbols` fields can be used.
-- `--output-dir`: Location for generated `.h5ad` outputs, CSV summaries, and
-  Markdown reports.
-- `--methods`: Optional subset of method names to benchmark.
-- `--time-limit`: CPU time limit per method in seconds (set to `0` to
-  disable the guard).
-- `--memory-limit`: Memory cap per method in GiB (set to `0` to disable
-  the guard).
-- `--generate-demo`: Regenerate the bundled synthetic dataset at
-  `--data-path` before running the benchmarks.
-- `--demo-seed`: Random seed to use when generating the demo dataset
-  (set to `-1` to sample a different seed each time).
+# Resource limits
+resource_limits:
+  time_limit: 36000           # 10 hours
+  memory_limit: 128           # GB
 
-## Outputs
+# Parallelization
+parallel_config:
+  n_cores: 16                 # or null to auto-detect
 
-Each benchmark run writes three types of files:
+# Other options
+force_restandardize: false
+show_progress: true
+quiet: false
+methods_to_run: null          # null = run all methods
+```
 
-1. Intermediate `.h5ad` files produced by each method (written directly to
-   `<output-dir>`).
-2. A CSV summary (`benchmark_results.csv`) containing timing,
-   memory usage, retention statistics, and high-level result
-   information for each method. Paths in the CSV are recorded relative
-   to the benchmark output directory so that the report remains stable
-   across machines.
-3. A Markdown report (`benchmark_results.md`) grouped by category
-   (streaming pipeline, differential expression, and reference
-   comparisons). The report opens with a prose summary covering overall
-   success rates, category-level runtime averages, and any dependency or
-   runtime issues before presenting the detailed tables for each group.
-4. A JSON summary (`benchmark_results_summary.json`) that mirrors the
-   narrative headline figures—status counts, average runtimes, and
-   captured errors—in a machine-readable format ready for dashboards or
-   automated monitoring.
+**Example**: See `config/adamson_only.yaml`
 
-Example outputs generated with the demo dataset are committed alongside this
-script. They provide a ready-to-view reference when browsing the repository.
+## Adaptive Features
+
+### Automatic QC Parameters
+When `qc_params: null`, calculates from data:
+- **Conservative** (default): 10th percentile thresholds, retains ~90% data
+- **Aggressive**: 5th percentile thresholds, retains ~95% data
+
+Example adaptive output for 65k cell dataset:
+```json
+{
+  "min_genes": 50,
+  "min_cells_per_perturbation": 50,
+  "min_cells_per_gene": 5,
+  "chunk_size": 8192
+}
+```
+
+### Dataset Standardization
+Automatically:
+- Renames perturbation column to `'perturbation'`
+- Standardizes control labels to `'control'`
+- Caches to `{output_dir}/.cache/standardized_{dataset}.h5ad`
+- Reuses cache unless `force_restandardize: true`
+
+## Scripts
+
+### `run_benchmark.sh`
+Run benchmarks on one or more datasets.
+
+```bash
+# Single dataset
+./run_benchmark.sh config/Adamson.yaml
+
+# Multiple datasets
+./run_benchmark.sh config/Adamson.yaml config/Frangieh.yaml
+
+# All datasets
+./run_benchmark.sh config/*.yaml
+
+# Datasets matching pattern
+./run_benchmark.sh config/Replogle-*.yaml
+```
+
+**Features**:
+- Accepts one or more config files as arguments
+- Runs each dataset independently
+- Separate log file for each dataset
+- Continues on failure, reports summary at end
+- Logs: `logs/benchmark_{timestamp}.log` (main) + `logs/{dataset}_{timestamp}.log` (per-dataset)
+
+### `inspect_datasets.sh`
+Wrapper script for dataset inspection with logging.
+
+```bash
+# Basic usage
+./inspect_datasets.sh
+
+# With custom memory limit
+./inspect_datasets.sh --memory-limit 64
+
+# Using reference config for memory limit
+./inspect_datasets.sh --reference-config benchmark_config.yaml
+```
+
+**Features**:
+- Logs all output to `logs/inspect_datasets_{timestamp}.log`
+- Real-time console output with `tee`
+- Passes all arguments to `inspect_datasets.py`
+
+### `inspect_datasets.py`
+Python script that auto-detects column structures and generates individual config files for all datasets.
+
+```bash
+python inspect_datasets.py
+```
+
+**Options**:
+- `--reference-config PATH`: Read memory limit from existing YAML config (default: `benchmark_config.yaml`)
+- `--memory-limit GB`: Override memory limit in GB for chunk size calculation
+
+**Output**: Individual config files in `config/` directory (one per dataset)
+- `config/Adamson.yaml`
+- `config/Frangieh.yaml`
+- `config/Replogle-GW-k562.yaml`
+- etc.
+
+**Memory-Aware Chunk Sizes**: When a memory limit is specified (either via `--reference-config` or `--memory-limit`), the script calculates optimal chunk sizes constrained by that memory limit. Otherwise, it uses available system memory.
+
+## Output Structure
+
+```
+benchmarking/results/
+├── DatasetName/
+│   ├── .cache/
+│   │   └── standardized_DatasetName.h5ad  # Cached standardized dataset
+│   ├── crispyx/
+│   │   ├── qc_filtered.h5ad
+│   │   ├── de_wald.h5ad
+│   │   ├── de_wilcoxon.h5ad
+│   │   └── pb_avg_log_effects.h5ad
+│   ├── scanpy/                # Scanpy comparison outputs
+│   │   └── de_wilcoxon.csv
+│   ├── pertpy/                # Pertpy comparison outputs
+│   │   ├── de_edger_wald.h5ad
+│   │   └── de_pydeseq2_wald.h5ad
+│   ├── results.csv            # Benchmark summary table
+│   ├── results.md             # Markdown report
+│   └── summary.json           # Metadata with adaptive QC params
+└── logs/
+    └── benchmark_*.log
+```
+
+### Summary Metadata
+`summary.json` includes adaptive decisions:
+```json
+{
+  "adaptive_qc": true,
+  "adaptive_qc_mode": "conservative",
+  "qc_params_used": {
+    "min_genes": 50,
+    "min_cells_per_perturbation": 50,
+    "min_cells_per_gene": 5,
+    "chunk_size": 8192
+  },
+  "standardized_dataset_path": "results/Adamson/.cache/standardized_Adamson.h5ad",
+  "original_dataset_path": "/data/projects/SeqExpDesign/data/origin/Adamson.h5ad"
+}
+```
+
+## Comparison Methods
+
+**Quality Control**: Scanpy in-memory pipeline vs CRISPYx streaming  
+**Differential Expression**:
+- Scanpy: t-test, Wilcoxon
+- Pertpy: edgeR, PyDESeq2, statsmodels
+- CRISPYx: Wald, Wilcoxon, NB-GLM (all with multi-core support)
+
+**Metrics**: Pearson/Spearman correlation, top-k overlap, max absolute difference, AUROC
+
+## Performance Tips
+
+1. **Use adaptive QC** (`qc_params: null`) for optimal parameters
+2. **Enable parallelization** (`n_cores: null` auto-detects)
+3. **Reuse standardized datasets** (`force_restandardize: false`)
+4. **One config per dataset** - Simple, flexible, easy to version control
+5. **Run datasets incrementally**:
+   ```bash
+   # Test on one first
+   ./run_benchmark.sh config/Adamson.yaml
+   
+   # Then run more
+   ./run_benchmark.sh config/Adamson.yaml config/Frangieh.yaml config/Tian-crispra.yaml
+   
+   # Or run all
+   ./run_benchmark.sh config/*.yaml
+   ```
+6. **Run in background** for long jobs:
+   ```bash
+   nohup ./run_benchmark.sh config/*.yaml &
+   tail -f benchmarking/logs/benchmark_*.log
+   ```
+
+## Workflow Example
+
+### Step 1: Generate Config Files (One Time)
+```bash
+cd benchmarking
+./inspect_datasets.sh
+```
+**Result**: Creates `config/Adamson.yaml`, `config/Frangieh.yaml`, etc.  
+**Log**: `logs/inspect_datasets_{timestamp}.log`
+
+### Step 2: Edit Config If Needed
+```bash
+vim config/Adamson.yaml
+# Adjust memory limits, cores, QC mode, etc.
+```
+
+### Step 3: Run Benchmarks
+```bash
+# Single dataset
+./run_benchmark.sh config/Adamson.yaml
+
+# Multiple datasets
+./run_benchmark.sh config/Adamson.yaml config/Frangieh.yaml
+
+# All datasets
+./run_benchmark.sh config/*.yaml
+```
+
+### Step 4: Check Results
+```bash
+# List completed datasets
+ls -1 benchmarking/results/
+
+# View summary
+cat benchmarking/results/Adamson/summary.json
+cat benchmarking/results/Adamson/results.csv
+
+# Check logs
+ls -lt benchmarking/logs/ | head
+```
+
+## Troubleshooting
+
+**Permission issues**: `chmod +x *.sh`  
+**Check progress**: `tail -f logs/benchmark_*.log`  
+**Force re-standardization**: Set `force_restandardize: true`  
+**Override adaptive QC**: Specify explicit `qc_params` in config
+

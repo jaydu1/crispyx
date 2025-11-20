@@ -371,6 +371,7 @@ class _ToolsNamespace:
                 "min_cells_expressed",
                 "min_total_count",
                 "chunk_size",
+                "n_jobs",
             }
             unexpected = set(kwargs) - allowed
             if unexpected:
@@ -390,7 +391,7 @@ class _ToolsNamespace:
             return result.result
 
         if normalised == "wald":
-            allowed = {"min_cells_expressed", "chunk_size"}
+            allowed = {"min_cells_expressed", "chunk_size", "n_jobs"}
             unexpected = set(kwargs) - allowed
             if unexpected:
                 raise TypeError(

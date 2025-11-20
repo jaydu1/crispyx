@@ -18,15 +18,15 @@ import scipy.sparse as sp
 from scipy.stats import norm, rankdata
 import scanpy as sc
 
-from streamlined_crispr import (
+from crispyx import (
     compute_average_log_expression,
     compute_pseudobulk_expression,
     quality_control_summary,
     wald_test,
     wilcoxon_test,
 )
-from streamlined_crispr.data import iter_matrix_chunks, normalize_total_block
-from streamlined_crispr.de import _tie_correction
+from crispyx.data import iter_matrix_chunks, normalize_total_block
+from crispyx.de import _tie_correction
 
 DATA_PATH = Path(__file__).resolve().parents[1] / "data" / "Adamson_subset.h5ad"
 PERTURBATION_COLUMN = "batch_group"

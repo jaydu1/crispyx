@@ -11,12 +11,15 @@ import time
 import traceback
 from collections import Counter
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from importlib import import_module
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, Optional
+from typing import Any, Callable, Dict, Iterable, List, Optional, Union
 
+import numpy as np
 import pandas as pd
+import yaml
+from tqdm import tqdm
 
 # Ensure the local package is importable when the project has not been installed.
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -27,15 +30,20 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from benchmarking.generate_demo_dataset import write_demo_dataset
-from streamlined_crispr.data import read_backed, resolve_control_label
-from streamlined_crispr.de import wald_test, wilcoxon_test
-from streamlined_crispr.metrics import DE_METRIC_KEYS, compute_de_comparison_metrics
-from streamlined_crispr.pseudobulk import (
+from crispyx.data import (
+    read_backed,
+    resolve_control_label,
+    calculate_adaptive_qc_thresholds,
+    standardize_dataset,
+)
+from crispyx.de import wald_test, wilcoxon_test
+from crispyx.metrics import DE_METRIC_KEYS, compute_de_comparison_metrics
+from crispyx.pseudobulk import (
     compute_average_log_expression,
     compute_pseudobulk_expression,
 )
-from streamlined_crispr.qc import quality_control_summary
-from streamlined_crispr.scanpy_validation import ComparisonResult, compare_with_scanpy
+from crispyx.qc import quality_control_summary
+from crispyx.scanpy_validation import ComparisonResult, compare_with_scanpy
 
 
 @dataclass
@@ -48,6 +56,123 @@ class BenchmarkMethod:
     kwargs: Dict[str, Any]
     summary: Callable[[Any, Dict[str, Any]], Dict[str, Any]]
     category: str = "core"
+
+
+@dataclass
+class QCParams:
+    """Quality control filtering parameters."""
+
+    min_genes: int = 5
+    min_cells_per_perturbation: int = 5
+    min_cells_per_gene: int = 5
+    chunk_size: int = 2048
+
+
+@dataclass
+class ResourceLimits:
+    """Resource constraints for benchmark execution."""
+
+    time_limit: int = 300  # seconds, 0 = no limit
+    memory_limit: float = 4.0  # GB, 0 = no limit
+
+
+@dataclass
+class BenchmarkConfig:
+    """Configuration for a single benchmark run."""
+
+    dataset_path: Path
+    dataset_name: str
+    output_dir: Path
+    perturbation_column: str = "perturbation"
+    control_label: Optional[str] = None
+    gene_name_column: Optional[str] = "gene_symbols"
+    qc_params: Optional[QCParams] = field(default_factory=QCParams)  # None = adaptive
+    resource_limits: ResourceLimits = field(default_factory=ResourceLimits)
+    methods_to_run: Optional[List[str]] = None
+    show_progress: bool = True
+    quiet: bool = False
+    n_cores: Optional[int] = None
+    force_restandardize: bool = False
+    adaptive_qc_mode: str = "conservative"
+
+    @classmethod
+    def from_dict(
+        cls, data: Dict[str, Any], base_output_dir: Optional[Path] = None
+    ) -> "BenchmarkConfig":
+        """Create config from dictionary (e.g., loaded from YAML)."""
+        dataset_path = Path(data["dataset_path"])
+        dataset_name = data.get("dataset_name") or dataset_path.stem
+
+        if base_output_dir:
+            output_dir = base_output_dir / dataset_name
+        else:
+            output_dir = Path(
+                data.get("output_dir", f"benchmarking/results/{dataset_name}")
+            )
+
+        qc_data = data.get("qc_params", {})
+        # Allow qc_params to be null for adaptive calculation
+        if qc_data is None:
+            qc_params = None
+        else:
+            qc_params = QCParams(
+                min_genes=qc_data.get("min_genes", 5),
+                min_cells_per_perturbation=qc_data.get("min_cells_per_perturbation", 5),
+                min_cells_per_gene=qc_data.get("min_cells_per_gene", 5),
+                chunk_size=qc_data.get("chunk_size", 2048),
+            )
+
+        limits_data = data.get("resource_limits", {})
+        resource_limits = ResourceLimits(
+            time_limit=limits_data.get("time_limit", 300),
+            memory_limit=limits_data.get("memory_limit", 4.0),
+        )
+
+        parallel_data = data.get("parallel_config", {})
+        n_cores = parallel_data.get("n_cores")
+
+        force_restandardize = data.get("force_restandardize", False)
+        adaptive_qc_mode = data.get("adaptive_qc_mode", "conservative")
+
+        return cls(
+            dataset_path=dataset_path,
+            dataset_name=dataset_name,
+            output_dir=output_dir,
+            perturbation_column=data.get("perturbation_column", "perturbation"),
+            control_label=data.get("control_label"),
+            gene_name_column=data.get("gene_name_column", "gene_symbols"),
+            qc_params=qc_params,
+            resource_limits=resource_limits,
+            methods_to_run=data.get("methods_to_run"),
+            show_progress=data.get("show_progress", True),
+            quiet=data.get("quiet", False),
+            n_cores=n_cores,
+            force_restandardize=force_restandardize,
+            adaptive_qc_mode=adaptive_qc_mode,
+        )
+
+    @classmethod
+    def from_yaml(
+        cls, yaml_path: Path
+    ) -> Union["BenchmarkConfig", List["BenchmarkConfig"]]:
+        """Load configuration(s) from YAML file."""
+        with open(yaml_path) as f:
+            data = yaml.safe_load(f)
+
+        # Multi-dataset mode
+        if "datasets" in data:
+            shared = data.get("shared_config", {})
+            base_output = Path(shared.get("output_dir", "benchmarking/results"))
+
+            configs = []
+            for dataset_data in data["datasets"]:
+                # Merge shared config with dataset-specific config
+                merged = {**shared, **dataset_data}
+                configs.append(cls.from_dict(merged, base_output))
+            return configs
+
+        # Single dataset mode
+        return cls.from_dict(data)
 
 
 @dataclass
@@ -80,11 +205,31 @@ _CATEGORY_ORDER = [
     "Streaming pipeline",
     "Differential expression",
     "Reference: Scanpy",
+    "Reference: edgeR",
     "Reference: Pertpy",
 ]
 
 
 _STATUS_ORDER = ["success", "memory_limit", "timeout", "error", "unknown"]
+
+
+# File naming conventions for benchmark outputs
+STREAMING_OUTPUT_NAMES = {
+    "quality_control": "crispyx/qc_filtered.h5ad",
+    "average_log_expression": "crispyx/pb_avg_log_effects.h5ad",
+    "pseudobulk_expression": "crispyx/pb_pseudobulk_effects.h5ad",
+    "wald_test": "crispyx/de_wald.h5ad",
+    "wilcoxon_test": "crispyx/de_wilcoxon.h5ad",
+}
+
+COMPARISON_OUTPUT_PATHS = {
+    "scanpy_quality_control_comparison": "scanpy/qc_comparison.json",
+    "scanpy_wald_comparison": "scanpy/de_wald.h5ad",
+    "scanpy_wilcoxon_comparison": "scanpy/de_wilcoxon.h5ad",
+    "edger_direct_comparison": "edger/edger_wald.h5ad",
+    "pertpy_pydeseq2_comparison": "pertpy/pydeseq2_wald.h5ad",
+    "pertpy_statsmodels_comparison": "pertpy/statsmodels_wald.h5ad",
+}
 
 
 def _normalise_path(path: str | Path | None, context: Mapping[str, Any]) -> str | None:
@@ -408,10 +553,10 @@ def _standardise_de_dataframe(df: Optional[pd.DataFrame]) -> pd.DataFrame:
         return None
 
     rename: Dict[str, str] = {}
-    perturbation_col = _resolve_column(["perturbation", "group", "cluster", "label"])
-    gene_col = _resolve_column(["gene", "genes", "name", "names", "feature"])
-    effect_col = _resolve_column(["effect_size", "logfoldchange", "logfoldchanges", "lfc", "coefficient"])
-    stat_col = _resolve_column(["statistic", "statistics", "score", "scores", "wald_statistic", "zscore", "t_stat", "u_stat"])
+    perturbation_col = _resolve_column(["perturbation", "group", "cluster", "label", "contrast"])
+    gene_col = _resolve_column(["gene", "genes", "name", "names", "feature", "variable"])
+    effect_col = _resolve_column(["effect_size", "logfoldchange", "logfoldchanges", "lfc", "log_fc", "coefficient"])
+    stat_col = _resolve_column(["statistic", "statistics", "score", "scores", "wald_statistic", "zscore", "t_stat", "t_value", "t_statistic", "f", "f_value", "u_stat"])
     pvalue_col = _resolve_column(["pvalue", "p_value", "pval", "pvals", "pvalue_raw", "pvalue_adj", "pvals_adj"])
 
     if perturbation_col is not None:
@@ -432,8 +577,8 @@ def _standardise_de_dataframe(df: Optional[pd.DataFrame]) -> pd.DataFrame:
             result[column] = pd.NA
 
     result = result[_STANDARD_DE_COLUMNS]
-    result["perturbation"] = result["perturbation"].astype(str)
-    result["gene"] = result["gene"].astype(str)
+    result["perturbation"] = result["perturbation"].astype(str).str.strip()
+    result["gene"] = result["gene"].astype(str).str.strip()
     result["effect_size"] = pd.to_numeric(result["effect_size"], errors="coerce")
     result["statistic"] = pd.to_numeric(result["statistic"], errors="coerce")
     result["pvalue"] = pd.to_numeric(result["pvalue"], errors="coerce")
@@ -640,6 +785,120 @@ def _convert_reference_result_to_dataframe(result: Any) -> Optional[pd.DataFrame
     return None
 
 
+def _run_edger_direct(
+    dataset_path: Path,
+    *,
+    perturbation_column: str,
+    control_label: str,
+    min_genes: int,
+    min_cells_per_gene: int,
+    min_cells_per_perturbation: int,
+    output_dir: Path,
+    data_name: str,
+) -> tuple[pd.DataFrame | None, Optional[Path], Optional[str]]:
+    """Execute edgeR directly via rpy2 without Pertpy wrapper."""
+
+    try:
+        import scanpy as sc
+        from rpy2 import robjects as ro
+        from rpy2.robjects import numpy2ri
+        from rpy2.robjects.conversion import localconverter
+    except ImportError as exc:
+        return None, None, str(exc)
+
+    try:
+        adata = _prepare_reference_anndata(
+            dataset_path,
+            min_genes=min_genes,
+            min_cells_per_gene=min_cells_per_gene,
+            min_cells_per_perturbation=min_cells_per_perturbation,
+            perturbation_column=perturbation_column,
+            control_label=control_label,
+        )
+    except ImportError as exc:
+        return None, None, str(exc)
+
+    groups = adata.obs[perturbation_column].astype(str).values
+    unique_groups = [g for g in np.unique(groups) if g != control_label]
+
+    if not unique_groups:
+        return None, None, "No perturbation groups available for comparison"
+
+    try:
+        # Load edgeR
+        ro.r('library(edgeR)')
+
+        # Convert count matrix to R
+        counts = adata.X.T  # genes x cells
+        if hasattr(counts, 'toarray'):
+            counts = counts.toarray()
+
+        with localconverter(ro.default_converter + numpy2ri.converter):
+            ro.globalenv['counts'] = counts
+            ro.globalenv['groups'] = ro.StrVector(groups)
+            ro.globalenv['gene_names'] = ro.StrVector(adata.var_names)
+
+            # Run edgeR analysis
+            ro.r('''
+            rownames(counts) <- gene_names
+            y <- DGEList(counts=counts, group=groups)
+            y <- calcNormFactors(y)
+            design <- model.matrix(~0 + groups)
+            colnames(design) <- gsub("groups", "", colnames(design))
+            y <- estimateDisp(y, design)
+            fit <- glmQLFit(y, design)
+            ''')
+
+            # Run tests for each non-control group
+            all_results = []
+
+            for group in unique_groups:
+                ro.globalenv['target_group'] = group
+                ro.globalenv['control'] = control_label
+
+                # Make contrast and run test
+                ro.r('''
+                contrast_vec <- makeContrasts(
+                    contrasts = paste0(target_group, "-", control),
+                    levels = design
+                )
+                lrt <- glmQLFTest(fit, contrast=contrast_vec)
+                ''')
+
+                # Extract results manually as vectors (avoids pickling issues)
+                genes = np.array(ro.r('rownames(lrt$table)'))
+                logFC = np.array(ro.r('lrt$table$logFC'))
+                logCPM = np.array(ro.r('lrt$table$logCPM'))
+                F_stat = np.array(ro.r('lrt$table$F'))
+                PValue = np.array(ro.r('lrt$table$PValue'))
+                FDR = np.array(ro.r('p.adjust(lrt$table$PValue, method="BH")'))
+
+                # Create DataFrame
+                results_df = pd.DataFrame({
+                    'gene': genes,
+                    'logFC': logFC,
+                    'logCPM': logCPM,
+                    'F': F_stat,
+                    'PValue': PValue,
+                    'FDR': FDR,
+                    'perturbation': group
+                })
+
+                all_results.append(results_df)
+
+        final_results = pd.concat(all_results, ignore_index=True)
+
+        reference_path: Optional[Path] = None
+        if not final_results.empty:
+            reference_path = output_dir / f"{data_name}_edger_direct_de.csv"
+            final_results.to_csv(reference_path, index=False)
+
+        return final_results, reference_path, None
+
+    except Exception as exc:
+        return None, None, str(exc)
+
+
 def _run_pertpy_de(
     dataset_path: Path,
     *,
@@ -730,7 +989,7 @@ def _run_pertpy_de(
     return df, reference_path, None
 
 
-def compare_scanpy_quality_control(
+def run_scanpy_qc_comparison(
     dataset_path: Path,
     *,
     perturbation_column: str,
@@ -743,6 +1002,10 @@ def compare_scanpy_quality_control(
 ) -> ComparisonResult:
     """Run the full Scanpy validation workflow for QC comparisons."""
 
+    # Create scanpy subdirectory for comparison outputs
+    scanpy_dir = output_dir / "scanpy"
+    scanpy_dir.mkdir(parents=True, exist_ok=True)
+
     return compare_with_scanpy(
         dataset_path,
         perturbation_column=perturbation_column,
@@ -751,12 +1014,12 @@ def compare_scanpy_quality_control(
         min_cells_per_perturbation=min_cells_per_perturbation,
         min_cells_per_gene=min_cells_per_gene,
         gene_name_column=gene_name_column,
-        output_dir=output_dir,
-        data_name="benchmark_scanpy_qc",
+        output_dir=scanpy_dir,
+        data_name="qc",
     )
 
 
-def compare_scanpy_de(
+def run_scanpy_de_comparison(
     dataset_path: Path,
     *,
     perturbation_column: str,
@@ -770,14 +1033,18 @@ def compare_scanpy_de(
 ) -> DifferentialComparisonSummary:
     """Compare streaming differential expression against Scanpy."""
 
+    # Create scanpy subdirectory for comparison outputs
+    scanpy_dir = output_dir / "scanpy"
+    scanpy_dir.mkdir(parents=True, exist_ok=True)
+
     if test_type == "wilcoxon":
         stream_result = wilcoxon_test(
             path=dataset_path,
             perturbation_column=perturbation_column,
             control_label=control_label,
             gene_name_column=gene_name_column,
-            output_dir=output_dir,
-            data_name="benchmark_scanpy_wilcoxon",
+            output_dir=scanpy_dir,
+            data_name="de",
         )
         reference_method = "wilcoxon"
     else:
@@ -786,8 +1053,8 @@ def compare_scanpy_de(
             perturbation_column=perturbation_column,
             control_label=control_label,
             gene_name_column=gene_name_column,
-            output_dir=output_dir,
-            data_name="benchmark_scanpy_wald",
+            output_dir=scanpy_dir,
+            data_name="de",
         )
         reference_method = "t-test"
 
@@ -805,8 +1072,8 @@ def compare_scanpy_de(
         min_cells_per_gene=min_cells_per_gene,
         min_cells_per_perturbation=min_cells_per_perturbation,
         method=reference_method,
-        output_dir=output_dir,
-        data_name="benchmark_scanpy_reference",
+        output_dir=scanpy_dir,
+        data_name="reference",
     )
 
     metrics = {key: None for key in DE_METRIC_KEYS}
@@ -823,7 +1090,63 @@ def compare_scanpy_de(
     )
 
 
-def compare_pertpy_de(
+def run_edger_direct_comparison(
+    dataset_path: Path,
+    *,
+    perturbation_column: str,
+    control_label: str,
+    gene_name_column: str,
+    min_genes: int,
+    min_cells_per_perturbation: int,
+    min_cells_per_gene: int,
+    output_dir: Path,
+) -> DifferentialComparisonSummary:
+    """Compare streaming GLM-based tests against edgeR (via direct rpy2)."""
+
+    # Create edger subdirectory for comparison outputs
+    edger_dir = output_dir / "edger"
+    edger_dir.mkdir(parents=True, exist_ok=True)
+
+    stream_result = wald_test(
+        path=dataset_path,
+        perturbation_column=perturbation_column,
+        control_label=control_label,
+        gene_name_column=gene_name_column,
+        output_dir=edger_dir,
+        data_name="edger",
+    )
+    streaming_frame = _streaming_de_to_frame(stream_result)
+    streaming_path = None
+    if not streaming_frame.empty:
+        any_result = next(iter(stream_result.values()))
+        streaming_path = str(getattr(any_result, "result_path", "")) or None
+
+    reference_df, reference_path, error = _run_edger_direct(
+        dataset_path,
+        perturbation_column=perturbation_column,
+        control_label=control_label,
+        min_genes=min_genes,
+        min_cells_per_gene=min_cells_per_gene,
+        min_cells_per_perturbation=min_cells_per_perturbation,
+        output_dir=edger_dir,
+        data_name="reference",
+    )
+
+    metrics = {key: None for key in DE_METRIC_KEYS}
+    if reference_df is not None:
+        metrics = _compare_de_frames(streaming_frame, _standardise_de_dataframe(reference_df))
+
+    return DifferentialComparisonSummary(
+        test_type="glm",
+        reference_tool="edger_direct",
+        metrics=metrics,
+        streaming_result_path=streaming_path,
+        reference_result_path=str(reference_path) if reference_path else None,
+        error=error,
+    )
+
+
+def run_pertpy_de_comparison(
     dataset_path: Path,
     *,
     perturbation_column: str,
@@ -837,13 +1160,17 @@ def compare_pertpy_de(
 ) -> DifferentialComparisonSummary:
     """Compare streaming GLM-based tests against a Pertpy backend."""
 
+    # Create pertpy subdirectory for comparison outputs
+    pertpy_dir = output_dir / "pertpy"
+    pertpy_dir.mkdir(parents=True, exist_ok=True)
+
     stream_result = wald_test(
         path=dataset_path,
         perturbation_column=perturbation_column,
         control_label=control_label,
         gene_name_column=gene_name_column,
-        output_dir=output_dir,
-        data_name=f"benchmark_{backend}_wald",
+        output_dir=pertpy_dir,
+        data_name=backend,
     )
     streaming_frame = _streaming_de_to_frame(stream_result)
     streaming_path = None
@@ -859,8 +1186,8 @@ def compare_pertpy_de(
         min_cells_per_gene=min_cells_per_gene,
         min_cells_per_perturbation=min_cells_per_perturbation,
         backend=backend,
-        output_dir=output_dir,
-        data_name="benchmark_pertpy_reference",
+        output_dir=pertpy_dir,
+        data_name="reference",
     )
 
     metrics = {key: None for key in DE_METRIC_KEYS}
@@ -1011,6 +1338,14 @@ def _worker(
 ) -> None:
     """Execute ``method`` with optional resource limits and report the outcome."""
 
+    # Force single-threaded operation for R/BLAS to avoid multiprocessing conflicts
+    import os
+    os.environ['OMP_NUM_THREADS'] = '1'
+    os.environ['MKL_NUM_THREADS'] = '1'
+    os.environ['OPENBLAS_NUM_THREADS'] = '1'
+    os.environ['NUMEXPR_NUM_THREADS'] = '1'
+    os.environ['R_THREADS'] = '1'
+    
     if memory_limit and memory_limit > 0:
         resource.setrlimit(resource.RLIMIT_AS, (memory_limit, memory_limit))
     if time_limit and time_limit > 0:
@@ -1060,8 +1395,37 @@ def _run_with_limits(
     memory_limit: int | None,
     time_limit: int | None,
 ) -> Dict[str, Any]:
-    queue: mp.Queue = mp.Queue()
-    process = mp.Process(
+    # Special handling for edgeR: run directly without multiprocessing to avoid R/fork issues
+    if 'edger_direct' in method.name.lower():
+        start = time.perf_counter()
+        try:
+            result = method.function(**method.kwargs)
+            elapsed = time.perf_counter() - start
+            usage = resource.getrusage(resource.RUSAGE_SELF)
+            max_rss_kb = usage.ru_maxrss
+            summary = method.summary(result, context)
+            return {
+                "status": "success",
+                "elapsed_seconds": elapsed,
+                "max_memory_mb": max_rss_kb / 1024,
+                "summary": summary,
+            }
+        except Exception as exc:
+            elapsed = time.perf_counter() - start
+            return {
+                "status": "error",
+                "elapsed_seconds": elapsed,
+                "max_memory_mb": None,
+                "error": str(exc),
+                "traceback": traceback.format_exc(),
+            }
+    
+    # Use spawn context for R/rpy2 compatibility (avoids fork() issues with R threading)
+    needs_spawn = 'pertpy' in method.name.lower()
+    mp_context = mp.get_context('spawn') if needs_spawn else mp
+    
+    queue = mp_context.Queue()
+    process = mp_context.Process(
         target=_worker,
         args=(queue, method, context, memory_limit, time_limit),
         name=f"benchmark-{method.name}",
@@ -1113,31 +1477,77 @@ def _load_dataset_context(path: Path) -> Dict[str, Any]:
     return context
 
 
-def build_methods(dataset_path: Path, output_dir: Path) -> Dict[str, BenchmarkMethod]:
-    """Return the available benchmark methods for the provided dataset."""
-
-    min_genes = 5
-    min_cells_per_perturbation = 5
-    min_cells_per_gene = 5
+def create_benchmark_suite(
+    dataset_path: Path,
+    output_dir: Path,
+    perturbation_column: str = "perturbation",
+    control_label: str | None = None,
+    gene_name_column: str | None = "gene_symbols",
+    qc_params: QCParams | None = None,
+    n_cores: int | None = None,
+) -> Dict[str, BenchmarkMethod]:
+    """Return the available benchmark methods for the provided dataset.
+    
+    Parameters
+    ----------
+    dataset_path
+        Path to standardized dataset.
+    output_dir
+        Directory for benchmark outputs.
+    perturbation_column
+        Name of perturbation column (should be 'perturbation' after standardization).
+    control_label
+        Control label (should be 'control' after standardization or None for auto-detect).
+    gene_name_column
+        Gene name column or None to use var.index.
+    qc_params
+        QC parameters. If None, will be calculated adaptively.
+    n_cores
+        Number of cores to use for parallel DE methods. If None, auto-detects.
+    """
+    import anndata as ad
+    
+    # Use provided QC params or calculate adaptively
+    if qc_params is None:
+        # Calculate adaptive QC parameters
+        adata_temp = ad.read_h5ad(dataset_path, backed='r')
+        try:
+            adaptive_thresholds = calculate_adaptive_qc_thresholds(
+                adata_temp, perturbation_column, mode='conservative'
+            )
+            min_genes = adaptive_thresholds['min_genes']
+            min_cells_per_perturbation = adaptive_thresholds['min_cells_per_perturbation']
+            min_cells_per_gene = adaptive_thresholds['min_cells_per_gene']
+            chunk_size = adaptive_thresholds['chunk_size']
+        finally:
+            adata_temp.file.close()
+    else:
+        min_genes = qc_params.min_genes
+        min_cells_per_perturbation = qc_params.min_cells_per_perturbation
+        min_cells_per_gene = qc_params.min_cells_per_gene
+        chunk_size = qc_params.chunk_size
 
     backed = read_backed(dataset_path)
     try:
-        perturbation_column = "perturbation"
         if perturbation_column not in backed.obs.columns:
             raise KeyError(
-                "Perturbation column 'perturbation' was not found in adata.obs. "
+                f"Perturbation column '{perturbation_column}' was not found in adata.obs. "
                 f"Available columns: {list(backed.obs.columns)}"
             )
         labels = backed.obs[perturbation_column].astype(str).to_numpy()
-        control_label = resolve_control_label(labels, None, verbose=False)
+        detected_control = resolve_control_label(labels, control_label, verbose=False)
     finally:
         backed.file.close()
 
     shared_kwargs = {
-        "perturbation_column": "perturbation",
-        "control_label": control_label,
-        "gene_name_column": "gene_symbols",
+        "perturbation_column": perturbation_column,
+        "control_label": detected_control,
+        "gene_name_column": gene_name_column,
     }
+
+    # Create crispyx subdirectory for streaming outputs
+    crispyx_dir = output_dir / "crispyx"
+    crispyx_dir.mkdir(parents=True, exist_ok=True)
 
     methods = {
         "quality_control": BenchmarkMethod(
@@ -1150,8 +1560,8 @@ def build_methods(dataset_path: Path, output_dir: Path) -> Dict[str, BenchmarkMe
                 "min_cells_per_perturbation": min_cells_per_perturbation,
                 "min_cells_per_gene": min_cells_per_gene,
                 **shared_kwargs,
-                "output_dir": output_dir,
-                "data_name": "benchmark",
+                "output_dir": crispyx_dir,
+                "data_name": "qc",
             },
             summary=_summarise_quality_control,
             category="Streaming pipeline",
@@ -1163,8 +1573,8 @@ def build_methods(dataset_path: Path, output_dir: Path) -> Dict[str, BenchmarkMe
             kwargs={
                 "path": dataset_path,
                 **shared_kwargs,
-                "output_dir": output_dir,
-                "data_name": "benchmark_avg_log",
+                "output_dir": crispyx_dir,
+                "data_name": "pb",
             },
             summary=_summarise_dataframe,
             category="Streaming pipeline",
@@ -1176,8 +1586,8 @@ def build_methods(dataset_path: Path, output_dir: Path) -> Dict[str, BenchmarkMe
             kwargs={
                 "path": dataset_path,
                 **shared_kwargs,
-                "output_dir": output_dir,
-                "data_name": "benchmark_pseudobulk",
+                "output_dir": crispyx_dir,
+                "data_name": "pb",
             },
             summary=_summarise_dataframe,
             category="Streaming pipeline",
@@ -1189,8 +1599,9 @@ def build_methods(dataset_path: Path, output_dir: Path) -> Dict[str, BenchmarkMe
             kwargs={
                 "path": dataset_path,
                 **shared_kwargs,
-                "output_dir": output_dir,
-                "data_name": "benchmark_wald",
+                "output_dir": crispyx_dir,
+                "data_name": "de",
+                "n_jobs": n_cores,
             },
             summary=_summarise_de_mapping,
             category="Differential expression",
@@ -1202,8 +1613,9 @@ def build_methods(dataset_path: Path, output_dir: Path) -> Dict[str, BenchmarkMe
             kwargs={
                 "path": dataset_path,
                 **shared_kwargs,
-                "output_dir": output_dir,
-                "data_name": "benchmark_wilcoxon",
+                "output_dir": crispyx_dir,
+                "data_name": "de",
+                "n_jobs": n_cores,
             },
             summary=_summarise_de_mapping,
             category="Differential expression",
@@ -1211,7 +1623,7 @@ def build_methods(dataset_path: Path, output_dir: Path) -> Dict[str, BenchmarkMe
         "scanpy_quality_control_comparison": BenchmarkMethod(
             name="scanpy_quality_control_comparison",
             description="Quality control comparison against Scanpy",
-            function=compare_scanpy_quality_control,
+            function=run_scanpy_qc_comparison,
             kwargs={
                 "dataset_path": dataset_path,
                 "perturbation_column": shared_kwargs["perturbation_column"],
@@ -1228,7 +1640,7 @@ def build_methods(dataset_path: Path, output_dir: Path) -> Dict[str, BenchmarkMe
         "scanpy_wald_comparison": BenchmarkMethod(
             name="scanpy_wald_comparison",
             description="Wald/t-test comparison against Scanpy",
-            function=compare_scanpy_de,
+            function=run_scanpy_de_comparison,
             kwargs={
                 "dataset_path": dataset_path,
                 "perturbation_column": shared_kwargs["perturbation_column"],
@@ -1246,7 +1658,7 @@ def build_methods(dataset_path: Path, output_dir: Path) -> Dict[str, BenchmarkMe
         "scanpy_wilcoxon_comparison": BenchmarkMethod(
             name="scanpy_wilcoxon_comparison",
             description="Wilcoxon comparison against Scanpy",
-            function=compare_scanpy_de,
+            function=run_scanpy_de_comparison,
             kwargs={
                 "dataset_path": dataset_path,
                 "perturbation_column": shared_kwargs["perturbation_column"],
@@ -1261,10 +1673,10 @@ def build_methods(dataset_path: Path, output_dir: Path) -> Dict[str, BenchmarkMe
             summary=_summarise_de_comparison,
             category="Reference: Scanpy",
         ),
-        "pertpy_edger_comparison": BenchmarkMethod(
-            name="pertpy_edger_comparison",
-            description="GLM comparison against edgeR via Pertpy",
-            function=compare_pertpy_de,
+        "edger_direct_comparison": BenchmarkMethod(
+            name="edger_direct_comparison",
+            description="GLM comparison against edgeR (direct rpy2)",
+            function=run_edger_direct_comparison,
             kwargs={
                 "dataset_path": dataset_path,
                 "perturbation_column": shared_kwargs["perturbation_column"],
@@ -1274,15 +1686,14 @@ def build_methods(dataset_path: Path, output_dir: Path) -> Dict[str, BenchmarkMe
                 "min_cells_per_perturbation": min_cells_per_perturbation,
                 "min_cells_per_gene": min_cells_per_gene,
                 "output_dir": output_dir,
-                "backend": "edger",
             },
             summary=_summarise_de_comparison,
-            category="Reference: Pertpy",
+            category="Reference: edgeR",
         ),
         "pertpy_pydeseq2_comparison": BenchmarkMethod(
             name="pertpy_pydeseq2_comparison",
             description="GLM comparison against PyDESeq2 via Pertpy",
-            function=compare_pertpy_de,
+            function=run_pertpy_de_comparison,
             kwargs={
                 "dataset_path": dataset_path,
                 "perturbation_column": shared_kwargs["perturbation_column"],
@@ -1300,7 +1711,7 @@ def build_methods(dataset_path: Path, output_dir: Path) -> Dict[str, BenchmarkMe
         "pertpy_statsmodels_comparison": BenchmarkMethod(
             name="pertpy_statsmodels_comparison",
             description="GLM comparison against statsmodels via Pertpy",
-            function=compare_pertpy_de,
+            function=run_pertpy_de_comparison,
             kwargs={
                 "dataset_path": dataset_path,
                 "perturbation_column": shared_kwargs["perturbation_column"],
@@ -1322,6 +1733,15 @@ def build_methods(dataset_path: Path, output_dir: Path) -> Dict[str, BenchmarkMe
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Benchmark streamlined CRISPR analysis methods")
     default_output = Path(__file__).resolve().parent / "results"
+    
+    # Config file option (new)
+    parser.add_argument(
+        "--config",
+        type=Path,
+        help="Path to YAML configuration file (overrides individual arguments)",
+    )
+    
+    # Single dataset arguments (backward compatible)
     parser.add_argument(
         "--data-path",
         type=Path,
@@ -1367,6 +1787,11 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Random seed used when generating the demo dataset (set to -1 to sample a random seed)."
         ),
+    )
+    parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help="Suppress progress bars and non-essential output",
     )
     return parser.parse_args()
 
@@ -1494,45 +1919,127 @@ def _dataframe_to_markdown(
     return narrative + "\n" + tables
 
 
-def main() -> None:
-    args = parse_args()
-    dataset_path = args.data_path
-    output_dir: Path = args.output_dir
-    output_dir.mkdir(parents=True, exist_ok=True)
+def _run_single_benchmark(
+    config: BenchmarkConfig,
+) -> tuple[pd.DataFrame, dict]:
+    """Run benchmarks for a single dataset and return results DataFrame and metadata.
+    
+    Returns
+    -------
+    tuple
+        (results_dataframe, metadata_dict)
+    """
+    
+    # Standardize dataset (uses cache if available)
+    if not config.quiet:
+        print(f"\nStandardizing dataset: {config.dataset_path.name}")
+    
+    standardized_path = standardize_dataset(
+        dataset_path=config.dataset_path,
+        perturbation_column=config.perturbation_column,
+        control_label=config.control_label,
+        gene_name_column=config.gene_name_column,
+        output_dir=config.output_dir,
+        force=config.force_restandardize,
+    )
+    
+    context = _load_dataset_context(standardized_path)
+    context["dataset_path"] = str(standardized_path)
+    context["output_dir"] = config.output_dir
+    
+    # Track whether QC params are adaptive or user-specified
+    adaptive_qc = config.qc_params is None
+    qc_params_used = None
+    
+    # Calculate or use provided QC params (this happens inside create_benchmark_suite)
+    # We need to extract them for logging
+    if adaptive_qc:
+        import anndata as ad
+        if not config.quiet:
+            print(f"\nCalculating adaptive QC parameters (mode: {config.adaptive_qc_mode})...")
+        
+        adata_temp = ad.read_h5ad(standardized_path, backed='r')
+        try:
+            qc_params_used = calculate_adaptive_qc_thresholds(
+                adata_temp, "perturbation", mode=config.adaptive_qc_mode
+            )
+            
+            if not config.quiet:
+                print(f"  ✓ min_genes: {qc_params_used['min_genes']}")
+                print(f"  ✓ min_cells_per_perturbation: {qc_params_used['min_cells_per_perturbation']}")
+                print(f"  ✓ min_cells_per_gene: {qc_params_used['min_cells_per_gene']}")
+                print(f"  ✓ chunk_size: {qc_params_used['chunk_size']}")
+        finally:
+            adata_temp.file.close()
+    else:
+        qc_params_used = {
+            "min_genes": config.qc_params.min_genes,
+            "min_cells_per_perturbation": config.qc_params.min_cells_per_perturbation,
+            "min_cells_per_gene": config.qc_params.min_cells_per_gene,
+            "chunk_size": config.qc_params.chunk_size,
+        }
 
-    if args.generate_demo:
-        seed = None if args.demo_seed == -1 else args.demo_seed
-        generated = write_demo_dataset(dataset_path, seed=seed)
-        print(f"Generated demo dataset at {generated}")
-
-    if not dataset_path.exists():
-        raise FileNotFoundError(
-            f"Dataset '{dataset_path}' was not found. "
-            "Generate it with --generate-demo or 'python benchmarking/generate_demo_dataset.py', "
-            "or supply --data-path to an existing .h5ad file."
-        )
-
-    context = _load_dataset_context(dataset_path)
-    context["dataset_path"] = str(dataset_path)
-    context["output_dir"] = output_dir
-
-    available_methods = build_methods(dataset_path, output_dir)
-    if args.methods:
-        selected_names = args.methods
+    available_methods = create_benchmark_suite(
+        dataset_path=standardized_path,
+        output_dir=config.output_dir,
+        perturbation_column="perturbation",  # Always 'perturbation' after standardization
+        control_label="control",  # Always 'control' after standardization
+        gene_name_column=config.gene_name_column,
+        qc_params=config.qc_params,  # Will use adaptive if None
+        n_cores=config.n_cores,
+    )
+    
+    methods_to_run = config.methods_to_run
+    if methods_to_run:
+        selected_names = methods_to_run
     else:
         ordered_methods = sorted(available_methods.values(), key=_method_sort_key)
         selected_names = [method.name for method in ordered_methods]
 
     rows = []
+    
+    # Calculate memory limit in bytes
     memory_limit_bytes = None
-    if args.memory_limit and args.memory_limit > 0:
-        memory_limit_bytes = int(args.memory_limit * (1024**3))
+    if config.resource_limits.memory_limit > 0:
+        memory_limit_bytes = int(config.resource_limits.memory_limit * 1024 * 1024 * 1024)
 
-    for name in selected_names:
+    # Create progress bar for benchmark execution
+    show_progress = config.show_progress and not config.quiet
+    if show_progress:
+        method_iterator = tqdm(
+            selected_names,
+            desc="Running benchmarks",
+            unit="method",
+            bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]",
+        )
+    else:
+        method_iterator = selected_names
+
+    for name in method_iterator:
         if name not in available_methods:
             raise ValueError(f"Unknown method '{name}'. Available methods: {sorted(available_methods)}")
         method = available_methods[name]
-        result = _run_with_limits(method, context, memory_limit_bytes, args.time_limit)
+        
+        # Update progress bar with current method name
+        if show_progress:
+            method_iterator.set_description(f"Running {method.name}")  # type: ignore
+        
+        result = _run_with_limits(
+            method, context, memory_limit_bytes, config.resource_limits.time_limit
+        )
+        
+        # Update progress bar with result status
+        if show_progress:
+            status = result.get("status", "unknown")
+            mem_mb = result.get("max_memory_mb") or 0
+            elapsed = result.get("elapsed_seconds") or 0
+            method_iterator.set_postfix(  # type: ignore
+                status=status, 
+                memory=f"{mem_mb:.0f}MB",
+                time=f"{elapsed:.1f}s",
+                refresh=False
+            )
+        
         row = {
             "category": method.category,
             "method": method.name,
@@ -1547,20 +2054,97 @@ def main() -> None:
         if result.get("error"):
             row["error"] = result["error"]
         rows.append(row)
+    
+    # Create metadata dict
+    metadata = {
+        "qc_params_used": qc_params_used,
+        "adaptive_qc": adaptive_qc,
+        "adaptive_qc_mode": config.adaptive_qc_mode if adaptive_qc else None,
+        "standardized_dataset_path": str(standardized_path),
+        "original_dataset_path": str(config.dataset_path),
+    }
 
-    df = _postprocess_results(pd.DataFrame(rows))
-    summary = _compute_aggregate_statistics(df)
-    csv_path = output_dir / "benchmark_results.csv"
-    md_path = output_dir / "benchmark_results.md"
-    summary_json_path = output_dir / "benchmark_results_summary.json"
+    return _postprocess_results(pd.DataFrame(rows)), metadata
 
-    df.to_csv(csv_path, index=False)
-    md_path.write_text(_dataframe_to_markdown(df, summary))
-    summary_json_path.write_text(json.dumps(summary, indent=2, sort_keys=True))
 
-    print(f"Benchmark complete. Saved results to {csv_path}")
-    print(f"Markdown summary written to {md_path}")
-    print(f"Aggregate summary written to {summary_json_path}")
+def main() -> None:
+    args = parse_args()
+    
+    # Load configuration from YAML or command-line arguments
+    if args.config:
+        config_result = BenchmarkConfig.from_yaml(args.config)
+        configs = config_result if isinstance(config_result, list) else [config_result]
+    else:
+        # Traditional CLI mode - create config from arguments
+        dataset_path = args.data_path
+        output_dir: Path = args.output_dir
+        
+        if args.generate_demo:
+            seed = None if args.demo_seed == -1 else args.demo_seed
+            generated = write_demo_dataset(dataset_path, seed=seed)
+            print(f"Generated demo dataset at {generated}")
+        
+        if not dataset_path.exists():
+            raise FileNotFoundError(
+                f"Dataset '{dataset_path}' was not found. "
+                "Generate it with --generate-demo or 'python benchmarking/generate_demo_dataset.py', "
+                "or supply --data-path to an existing .h5ad file."
+            )
+        
+        memory_limit_bytes = None
+        if args.memory_limit and args.memory_limit > 0:
+            memory_limit = args.memory_limit
+        else:
+            memory_limit = 0
+            
+        # Create single config from CLI args
+        configs = [BenchmarkConfig(
+            dataset_path=dataset_path,
+            dataset_name=dataset_path.stem,
+            output_dir=output_dir,
+            qc_params=QCParams(),
+            resource_limits=ResourceLimits(
+                time_limit=args.time_limit,
+                memory_limit=memory_limit,
+            ),
+            methods_to_run=args.methods,
+            quiet=args.quiet,
+        )]
+    
+    # Run benchmarks for each configuration
+    for i, config in enumerate(configs):
+        if len(configs) > 1:
+            print(f"\n{'='*60}")
+            print(f"Dataset {i+1}/{len(configs)}: {config.dataset_name}")
+            print(f"{'='*60}")
+        
+        # Ensure output directory exists
+        config.output_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Run benchmarks with standardization and adaptive QC
+        df, metadata = _run_single_benchmark(config)
+        
+        # Save results
+        summary = _compute_aggregate_statistics(df)
+        
+        # Add metadata to summary
+        summary.update(metadata)
+        
+        csv_path = config.output_dir / "results.csv"
+        md_path = config.output_dir / "results.md"
+        summary_json_path = config.output_dir / "summary.json"
+
+        df.to_csv(csv_path, index=False)
+        md_path.write_text(_dataframe_to_markdown(df, summary))
+        summary_json_path.write_text(json.dumps(summary, indent=2, sort_keys=True))
+
+        if not config.quiet:
+            print(f"\nBenchmark complete for {config.dataset_name}")
+            print(f"  Results: {csv_path}")
+            print(f"  Summary: {md_path}")
+            print(f"  JSON: {summary_json_path}")
+            if metadata.get("adaptive_qc"):
+                print(f"\n  Adaptive QC parameters saved to summary.json")
 
 
 if __name__ == "__main__":

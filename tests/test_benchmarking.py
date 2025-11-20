@@ -17,8 +17,8 @@ SRC_PATH = PROJECT_ROOT / "src"
 if str(SRC_PATH) not in sys.path:
     sys.path.insert(0, str(SRC_PATH))
 
-from benchmarking.run_benchmarks import _summarise_dataframe, build_methods
-from streamlined_crispr import compute_average_log_expression
+from benchmarking.run_benchmarks import _summarise_dataframe, create_benchmark_suite
+from crispyx import compute_average_log_expression
 
 
 def _create_demo_dataset(tmp_path: Path, control_label: str = "ctrl") -> Path:
@@ -66,10 +66,10 @@ def test_summarise_dataframe_includes_result_path(tmp_path: Path) -> None:
     result.close()
 
 
-def test_build_methods_infers_control_label(tmp_path: Path) -> None:
+def test_create_benchmark_suite_infers_control_label(tmp_path: Path) -> None:
     dataset_path = _create_demo_dataset(tmp_path, control_label="non_target_control")
 
-    methods = build_methods(dataset_path, tmp_path)
+    methods = create_benchmark_suite(dataset_path, tmp_path)
 
     assert methods  # sanity check
     control_labels = {

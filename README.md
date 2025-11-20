@@ -1,76 +1,100 @@
-# Streamlined CRISPR Screen Analysis
+# CRISPYx
 
-This package provides a lightweight toolkit for performing key steps of CRISPR screen analysis without loading the entire dataset into memory. It operates directly on standard AnnData `.h5ad` files using backed access so that large cell-by-gene matrices remain on disk while QC, pseudo-bulk aggregation, and differential expression calculations stream across the data.
+A lightweight toolkit for streaming CRISPR screen analysis that processes large datasets without loading them into memory. Uses backed AnnData `.h5ad` files to perform QC, pseudo-bulk aggregation, and differential expression while data remains on disk.
 
 ## Features
-- Quality control filters for low quality cells, perturbations, and genes with automatic verification of gene symbol columns. When a gene column is not provided the toolkit falls back to `adata.var_names` and logs the decision, and control labels such as `ctrl`/`nontarget` are detected automatically. Filtered cell × gene matrices are persisted as `{dataset}_filtered.h5ad` and returned as `scr.AnnData` views so downstream steps can be chained without reopening the file manually.
-- Scanpy-style namespaces exposed as `scr.pp`, `scr.pb`, and `scr.tl` so familiar workflows can call quality control, pseudo-bulk, and differential expression steps while the heavy lifting remains streamed from disk.
-- Pseudo-bulk aggregation for effect size estimation using both averaged log counts and pseudo-bulk counts. Each estimator produces an AnnData file of effect sizes for downstream inspection.
-- Differential expression testing with Wald and Wilcoxon tests that can skip lowly expressed genes for stability. Result matrices are saved as AnnData files containing effect sizes, statistics, and p-values, and `scr.tl.rank_genes_groups` exposes them as `scr.AnnData` wrappers that close automatically when garbage collected.
-- Lightweight `read_h5ad_ondisk` helper that opens a backed AnnData file, prints a small metadata summary, and returns a read-only :class:`scr.AnnData` wrapper that automatically closes the handle when it falls out of scope.
-- Negative binomial GLM differential expression that regresses out measured covariates while reusing a streamed design matrix solver optimised for sparse counts. Fits can be initialised via Poisson IRLS, include early stopping for lowly expressed genes, and write results (including convergence diagnostics) to disk.
+
+- **Streaming QC** – Filters low-quality cells, perturbations, and genes with automatic control label detection and adaptive thresholds
+- **Scanpy-style API** – Familiar `cx.pp`, `cx.pb`, and `cx.tl` namespaces for quality control, pseudo-bulk, and differential expression
+- **Pseudo-bulk aggregation** – Average log expression and pseudo-bulk counts for effect size estimation
+- **Differential expression** – Wald, Wilcoxon, and negative binomial GLM tests with multi-core support
+- **Adaptive processing** – Automatic QC parameter calculation and dataset standardization with caching
+- **Production-ready** – Comprehensive benchmarking scripts with logging and multi-dataset support
+
+## Quick Start
 
 ```python
-import streamlined_crispr as scr
+import crispyx as cx
 
-adata_ro = scr.read_h5ad_ondisk("data/demo_benchmark.h5ad")
-adata_ro = scr.pp.qc_summary(
-    adata_ro,
+# Open dataset without loading into memory
+adata = cx.read_h5ad_ondisk("data/demo_benchmark.h5ad")
+
+# Quality control with adaptive thresholds
+adata = cx.pp.qc_summary(
+    adata,
     perturbation_column="perturbation",
     min_genes=5,
     min_cells_per_perturbation=5,
 )
-adata_pb = scr.pb.average_log_expression(
-    adata_ro,
+
+# Pseudo-bulk aggregation
+adata_pb = cx.pb.average_log_expression(
+    adata,
     perturbation_column="perturbation",
 )
-adata_ro = scr.tl.rank_genes_groups(
-    adata_ro,
+
+# Differential expression with multi-core support
+adata = cx.tl.rank_genes_groups(
+    adata,
     perturbation_column="perturbation",
     method="wilcoxon",
+    n_jobs=4,  # Use 4 cores
 )
-print(adata_ro.uns["rank_genes_groups"])  # preview top hits per perturbation
-de_results = adata_ro.uns["rank_genes_groups"].load()
-full_tables = de_results["full"]
-var_table = adata_ro.var.load()
+
+# Access results
+print(adata.uns["rank_genes_groups"])
+de_results = adata.uns["rank_genes_groups"].load()
 ```
 
-## Development
-Run the tests with:
+## Installation
 
 ```bash
-pytest
+pip install -e .
 ```
 
 ## Benchmarking
 
-The `benchmarking` directory contains a reusable script for profiling the
-streaming analysis methods. Generate the synthetic demo dataset with
-`python benchmarking/generate_demo_dataset.py` (or provide your own `.h5ad`)
-and then execute `python benchmarking/run_benchmarks.py` to generate CSV and
-Markdown summaries alongside the intermediate `.h5ad` outputs in the selected
-results directory. The Markdown report now opens with a short narrative that
-highlights overall success rates, category-level runtimes, and any dependency
-issues before presenting the detailed tables.
+### Single Dataset
 
-Benchmark outputs report more than the maximum absolute differences between
-streaming and reference pipelines. Each differential expression comparison
-now includes Pearson and Spearman correlations, top-`k` overlaps (by default
-`k=50`) for effect sizes, statistics, and *p*-values, as well as AUROC scores
-when ground-truth labels are present in the merged results. These metrics
-surface whether rankings agree in addition to absolute magnitudes, making it
-easier to spot systematic discrepancies.
+```bash
+cd benchmarking
+./run_benchmark.sh config/Adamson.yaml
+```
 
-Every run additionally emits a machine-readable
-`benchmark_results_summary.json` containing aggregate counts, runtime averages,
-and grouped error metadata so dashboards can ingest the results directly
-without parsing tables.
+### Multiple Datasets
+
+```bash
+cd benchmarking
+./run_benchmark.sh config/*.yaml
+```
+
+See `benchmarking/README.md` for detailed configuration options, adaptive features, and output structure.
+
+## Testing
+
+```bash
+pytest  # Run all tests
+pytest tests/test_workflow.py  # Run specific test file
+```
 
 ## Documentation
 
-Sphinx configuration files live under `docs/` so the package can be published on
-Read the Docs. Build the documentation locally with:
+Build docs locally:
 
 ```bash
 sphinx-build docs docs/_build
+```
+
+## Output Files
+
+Results use standardized naming: `{procedure}_{method}.h5ad`
+
+```
+results/DatasetName/
+├── qc_filtered.h5ad           # QC output
+├── de_wald.h5ad               # Wald test results
+├── de_wilcoxon.h5ad           # Wilcoxon test results
+├── pb_avg_log_effects.h5ad    # Average log expression
+├── results.csv                # Benchmark summary
+└── summary.json               # Metadata with adaptive QC params
 ```

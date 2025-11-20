@@ -604,7 +604,7 @@ def compare_with_scanpy(
         gene_name_column=gene_name_column,
         chunk_size=chunk_size,
         output_dir=output_dir,
-        data_name=data_name,
+        data_name="qc",
     )
     timings_streamlined["quality_control"] = time.perf_counter() - t0
     streamlined_filtered = ad.read_h5ad(str(qc_result.filtered_path))
@@ -618,7 +618,7 @@ def compare_with_scanpy(
         perturbations=perturbations,
         chunk_size=chunk_size,
         output_dir=output_dir,
-        data_name=data_name,
+        data_name="pb",
     )
     avg_log_mem = avg_log_effects_handle.to_memory()
     avg_log_effects = pd.DataFrame(
@@ -639,7 +639,7 @@ def compare_with_scanpy(
         baseline_count=baseline_count,
         chunk_size=chunk_size,
         output_dir=output_dir,
-        data_name=data_name,
+        data_name="pb",
     )
     pseudobulk_mem = pseudobulk_effects_handle.to_memory()
     pseudobulk_effects = pd.DataFrame(
@@ -660,7 +660,7 @@ def compare_with_scanpy(
         min_cells_expressed=de_min_cells_expressed,
         chunk_size=chunk_size,
         output_dir=output_dir,
-        data_name=data_name,
+        data_name="de",
     )
     timings_streamlined["wald_test"] = time.perf_counter() - t0
 
@@ -674,7 +674,7 @@ def compare_with_scanpy(
         min_cells_expressed=de_min_cells_expressed,
         chunk_size=chunk_size,
         output_dir=output_dir,
-        data_name=data_name,
+        data_name="de",
     )
     timings_streamlined["wilcoxon_test"] = time.perf_counter() - t0
 

@@ -14,13 +14,13 @@ SRC_PATH = PROJECT_ROOT / "src"
 if str(SRC_PATH) not in sys.path:
     sys.path.insert(0, str(SRC_PATH))
 
-from streamlined_crispr.data import (
+from crispyx.data import (
     AnnData,
     ensure_gene_symbol_column,
     read_h5ad_ondisk,
     resolve_control_label,
 )
-from streamlined_crispr.pseudobulk import compute_average_log_expression
+from crispyx.pseudobulk import compute_average_log_expression
 
 
 def _create_dataset(tmp_path: Path) -> Path:
@@ -46,7 +46,7 @@ def _create_dataset(tmp_path: Path) -> Path:
 
 
 def test_ensure_gene_symbol_column_uses_var_names(caplog):
-    caplog.set_level(logging.INFO, logger="streamlined_crispr.data")
+    caplog.set_level(logging.INFO, logger="crispyx.data")
     adata = ad.AnnData(np.ones((2, 2)))
     adata.var_names = pd.Index(["g1", "g2"])
 
@@ -57,7 +57,7 @@ def test_ensure_gene_symbol_column_uses_var_names(caplog):
 
 
 def test_resolve_control_label_infers_ctrl(caplog):
-    caplog.set_level(logging.INFO, logger="streamlined_crispr.data")
+    caplog.set_level(logging.INFO, logger="crispyx.data")
 
     inferred = resolve_control_label(["KO", "CTRL_cells"], None)
 
@@ -79,7 +79,7 @@ def test_read_h5ad_ondisk_returns_backed_object(tmp_path, capsys):
 
 
 def test_compute_average_log_expression_infers_control(tmp_path, caplog):
-    caplog.set_level(logging.INFO, logger="streamlined_crispr.data")
+    caplog.set_level(logging.INFO, logger="crispyx.data")
     path = _create_dataset(tmp_path)
 
     result = compute_average_log_expression(
