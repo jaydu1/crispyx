@@ -238,11 +238,17 @@ def generate_yaml_config(dataset_infos: list[dict], output_path: Path, memory_li
         
         yaml_lines.extend([
             "",
+            "# Environment configuration (optional - auto-detects if omitted)",
+            "# environment_config:",
+            "#   r_home: null  # Path to R installation (e.g., /path/to/R/lib/R), null = auto-detect",
+            "#   default_n_cores: null  # Default cores for parallel ops, null = use parallel_config.n_cores or auto-detect",
+            "",
             "# Adaptive QC mode",
             "force_restandardize: false  # Set to true to regenerate standardized files",
             "adaptive_qc_mode: conservative  # or 'aggressive'",
             "",
             "# Methods to run (null = run all available methods)",
+            "# Scanpy comparisons are now optimized to load data only once and cache results",
             "methods_to_run: null",
             "",
             "# Progress and output options",

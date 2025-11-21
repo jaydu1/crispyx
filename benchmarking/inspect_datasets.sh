@@ -13,7 +13,7 @@ PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 PYTHON_ENV="/data/miniforge3/envs/pert/bin/python"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 LOG_DIR="${SCRIPT_DIR}/logs"
-LOG_FILE="${LOG_DIR}/inspect_datasets_${TIMESTAMP}.log"
+LOG_FILE="${LOG_DIR}/${TIMESTAMP}_inspect_datasets.log"
 
 # Create log directory
 mkdir -p "$LOG_DIR"

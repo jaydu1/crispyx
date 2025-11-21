@@ -44,30 +44,34 @@ output_dir: "benchmarking/results/Adamson"
 
 # Dataset column configuration
 perturbation_column: "gene"
-control_label: null           # Auto-detect
-gene_name_column: "gene_symbols"
+control_label: null           # Auto-detects 'CTRL'
+gene_name_column: null        # Uses var.index
 
-# Quality control parameters
-qc_params: null               # null = adaptive calculation
-adaptive_qc_mode: conservative
+# Quality control parameters - set to null to use adaptive calculation
+qc_params: null               # Will be calculated adaptively based on data distribution
 
 # Resource limits
 resource_limits:
-  time_limit: 36000           # 10 hours
-  memory_limit: 128           # GB
+  time_limit: 3600            # 1 hour per method
+  memory_limit: 128.0         # GB per method
 
-# Parallelization
+# Parallelization configuration
 parallel_config:
-  n_cores: 16                 # or null to auto-detect
+  n_cores: 32                 # or null to auto-detect
 
-# Other options
-force_restandardize: false
+# Adaptive QC mode
+force_restandardize: false    # Set to true to regenerate standardized files
+adaptive_qc_mode: conservative  # or 'aggressive'
+
+# Methods to run (null = run all available methods)
+methods_to_run: null
+
+# Progress and output options
 show_progress: true
 quiet: false
-methods_to_run: null          # null = run all methods
 ```
 
-**Example**: See `config/adamson_only.yaml`
+**Example**: See `config/Adamson.yaml`
 
 ## Adaptive Features
 
@@ -76,7 +80,7 @@ When `qc_params: null`, calculates from data:
 - **Conservative** (default): 10th percentile thresholds, retains ~90% data
 - **Aggressive**: 5th percentile thresholds, retains ~95% data
 
-Example adaptive output for 65k cell dataset:
+Example adaptive output calculated from data distribution:
 ```json
 {
   "min_genes": 50,
@@ -85,6 +89,8 @@ Example adaptive output for 65k cell dataset:
   "chunk_size": 8192
 }
 ```
+
+Note: Chunk size is calculated based on memory limits and dataset dimensions.
 
 ### Dataset Standardization
 Automatically:
@@ -117,7 +123,7 @@ Run benchmarks on one or more datasets.
 - Runs each dataset independently
 - Separate log file for each dataset
 - Continues on failure, reports summary at end
-- Logs: `logs/benchmark_{timestamp}.log` (main) + `logs/{dataset}_{timestamp}.log` (per-dataset)
+- Logs: `logs/{timestamp}_benchmark.log` (main) + `logs/{timestamp}_{dataset}.log` (per-dataset)
 
 ### `inspect_datasets.sh`
 Wrapper script for dataset inspection with logging.
@@ -134,7 +140,7 @@ Wrapper script for dataset inspection with logging.
 ```
 
 **Features**:
-- Logs all output to `logs/inspect_datasets_{timestamp}.log`
+- Logs all output to `logs/{timestamp}_inspect_datasets.log`
 - Real-time console output with `tee`
 - Passes all arguments to `inspect_datasets.py`
 
@@ -164,21 +170,26 @@ benchmarking/results/
 ├── DatasetName/
 │   ├── .cache/
 │   │   └── standardized_DatasetName.h5ad  # Cached standardized dataset
-│   ├── crispyx/
-│   │   ├── qc_filtered.h5ad
-│   │   ├── de_wald.h5ad
-│   │   ├── de_wilcoxon.h5ad
-│   │   └── pb_avg_log_effects.h5ad
-│   ├── scanpy/                # Scanpy comparison outputs
-│   │   └── de_wilcoxon.csv
-│   ├── pertpy/                # Pertpy comparison outputs
-│   │   ├── de_edger_wald.h5ad
-│   │   └── de_pydeseq2_wald.h5ad
-│   ├── results.csv            # Benchmark summary table
-│   ├── results.md             # Markdown report
-│   └── summary.json           # Metadata with adaptive QC params
+│   ├── preprocessing/
+│   │   ├── qc_filtered.h5ad               # Quality control output
+│   │   ├── pb_avg_log_effects.h5ad        # Average log expression
+│   │   └── pb_pseudobulk_effects.h5ad     # Pseudobulk expression
+│   ├── de/
+│   │   ├── de_wald.h5ad                   # Wald test DE results
+│   │   └── de_wilcoxon.h5ad               # Wilcoxon test DE results
+│   ├── scanpy/                            # Scanpy comparison outputs
+│   │   ├── qc_comparison.json
+│   │   ├── wald_comparison.csv
+│   │   └── wilcoxon_comparison.csv
+│   ├── edger/                             # edgeR comparison outputs
+│   │   └── direct_comparison.csv
+│   ├── pertpy/                            # Pertpy comparison outputs
+│   │   └── pydeseq2_comparison.csv
+│   ├── results.csv                        # Benchmark summary table
+│   ├── results.md                         # Markdown report
+│   └── summary.json                       # Metadata with adaptive QC params
 └── logs/
-    └── benchmark_*.log
+    └── {timestamp}_*.log
 ```
 
 ### Summary Metadata
@@ -198,15 +209,25 @@ benchmarking/results/
 }
 ```
 
-## Comparison Methods
+## Benchmark Methods
 
-**Quality Control**: Scanpy in-memory pipeline vs CRISPYx streaming  
-**Differential Expression**:
-- Scanpy: t-test, Wilcoxon
-- Pertpy: edgeR, PyDESeq2, statsmodels
-- CRISPYx: Wald, Wilcoxon, NB-GLM (all with multi-core support)
+**CRISPYx Streaming Pipeline** (5 methods):
+1. `quality_control` - Streaming quality control filters
+2. `average_log_expression` - Average log-normalized expression per perturbation
+3. `pseudobulk_expression` - Pseudo-bulk log fold-change per perturbation
+4. `wald_test` - Wald differential expression test (parallelized)
+5. `wilcoxon_test` - Wilcoxon rank-sum differential expression (parallelized)
 
-**Metrics**: Pearson/Spearman correlation, top-k overlap, max absolute difference, AUROC
+**Reference Comparisons** (5 methods):
+6. `scanpy_quality_control_comparison` - QC comparison against Scanpy
+7. `scanpy_wald_comparison` - Wald/t-test comparison against Scanpy
+8. `scanpy_wilcoxon_comparison` - Wilcoxon comparison against Scanpy
+9. `edger_direct_comparison` - GLM comparison against edgeR (via rpy2, parallelized)
+10. `pertpy_pydeseq2_comparison` - GLM comparison against PyDESeq2 via Pertpy (parallelized)
+
+**Comparison Metrics**: Pearson/Spearman correlation, top-k overlap, max absolute difference, AUROC
+
+**Note**: The `pertpy_statsmodels` comparison is excluded because it does not support parallelization and is extremely slow on large datasets. PyDESeq2 provides equivalent GLM-based validation.
 
 ## Performance Tips
 
@@ -228,7 +249,8 @@ benchmarking/results/
 6. **Run in background** for long jobs:
    ```bash
    nohup ./run_benchmark.sh config/*.yaml &
-   tail -f benchmarking/logs/benchmark_*.log
+   # Check latest log file
+   tail -f benchmarking/logs/$(ls -1t benchmarking/logs/*.log | head -1)
    ```
 
 ## Workflow Example
@@ -268,14 +290,15 @@ ls -1 benchmarking/results/
 cat benchmarking/results/Adamson/summary.json
 cat benchmarking/results/Adamson/results.csv
 
-# Check logs
-ls -lt benchmarking/logs/ | head
+# Check logs (sorted chronologically)
+ls -1t benchmarking/logs/ | head
 ```
 
 ## Troubleshooting
 
 **Permission issues**: `chmod +x *.sh`  
-**Check progress**: `tail -f logs/benchmark_*.log`  
+**Check progress**: `tail -f logs/{timestamp}_benchmark.log`  
 **Force re-standardization**: Set `force_restandardize: true`  
-**Override adaptive QC**: Specify explicit `qc_params` in config
+**Override adaptive QC**: Specify explicit `qc_params` in config  
+**View all logs**: `ls -1 logs/` (timestamps at beginning for chronological sorting)
 

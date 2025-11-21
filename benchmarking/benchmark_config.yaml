@@ -20,7 +20,7 @@ resource_limits:
 
 # Parallelization configuration
 parallel_config:
-  n_cores: 32  # Use 2 cores for testing
+  n_cores: null
 
 # Adaptive QC mode
 force_restandardize: false  # Set to true to regenerate standardized files

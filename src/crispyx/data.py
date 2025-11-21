@@ -695,30 +695,55 @@ def calculate_adaptive_qc_thresholds(
     n_sample = min(sample_size, adata.n_obs)
     if n_sample < adata.n_obs:
         sample_idx = np.random.choice(adata.n_obs, n_sample, replace=False)
-        X_sample = adata[sample_idx, :].X
+        sample_idx = np.sort(sample_idx)  # Sort for efficient backed access
     else:
-        X_sample = adata.X
+        sample_idx = None
     
-    # Convert to dense if sparse
-    if sp.issparse(X_sample):
-        X_sample = X_sample.toarray()
+    # Calculate cells per gene and genes per cell efficiently
+    # Use chunked processing to handle backed datasets
+    cells_per_gene = np.zeros(adata.n_vars, dtype=np.int64)
+    genes_per_cell = np.zeros(n_sample if sample_idx is not None else adata.n_obs, dtype=np.int64)
     
-    # Calculate cells expressing each gene
-    cells_per_gene = (X_sample > 0).sum(axis=0)
-    if isinstance(cells_per_gene, np.matrix):
-        cells_per_gene = np.asarray(cells_per_gene).ravel()
-    elif cells_per_gene.ndim > 1:
-        cells_per_gene = cells_per_gene.ravel()
+    chunk_size = calculate_optimal_chunk_size(adata.n_obs, adata.n_vars)
+    cell_idx = 0
     
+    for chunk_start in range(0, adata.n_obs, chunk_size):
+        chunk_end = min(chunk_start + chunk_size, adata.n_obs)
+        
+        # Get the chunk indices
+        if sample_idx is not None:
+            # Get indices that fall in this chunk
+            mask = (sample_idx >= chunk_start) & (sample_idx < chunk_end)
+            if not mask.any():
+                continue
+            chunk_indices = sample_idx[mask] - chunk_start
+            X_chunk = adata.X[chunk_start:chunk_end][chunk_indices]
+        else:
+            X_chunk = adata.X[chunk_start:chunk_end]
+        
+        # Process chunk (works with both sparse and dense)
+        if sp.issparse(X_chunk):
+            # Count non-zeros per gene (column)
+            cells_per_gene += np.asarray(np.diff(X_chunk.tocsc().indptr))
+            # Count non-zeros per cell (row)
+            chunk_genes_per_cell = np.asarray(np.diff(X_chunk.tocsr().indptr))
+        else:
+            # Dense matrix
+            X_chunk_bool = X_chunk > 0
+            cells_per_gene += np.asarray(X_chunk_bool.sum(axis=0)).ravel()
+            chunk_genes_per_cell = np.asarray(X_chunk_bool.sum(axis=1)).ravel()
+        
+        # Store genes per cell for this chunk
+        n_cells_in_chunk = chunk_genes_per_cell.shape[0]
+        genes_per_cell[cell_idx:cell_idx + n_cells_in_chunk] = chunk_genes_per_cell
+        cell_idx += n_cells_in_chunk
+    
+    # Trim genes_per_cell if we didn't fill it completely
+    genes_per_cell = genes_per_cell[:cell_idx]
+    
+    # Calculate thresholds from the collected statistics
     gene_percentile = np.percentile(cells_per_gene, percentile)
     min_cells_per_gene = int(max(5, min(100, gene_percentile)))
-    
-    # Calculate genes per cell (standard threshold)
-    genes_per_cell = (X_sample > 0).sum(axis=1)
-    if isinstance(genes_per_cell, np.matrix):
-        genes_per_cell = np.asarray(genes_per_cell).ravel()
-    elif genes_per_cell.ndim > 1:
-        genes_per_cell = genes_per_cell.ravel()
     
     median_genes = int(np.median(genes_per_cell))
     min_genes = max(5, min(50, median_genes // 10))  # 10% of median

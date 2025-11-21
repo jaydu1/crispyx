@@ -15,7 +15,7 @@ PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 PYTHON_ENV="/data/miniforge3/envs/pert/bin/python"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 LOG_DIR="${SCRIPT_DIR}/logs"
-MAIN_LOG="${LOG_DIR}/benchmark_${TIMESTAMP}.log"
+MAIN_LOG="${LOG_DIR}/${TIMESTAMP}_benchmark.log"
 
 # Create log directory
 mkdir -p "$LOG_DIR"
@@ -94,7 +94,7 @@ for CONFIG_FILE in "${CONFIGS[@]}"; do
     log "Config: $CONFIG_FILE"
     
     # Create dataset-specific log
-    DATASET_LOG="${LOG_DIR}/$(basename "$CONFIG_FILE" .yaml)_${TIMESTAMP}.log"
+    DATASET_LOG="${LOG_DIR}/${TIMESTAMP}_$(basename "$CONFIG_FILE" .yaml).log"
     log "Dataset log: $DATASET_LOG"
     
     # Run benchmark
@@ -130,7 +130,7 @@ fi
 log ""
 log "Results location: benchmarking/results/"
 log "Main log: $MAIN_LOG"
-log "Dataset logs: ${LOG_DIR}/*_${TIMESTAMP}.log"
+log "Dataset logs: ${LOG_DIR}/${TIMESTAMP}_*.log"
 log ""
 log "=========================================="
 
