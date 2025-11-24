@@ -20,7 +20,7 @@ from .de import (
     RankGenesGroupsResult,
     _adjust_pvalue_matrix,
     nb_glm_test,
-    wald_test,
+    t_test,
     wilcoxon_test,
 )
 from .pseudobulk import (
@@ -74,7 +74,7 @@ def _infer_control_label(
     return resolve_control_label(labels, None)
 
 
-def _wald_results_to_rank_genes(
+def _t_test_results_to_rank_genes(
     path: Path,
     results,
     *,
@@ -107,7 +107,7 @@ def _wald_results_to_rank_genes(
         pvalue_matrix = np.ones_like(effect_matrix)
         result_path = resolve_output_path(
             path,
-            suffix="wald_de",
+            suffix="t_test_de",
             output_dir=output_dir,
             data_name=data_name,
         )
@@ -115,7 +115,7 @@ def _wald_results_to_rank_genes(
 
     if corr_method not in {"benjamini-hochberg", "bonferroni"}:
         raise ValueError(
-            "corr_method must be 'benjamini-hochberg' or 'bonferroni' for Wald tests"
+            "corr_method must be 'benjamini-hochberg' or 'bonferroni' for t-tests"
         )
 
     pvalue_adj = (
@@ -143,7 +143,7 @@ def _wald_results_to_rank_genes(
         pts_rest=zeros,
         order=order,
         groupby=perturbation_column,
-        method="wald",
+        method="t_test",
         control_label=control_label,
         tie_correct=False,
         pvalue_correction=corr_method,
@@ -153,7 +153,7 @@ def _wald_results_to_rank_genes(
         memory = result.result.to_memory()
         memory.uns["rank_genes_groups"] = result.to_rank_genes_groups_dict()
         memory.uns["genes"] = genes.to_numpy()
-        memory.uns["method"] = "wald"
+        memory.uns["method"] = "t_test"
         memory.uns["control_label"] = control_label
         memory.uns["tie_correct"] = False
         memory.uns["pvalue_correction"] = corr_method
@@ -326,7 +326,9 @@ class _ToolsNamespace:
             "wilcox": "wilcoxon",
             "wilcoxon-test": "wilcoxon",
             "wilcox-test": "wilcoxon",
-            "wald": "wald",
+            "t-test": "t_test",
+            "ttest": "t_test",
+            "wald": "t_test",  # backward compatibility
             "nb-glm": "nb_glm",
             "nb-glm-test": "nb_glm",
         }
@@ -390,21 +392,21 @@ class _ToolsNamespace:
                 raise RuntimeError("NB-GLM test did not produce an AnnData result.")
             return result.result
 
-        if normalised == "wald":
+        if normalised == "t_test":
             allowed = {"min_cells_expressed", "chunk_size", "n_jobs"}
             unexpected = set(kwargs) - allowed
             if unexpected:
                 raise TypeError(
-                    "Unexpected keyword arguments for wald method: %s"
+                    "Unexpected keyword arguments for t_test method: %s"
                     % ", ".join(sorted(unexpected))
                 )
             method_kwargs = {key: kwargs[key] for key in allowed if key in kwargs}
-            results = wald_test(
+            results = t_test(
                 path,
                 **base_kwargs,
                 **method_kwargs,
             )
-            mapped = _wald_results_to_rank_genes(
+            mapped = _t_test_results_to_rank_genes(
                 path,
                 results,
                 gene_name_column=gene_name_column,
@@ -415,12 +417,12 @@ class _ToolsNamespace:
                 data_name=data_name,
             )
             if mapped.result is None:
-                raise RuntimeError("Wald test did not produce an AnnData result.")
+                raise RuntimeError("t-test did not produce an AnnData result.")
             return mapped.result
 
         raise ValueError(
             f"Unsupported differential expression method: {method}. "
-            "Choose from 'wilcoxon', 'wald', or 'nb_glm'."
+            "Choose from 'wilcoxon', 't-test', or 'nb_glm'."
         )
 
 
@@ -439,7 +441,7 @@ __all__ = [
     "compute_average_log_expression",
     "compute_pseudobulk_expression",
     "RankGenesGroupsResult",
-    "wald_test",
+    "t_test",
     "wilcoxon_test",
     "nb_glm_test",
     "ensure_gene_symbol_column",

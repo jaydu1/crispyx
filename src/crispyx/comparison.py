@@ -167,7 +167,29 @@ def compute_de_comparison_metrics(
     *,
     top_k: int = _DEFAULT_TOP_K,
 ) -> Dict[str, Optional[float]]:
-    """Return a dictionary of metrics comparing two differential expression tables."""
+    """Return a dictionary of metrics comparing two differential expression tables.
+    
+    Computes correlation, overlap, and statistical comparison metrics between two
+    differential expression result DataFrames. Both inputs must contain columns:
+    'perturbation', 'gene', 'effect_size', 'statistic', and 'pvalue'.
+    
+    Label-based metrics (pvalue_stream_auroc, pvalue_reference_auroc) require
+    ground truth labels in a column such as 'is_hit', 'label', or 'ground_truth'.
+    These AUROC metrics are typically only available in benchmark/validation
+    scenarios where true positive perturbations are known.
+    
+    Args:
+        streaming: DataFrame with streaming/test DE results
+        reference: DataFrame with reference/baseline DE results
+        top_k: Number of top hits to consider for overlap metrics (default: 50)
+    
+    Returns:
+        Dictionary with 14 metric keys defined in DE_METRIC_KEYS. Metrics include:
+        - Correlation (Pearson, Spearman) for effect sizes, statistics, and p-values
+        - Top-k overlap for ranking concordance
+        - Max absolute differences
+        - AUROC for p-values (only when ground truth labels are present)
+    """
 
     metrics: Dict[str, Optional[float]] = {key: None for key in DE_METRIC_KEYS}
 

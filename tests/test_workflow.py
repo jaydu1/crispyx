@@ -24,7 +24,7 @@ from crispyx import (
     compute_average_log_expression,
     compute_pseudobulk_expression,
     quality_control_summary,
-    wald_test,
+    t_test,
     wilcoxon_test,
 )
 from crispyx.data import normalize_total_block
@@ -171,13 +171,13 @@ def test_downstream_effect_outputs(tmp_path):
         output_dir=tmp_path,
         data_name="pseudo_effects",
     )
-    wald = wald_test(
+    wald = t_test(
         qc_result.filtered,
         perturbation_column="perturbation",
         control_label="ctrl",
         gene_name_column="gene_symbols",
         output_dir=tmp_path,
-        data_name="wald",
+        data_name="t_test",
     )
     wilcoxon = wilcoxon_test(
         qc_result.filtered,
@@ -211,14 +211,14 @@ def test_downstream_effect_outputs(tmp_path):
     expected = ko1.mean() - ctrl.mean()
     assert np.isclose(avg_df.loc["KO1", "gene0"], expected)
 
-    assert (tmp_path / "avg_effects_avg_log_effects.h5ad").exists()
-    assert (tmp_path / "pseudo_effects_pseudobulk_effects.h5ad").exists()
-    assert (tmp_path / "wald_wald.h5ad").exists()
-    assert (tmp_path / "wilcoxon_wilcoxon.h5ad").exists()
+    assert (tmp_path / "crispyx_avg_effects.h5ad").exists()
+    assert (tmp_path / "crispyx_pseudo_effects.h5ad").exists()
+    assert (tmp_path / "crispyx_t_test.h5ad").exists()
+    assert (tmp_path / "crispyx_wilcoxon.h5ad").exists()
 
     ko1_result = wald["KO1"]
     assert ko1_result.effect_size.shape[0] == 4
-    assert ko1_result.method == "wald"
+    assert ko1_result.method == "t_test"
     ko2_result = wilcoxon["KO2"]
     assert ko2_result.pvalue.shape[0] == 4
     assert ko2_result.method == "wilcoxon"
@@ -314,14 +314,14 @@ def test_scanpy_style_namespaces_match_direct(tmp_path):
     wald_wrapped = cx.tl.rank_genes_groups(
         qc_wrapped,
         perturbation_column="perturbation",
-        method="wald",
+        method="t-test",
         control_label="ctrl",
         gene_name_column="gene_symbols",
         output_dir=tmp_path,
         data_name="wrapped_wald",
         min_cells_expressed=0,
     )
-    wald_direct = wald_test(
+    wald_direct = t_test(
         qc_direct.filtered,
         perturbation_column="perturbation",
         control_label="ctrl",

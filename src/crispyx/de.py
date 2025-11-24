@@ -232,7 +232,7 @@ def _adjust_pvalue_matrix(
     return adjusted
 
 
-def wald_test(
+def t_test(
     path: str | Path,
     *,
     perturbation_column: str,
@@ -244,15 +244,49 @@ def wald_test(
     output_dir: str | Path | None = None,
     data_name: str | None = None,
     n_jobs: int | None = None,
-) -> Dict[str, DifferentialExpressionResult]:
-    """Perform a Wald-style test comparing log-expression means for each perturbation.
+) -> RankGenesGroupsResult:
+    """Perform a t-test comparing log-expression means for each perturbation.
+    
+    Returns a RankGenesGroupsResult containing differential expression statistics
+    in Scanpy-compatible format. Results are stored in an h5ad file with 
+    `uns['rank_genes_groups']` containing logfoldchanges, scores (z-statistics),
+    p-values, adjusted p-values, and proportion of expressing cells.
+    
+    The RankGenesGroupsResult implements the Mapping interface, so it can be used 
+    like a dict: `result[perturbation_label]` returns a DifferentialExpressionResult
+    for that perturbation.
     
     Parameters
     ----------
+    path
+        Path to an h5ad file containing expression data.
+    perturbation_column
+        Column in `adata.obs` indicating perturbation labels.
+    control_label
+        Label for the control/reference group. If None, infers from common patterns.
+    gene_name_column
+        Column in `adata.var` with gene symbols. If None, uses `adata.var_names`.
+    perturbations
+        Specific perturbations to test. If None, tests all non-control groups.
+    min_cells_expressed
+        Minimum total cells (control + perturbation) expressing a gene for testing.
+    chunk_size
+        Number of cells to process per chunk (memory vs. speed tradeoff).
+    output_dir
+        Directory for output h5ad file. Defaults to input file's directory.
+    data_name
+        Custom name for output file. If None, uses "t_test" suffix.
     n_jobs
         Number of parallel workers for computing statistics across perturbations.
         If None, uses all available cores. If 1, runs sequentially.
         If -1, uses all available cores.
+    
+    Returns
+    -------
+    RankGenesGroupsResult
+        Differential expression results in Scanpy-compatible format. Access results
+        via dict-like interface: `result[label].effect_size`, `result[label].pvalue`, etc.
+        The h5ad file path is available at `result.result_path`.
     """
 
     backed = read_backed(path)
@@ -301,7 +335,18 @@ def wald_test(
     effect_matrix = []
     statistic_matrix = []
     pvalue_matrix = []
-    results: Dict[str, DifferentialExpressionResult] = {}
+    lfc_matrix = []
+    pts_matrix = []
+    pts_rest_matrix = []
+    order_matrix = []
+
+    # Calculate control pts (proportion of cells expressing each gene)
+    control_pts = np.divide(
+        expr_counts[control_label],
+        control_n,
+        out=np.zeros(n_genes, dtype=float),
+        where=control_n > 0,
+    )
 
     # Determine worker count for parallelization
     n_groups = len(candidates)
@@ -312,7 +357,7 @@ def wald_test(
         worker_count = min(n_groups, abs(n_jobs))
     worker_count = max(worker_count, 1)
 
-    def compute_perturbation(label: str) -> tuple[str, np.ndarray, np.ndarray, np.ndarray]:
+    def compute_perturbation(label: str) -> tuple[str, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """Compute statistics for a single perturbation."""
         n_cells = counts[label]
         if n_cells == 0:
@@ -323,6 +368,7 @@ def wald_test(
             var = (sumsq[label] - (sums[label] ** 2) / n_cells) / (n_cells - 1)
         var = np.clip(var, a_min=0, a_max=None)
         effect = mean - control_mean
+        log_fc = effect  # For t-test, effect size is log fold change
         se = np.sqrt(control_var / control_n + var / n_cells)
         total_expr = expr_counts[label] + expr_counts[control_label]
         valid = (se > 0) & (total_expr >= min_cells_expressed)
@@ -330,7 +376,19 @@ def wald_test(
         pvalue = np.ones_like(effect)
         z[valid] = effect[valid] / se[valid]
         pvalue[valid] = 2 * norm.sf(np.abs(z[valid]))
-        return label, effect, z, pvalue
+        
+        # Calculate pts (proportion of cells expressing each gene)
+        pts = np.divide(
+            expr_counts[label],
+            n_cells,
+            out=np.zeros(n_genes, dtype=float),
+            where=n_cells > 0,
+        )
+        
+        # Create ranking order (descending by absolute z-score)
+        order = np.argsort(-np.abs(z))
+        
+        return label, effect, z, pvalue, log_fc, pts, order
 
     # Compute in parallel or sequentially based on worker count
     if n_groups == 0:
@@ -342,18 +400,14 @@ def wald_test(
             futures = [executor.submit(compute_perturbation, label) for label in candidates]
             computed = [future.result() for future in futures]
 
-    for label, effect, z, pvalue in computed:
+    for label, effect, z, pvalue, log_fc, pts, order in computed:
         effect_matrix.append(effect)
         statistic_matrix.append(z)
         pvalue_matrix.append(pvalue)
-        results[label] = DifferentialExpressionResult(
-            genes=gene_symbols,
-            effect_size=effect,
-            statistic=z,
-            pvalue=pvalue,
-            method="wald",
-            perturbation=label,
-        )
+        lfc_matrix.append(log_fc)
+        pts_matrix.append(pts)
+        pts_rest_matrix.append(control_pts)
+        order_matrix.append(order)
 
     gene_symbols = pd.Index(gene_symbols).astype(str)
 
@@ -361,27 +415,63 @@ def wald_test(
         effect_arr = np.vstack(effect_matrix)
         stat_arr = np.vstack(statistic_matrix)
         p_arr = np.vstack(pvalue_matrix)
+        lfc_arr = np.vstack(lfc_matrix)
+        pts_arr = np.vstack(pts_matrix)
+        pts_rest_arr = np.vstack(pts_rest_matrix)
+        order_arr = np.vstack(order_matrix)
     else:
-        effect_arr = np.zeros((0, gene_symbols.size))
-        stat_arr = np.zeros_like(effect_arr)
-        p_arr = np.zeros_like(effect_arr)
+        shape = (0, gene_symbols.size)
+        effect_arr = np.zeros(shape)
+        stat_arr = np.zeros(shape)
+        p_arr = np.zeros(shape)
+        lfc_arr = np.zeros(shape)
+        pts_arr = np.zeros(shape)
+        pts_rest_arr = np.zeros(shape)
+        order_arr = np.zeros(shape, dtype=np.int64)
 
+    # Apply p-value correction
+    pvalue_adj_arr = _adjust_pvalue_matrix(p_arr, method="benjamini-hochberg")
+
+    # Create AnnData with rank_genes_groups format in uns
     obs_index = pd.Index(candidates, name="perturbation").astype(str)
     obs = pd.DataFrame({perturbation_column: obs_index.to_list()}, index=obs_index)
     var = pd.DataFrame(index=gene_symbols)
-    adata = ad.AnnData(effect_arr, obs=obs, var=var)
-    adata.layers["z_score"] = stat_arr
-    adata.layers["pvalue"] = p_arr
-    adata.uns["method"] = "wald"
+    
+    # Create minimal AnnData - the actual results are in uns["rank_genes_groups"]
+    adata = ad.AnnData(np.zeros((len(candidates), 0)), obs=obs, var=pd.DataFrame(index=[]))
+    adata.uns["method"] = "t_test"
     adata.uns["control_label"] = control_label
-    output_path = resolve_output_path(path, suffix="wald", output_dir=output_dir, data_name=data_name)
+    adata.uns["genes"] = gene_symbols.to_numpy()
+    adata.uns["pvalue_correction"] = "benjamini-hochberg"
+    
+    output_path = resolve_output_path(path, suffix="t_test", output_dir=output_dir, data_name=data_name)
+    
+    result = RankGenesGroupsResult(
+        genes=gene_symbols,
+        groups=candidates,
+        statistics=stat_arr,
+        pvalues=p_arr,
+        pvalues_adj=pvalue_adj_arr,
+        logfoldchanges=lfc_arr,
+        effect_size=effect_arr,
+        u_statistics=np.zeros_like(effect_arr),  # Not used in t-test
+        pts=pts_arr,
+        pts_rest=pts_rest_arr,
+        order=order_arr,
+        groupby=perturbation_column,
+        method="t_test",
+        control_label=control_label,
+        tie_correct=False,
+        pvalue_correction="benjamini-hochberg",
+        result=None,
+    )
+    
+    # Add rank_genes_groups to uns for Scanpy compatibility
+    adata.uns["rank_genes_groups"] = result.to_rank_genes_groups_dict()
     adata.write(output_path)
-
-    result_view = AnnData(output_path)
-    for label, result in results.items():
-        result.result = result_view
-
-    return results
+    
+    result.result = AnnData(output_path)
+    return result
 
 
 def nb_glm_test(
@@ -406,14 +496,62 @@ def nb_glm_test(
 ) -> RankGenesGroupsResult:
     """Perform negative binomial GLM differential expression test.
     
+    Returns a RankGenesGroupsResult containing differential expression statistics
+    in Scanpy-compatible format. Uses a negative binomial GLM framework that can
+    incorporate covariates. Results are stored in an h5ad file with 
+    `uns['rank_genes_groups']` containing logfoldchanges, scores (Wald statistics),
+    p-values, adjusted p-values, and proportion of expressing cells.
+    
+    The RankGenesGroupsResult implements the Mapping interface, so it can be used 
+    like a dict: `result[perturbation_label]` returns a DifferentialExpressionResult
+    for that perturbation.
+    
     Parameters
     ----------
+    path
+        Path to an h5ad file containing raw count data.
+    perturbation_column
+        Column in `adata.obs` indicating perturbation labels.
+    control_label
+        Label for the control/reference group. If None, infers from common patterns.
+    covariates
+        Additional columns in `adata.obs` to include as covariates in the GLM.
+    gene_name_column
+        Column in `adata.var` with gene symbols. If None, uses `adata.var_names`.
+    perturbations
+        Specific perturbations to test. If None, tests all non-control groups.
+    dispersion
+        Fixed dispersion parameter for negative binomial. If None, estimates per gene.
+    max_iter
+        Maximum iterations for GLM fitting.
+    tol
+        Convergence tolerance for GLM fitting.
+    poisson_init_iter
+        Initial Poisson iterations before switching to negative binomial.
+    min_cells_expressed
+        Minimum total cells (control + perturbation) expressing a gene for testing.
+    min_total_count
+        Minimum total count across all cells for a gene to be tested.
+    chunk_size
+        Number of genes to process per chunk (memory vs. speed tradeoff).
+    corr_method
+        Method for p-value correction: "benjamini-hochberg" or "bonferroni".
+    output_dir
+        Directory for output h5ad file. Defaults to input file's directory.
+    data_name
+        Custom name for output file. If None, uses "nb_glm" suffix.
     n_jobs
         Number of parallel workers for fitting GLMs across perturbations.
         If None, uses all available cores. If 1, runs sequentially.
         If -1, uses all available cores.
+    
+    Returns
+    -------
+    RankGenesGroupsResult
+        Differential expression results in Scanpy-compatible format. Access results
+        via dict-like interface: `result[label].effect_size`, `result[label].pvalue`, etc.
+        The h5ad file path is available at `result.result_path`.
     """
-    """Differential expression using a negative binomial GLM with covariates."""
 
     covariates = list(covariates or [])
 

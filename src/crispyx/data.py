@@ -113,7 +113,7 @@ class _LazyUnsMapping(Mapping[str, _LazyUnsEntry]):
 
     def _keys(self) -> list[str]:
         try:
-            return list(self._parent.backed.uns_keys())
+            return list(self._parent.backed.uns.keys())
         except AttributeError:
             return []
 
@@ -243,13 +243,19 @@ def resolve_output_path(
     suffix: str,
     output_dir: str | Path | None = None,
     data_name: str | None = None,
+    module: str = "crispyx",
 ) -> Path:
     """Construct an informative output path for an intermediate ``.h5ad`` file."""
 
     input_path = Path(input_path)
     output_dir = Path(output_dir) if output_dir is not None else input_path.parent
-    data_name = data_name or input_path.stem
-    return output_dir / f"{data_name}_{suffix}.h5ad"
+    if data_name:
+        # If data_name already includes the full name (e.g., "qc_filtered"), use it directly
+        # Otherwise append suffix for backward compatibility
+        if module and not data_name.startswith(f"{module}_"):
+            return output_dir / f"{module}_{data_name}.h5ad"
+        return output_dir / f"{data_name}.h5ad"
+    return output_dir / f"{module}_{suffix}.h5ad"
 
 
 def ensure_gene_symbol_column(

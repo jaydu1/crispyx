@@ -7,6 +7,7 @@ import json
 import multiprocessing as mp
 import resource
 import sys
+import threading
 import time
 import traceback
 from collections import Counter
@@ -41,8 +42,8 @@ from crispyx.data import (
     calculate_adaptive_qc_thresholds,
     standardize_dataset,
 )
-from crispyx.de import wald_test, wilcoxon_test
-from crispyx.metrics import DE_METRIC_KEYS, compute_de_comparison_metrics
+from crispyx.de import t_test, wilcoxon_test, nb_glm_test
+from crispyx.comparison import DE_METRIC_KEYS, compute_de_comparison_metrics
 from crispyx.pseudobulk import (
     compute_average_log_expression,
     compute_pseudobulk_expression,
@@ -51,7 +52,7 @@ from crispyx.qc import quality_control_summary
 
 
 # ============================================================================
-# Scanpy validation utilities (migrated from src/crispyx/scanpy_validation.py)
+# Scanpy validation utilities
 # ============================================================================
 
 import importlib
@@ -96,7 +97,9 @@ class ComparisonResult:
     wald_metrics: Mapping[str, Optional[float]]
     wilcoxon_metrics: Mapping[str, Optional[float]]
     streamlined_peak_memory_mb: float
+    streamlined_avg_memory_mb: Optional[float]
     reference_peak_memory_mb: float
+    reference_avg_memory_mb: Optional[float]
     streamlined_timings: Mapping[str, float]
     reference_timings: Mapping[str, float]
     streamlined_effects: Mapping[str, pd.DataFrame]
@@ -215,6 +218,49 @@ def _get_peak_memory_mb() -> float:
 
 def _peak_memory_delta_mb(baseline_bytes: float) -> float:
     return max(0.0, (_get_peak_memory_bytes() - baseline_bytes) / (1024.0 * 1024.0))
+
+
+def _sample_memory_continuously(
+    stop_event: threading.Event,
+    memory_samples: list,
+    sample_interval: float = 0.1
+) -> None:
+    """Background thread function to sample memory usage continuously.
+    
+    Parameters
+    ----------
+    stop_event : threading.Event
+        Event to signal when to stop sampling
+    memory_samples : list
+        List to store memory samples (in MB)
+    sample_interval : float
+        Time interval between samples in seconds (default: 0.1)
+    """
+    while not stop_event.is_set():
+        memory_mb = _get_peak_memory_mb()
+        memory_samples.append(memory_mb)
+        time.sleep(sample_interval)
+
+
+def _track_memory_stats(baseline_bytes: float) -> tuple[float, float]:
+    """Start background memory tracking and return peak and average memory.
+    
+    Returns peak and average memory delta from baseline in MB.
+    This is a context manager approach - use with start/stop.
+    
+    Parameters
+    ----------
+    baseline_bytes : float
+        Baseline memory in bytes before execution
+        
+    Returns
+    -------
+    tuple[float, float]
+        (peak_memory_mb, avg_memory_mb) - both as delta from baseline
+    """
+    # This is a helper that will be used by reference methods
+    # Actual implementation is in the reference method functions
+    pass
 
 
 def _subprocess_worker(pipe, func, args, kwargs):  # type: ignore[override]
@@ -657,7 +703,7 @@ def _compute_reference_pipeline(
     if skip_de:
         reference_wald = {}
         reference_wilcoxon = {}
-        timings_reference["wald_test"] = 0.0
+        timings_reference["t_test"] = 0.0
         timings_reference["wilcoxon_test"] = 0.0
     else:
         t0 = time.perf_counter()
@@ -669,7 +715,7 @@ def _compute_reference_pipeline(
             perturbations=perturbations,
             min_cells_expressed=de_min_cells_expressed,
         )
-        timings_reference["wald_test"] = time.perf_counter() - t0
+        timings_reference["t_test"] = time.perf_counter() - t0
 
         t0 = time.perf_counter()
         reference_wilcoxon = _compute_reference_wilcoxon(
@@ -806,11 +852,11 @@ def compare_with_scanpy(
         # Skip DE tests - set empty results
         wald_results = {}
         wilcoxon_results = {}
-        timings_streamlined["wald_test"] = 0.0
+        timings_streamlined["t_test"] = 0.0
         timings_streamlined["wilcoxon_test"] = 0.0
     else:
         t0 = time.perf_counter()
-        wald_results = wald_test(
+        wald_results = t_test(
             qc_result.filtered_path,
             perturbation_column=perturbation_column,
             control_label=control_label,
@@ -821,7 +867,7 @@ def compare_with_scanpy(
             output_dir=output_dir,
             data_name="de",
         )
-        timings_streamlined["wald_test"] = time.perf_counter() - t0
+        timings_streamlined["t_test"] = time.perf_counter() - t0
 
         t0 = time.perf_counter()
         wilcoxon_results = wilcoxon_test(
@@ -913,7 +959,9 @@ def compare_with_scanpy(
         wald_metrics=wald_metrics,
         wilcoxon_metrics=wilcoxon_metrics,
         streamlined_peak_memory_mb=streamlined_peak_memory_mb,
+        streamlined_avg_memory_mb=None,  # Average memory not tracked for QC comparison
         reference_peak_memory_mb=reference_peak_memory_mb,
+        reference_avg_memory_mb=None,  # Average memory not tracked for QC comparison
         streamlined_timings=timings_streamlined,
         reference_timings=timings_reference,
         streamlined_effects={
@@ -939,7 +987,6 @@ class BenchmarkMethod:
     function: Callable[..., Any]
     kwargs: Dict[str, Any]
     summary: Callable[[Any, Dict[str, Any]], Dict[str, Any]]
-    category: str = "core"
 
 
 @dataclass
@@ -1083,6 +1130,12 @@ class DifferentialComparisonSummary:
     streaming_result_path: str | None
     reference_result_path: str | None
     error: Optional[str] = None
+    stream_runtime_seconds: Optional[float] = None
+    reference_runtime_seconds: Optional[float] = None
+    stream_peak_memory_mb: Optional[float] = None
+    stream_avg_memory_mb: Optional[float] = None
+    reference_peak_memory_mb: Optional[float] = None
+    reference_avg_memory_mb: Optional[float] = None
 
     @property
     def effect_max_abs_diff(self) -> Optional[float]:
@@ -1098,15 +1151,6 @@ class DifferentialComparisonSummary:
 
 
 _STANDARD_DE_COLUMNS = ["perturbation", "gene", "effect_size", "statistic", "pvalue"]
-
-_CATEGORY_ORDER = [
-    "Streaming pipeline",
-    "Differential expression",
-    "Reference: Scanpy",
-    "Reference: edgeR",
-    "Reference: Pertpy",
-]
-
 
 _STATUS_ORDER = ["success", "memory_limit", "timeout", "error", "unknown"]
 
@@ -1132,23 +1176,33 @@ def _get_expected_output_path(method_name: str, output_dir: Path, data_name: str
     preprocessing_dir = output_dir / "preprocessing"
     de_dir = output_dir / "de"
     
-    # Streaming QC and pseudobulk methods (in preprocessing/)
-    if method_name == "quality_control":
-        return preprocessing_dir / "qc_filtered.h5ad"
-    elif method_name == "average_log_expression":
-        return preprocessing_dir / "pb_avg_log_effects.h5ad"
-    elif method_name == "pseudobulk_expression":
-        return preprocessing_dir / "pb_pseudobulk_effects.h5ad"
+    # CRISPYx methods with module prefix
+    if method_name == "crispyx_qc_filtered":
+        return preprocessing_dir / "crispyx_qc_filtered.h5ad"
+    elif method_name == "crispyx_pb_avg_log":
+        return preprocessing_dir / "crispyx_pb_avg_log.h5ad"
+    elif method_name == "crispyx_pb_pseudobulk":
+        return preprocessing_dir / "crispyx_pb_pseudobulk.h5ad"
+    elif method_name == "crispyx_de_t_test":
+        return de_dir / "crispyx_de_t_test.h5ad"
+    elif method_name == "crispyx_de_wilcoxon":
+        return de_dir / "crispyx_de_wilcoxon.h5ad"
+    elif method_name == "crispyx_de_nb_glm":
+        return de_dir / "crispyx_de_nb_glm.h5ad"
     
-    # Streaming DE methods (in de/)
-    elif method_name == "wald_test":
-        return de_dir / "de_wald.h5ad"
-    elif method_name == "wilcoxon_test":
-        return de_dir / "de_wilcoxon.h5ad"
+    # Scanpy methods with module prefix
+    elif method_name == "scanpy_qc_filtered":
+        return preprocessing_dir / "scanpy_qc_filtered.h5ad"
+    elif method_name == "scanpy_de_t_test":
+        return de_dir / "scanpy_de_t_test.h5ad"
+    elif method_name == "scanpy_de_wilcoxon":
+        return de_dir / "scanpy_de_wilcoxon.h5ad"
     
-    # Reference comparison methods output results to their respective phase directories
-    # These methods save their results via their own logic, not via this function
-    # So we don't need to track their paths here
+    # Reference tool CSV outputs
+    elif method_name == "edger_de_glm":
+        return de_dir / "edger_de_glm.csv"
+    elif method_name == "pertpy_de_pydeseq2":
+        return de_dir / "pertpy_de_pydeseq2.csv"
     
     return None
 
@@ -1248,14 +1302,18 @@ def _load_cached_results(output_dir: Path) -> List[Dict[str, Any]]:
     
     cached_results = []
     for cache_file in cache_dir.glob("*.json"):
-        # Skip config.json and temp files
-        if cache_file.name in ("config.json", ".config.json.tmp") or cache_file.name.startswith("."):
+        # Skip config.json, temp files, and comparison cache files
+        if (cache_file.name in ("config.json", ".config.json.tmp") or 
+            cache_file.name.startswith(".") or
+            cache_file.name.endswith("_comparison.json")):
             continue
         
         try:
             with cache_file.open('r') as f:
                 result = json.load(f)
-                cached_results.append(result)
+                # Only add results that have a method field (exclude comparison metadata)
+                if "method" in result:
+                    cached_results.append(result)
         except (json.JSONDecodeError, OSError) as exc:
             print(f"Warning: Skipping corrupted cache file {cache_file.name}: {exc}")
             continue
@@ -1419,13 +1477,19 @@ def _format_timing_summary(timings: Mapping[str, float]) -> str | None:
 
 
 def _method_sort_key(method: BenchmarkMethod) -> tuple[int, str]:
-    """Return a stable sort key that groups methods by category."""
+    """Return a stable sort key that groups methods by task prefix."""
 
-    try:
-        category_index = _CATEGORY_ORDER.index(method.category)
-    except ValueError:
-        category_index = len(_CATEGORY_ORDER)
-    return (category_index, method.name)
+    # Extract task order from method name
+    name = method.name
+    if "_qc_" in name:
+        task_order = 0
+    elif "_pb_" in name:
+        task_order = 1
+    elif "_de_" in name:
+        task_order = 2
+    else:
+        task_order = 3
+    return (task_order, name)
 
 
 def _postprocess_results(df: pd.DataFrame) -> pd.DataFrame:
@@ -1457,10 +1521,10 @@ def _postprocess_results(df: pd.DataFrame) -> pd.DataFrame:
         "columns",
         "groups",
         "genes",
-        "stream_total_seconds",
-        "reference_total_seconds",
         "stream_peak_memory_mb",
+        "stream_avg_memory_mb",
         "reference_peak_memory_mb",
+        "reference_avg_memory_mb",
     ]
     numeric_columns.extend(
         key for key in DE_METRIC_KEYS if key not in numeric_columns
@@ -1469,23 +1533,19 @@ def _postprocess_results(df: pd.DataFrame) -> pd.DataFrame:
         if column in table.columns:
             table[column] = pd.to_numeric(table[column], errors="coerce")
 
-    if "category" in table.columns:
-        categories = table["category"].fillna("Uncategorised").astype(str)
-        extra_categories = sorted({c for c in categories.unique() if c not in _CATEGORY_ORDER})
-        dtype = pd.CategoricalDtype(categories=_CATEGORY_ORDER + extra_categories, ordered=True)
-        table["category"] = categories.astype(dtype)
-        table = table.sort_values(["category", "method"], kind="stable")
-        table["category"] = table["category"].astype(str)
-    else:
-        table = table.sort_values(["method"], kind="stable")
+    # Sort by method name
+    table = table.sort_values(["method"], kind="stable") if "method" in table.columns else table
 
+    # Logical column grouping for results CSV
     preferred_order = [
-        "category",
+        # 1. Method identification
         "method",
         "description",
         "status",
+        # 2. Performance metrics
         "runtime_seconds",
         "peak_memory_mb",
+        # 3. Data dimensions
         "cells_total",
         "cells_kept",
         "cells_kept_pct",
@@ -1498,32 +1558,43 @@ def _postprocess_results(df: pd.DataFrame) -> pd.DataFrame:
         "columns",
         "groups",
         "genes",
+        # 4. Comparison metadata
         "comparison_category",
         "test_type",
         "reference_tool",
-        "effect_max_abs_diff",
-        "statistic_max_abs_diff",
-        "pvalue_max_abs_diff",
+        # 5. Comparison metrics - Effect size
         "effect_pearson_corr",
         "effect_spearman_corr",
         "effect_top_k_overlap",
+        "effect_max_abs_diff",
+        # 6. Comparison metrics - Statistics
         "statistic_pearson_corr",
         "statistic_spearman_corr",
         "statistic_top_k_overlap",
+        "statistic_max_abs_diff",
+        # 7. Comparison metrics - P-values
         "pvalue_pearson_corr",
         "pvalue_spearman_corr",
         "pvalue_top_k_overlap",
+        "pvalue_max_abs_diff",
         "pvalue_stream_auroc",
         "pvalue_reference_auroc",
-        "stream_total_seconds",
-        "reference_total_seconds",
+        # 8. Detailed comparison data
         "stream_peak_memory_mb",
+        "stream_avg_memory_mb",
         "reference_peak_memory_mb",
+        "reference_avg_memory_mb",
         "stream_timing_breakdown",
         "reference_timing_breakdown",
+        "runtime_diff_seconds",
+        "runtime_diff_pct",
+        "memory_diff_mb",
+        "memory_diff_pct",
+        # 9. File paths
         "result_path",
         "streaming_result_path",
         "reference_result_path",
+        # 10. Errors
         "error",
     ]
     ordered_columns = [col for col in preferred_order if col in table.columns]
@@ -1589,42 +1660,8 @@ def _compute_aggregate_statistics(df: pd.DataFrame) -> Dict[str, Any]:
         if not runtimes.empty:
             summary["average_runtime_seconds"] = float(runtimes.mean())
 
-    category_summaries = []
-    if "category" in df.columns:
-        for category, group in df.groupby("category", sort=False):
-            group_status = group.get("status")
-            if group_status is not None:
-                group_status_counts = Counter(group_status.fillna("unknown").astype(str))
-            else:
-                group_status_counts = Counter()
-
-            ordered_group_counts: Dict[str, int] = {}
-            for status in _STATUS_ORDER:
-                count = int(group_status_counts.get(status, 0))
-                if count:
-                    ordered_group_counts[status] = count
-            for status, count in group_status_counts.items():
-                status = str(status)
-                if status not in ordered_group_counts:
-                    ordered_group_counts[status] = int(count)
-
-            group_runtime = group.get("runtime_seconds")
-            average_runtime = None
-            if group_runtime is not None:
-                group_runtimes = pd.to_numeric(group_runtime, errors="coerce").dropna()
-                if not group_runtimes.empty:
-                    average_runtime = float(group_runtimes.mean())
-
-            category_summaries.append(
-                {
-                    "category": str(category),
-                    "method_count": int(len(group)),
-                    "status_counts": ordered_group_counts,
-                    "average_runtime_seconds": average_runtime,
-                }
-            )
-
-    summary["categories"] = category_summaries
+    # Remove category-based summaries since categories no longer exist
+    summary["categories"] = []
 
     if "error" in df.columns:
         error_rows = df[df["error"].notna()]
@@ -1633,7 +1670,6 @@ def _compute_aggregate_statistics(df: pd.DataFrame) -> Dict[str, Any]:
             details.append(
                 {
                     "method": str(row.get("method", "")),
-                    "category": str(row.get("category", "")),
                     "error": str(row["error"]),
                 }
             )
@@ -1654,6 +1690,97 @@ def _compute_aggregate_statistics(df: pd.DataFrame) -> Dict[str, Any]:
         summary["other_errors"] = sorted(other_errors)
 
     return summary
+
+
+def _anndata_to_de_dict(adata: Any) -> Dict[str, Any]:
+    """Convert AnnData with DE results to a dictionary of result objects.
+    
+    Extracts differential expression results from CRISPYx AnnData format
+    where results are stored in layers with obs=perturbations.
+    """
+    from types import SimpleNamespace
+    
+    result_dict = {}
+    
+    # CRISPYx stores results in layers: logfoldchange, statistic, pvalue
+    # with obs representing perturbations
+    if "logfoldchange" in adata.layers and "pvalue" in adata.layers:
+        perturbations = adata.obs["perturbation"].tolist()
+        for idx, group in enumerate(perturbations):
+            result_dict[group] = SimpleNamespace(
+                genes=adata.var_names.to_numpy(),
+                effect_size=adata.layers["logfoldchange"][idx, :],
+                statistic=adata.layers.get("statistic", [None] * adata.n_vars)[idx, :] if "statistic" in adata.layers else None,
+                pvalue=adata.layers["pvalue"][idx, :],
+            )
+    
+    return result_dict
+
+
+def _anndata_to_de_dict(adata) -> Dict[str, Any]:
+    """Convert AnnData with DE results to dictionary format.
+    
+    Parameters
+    ----------
+    adata : AnnData
+        AnnData object containing DE results in layers (crispyx format)
+        
+    Returns
+    -------
+    Dict[str, Any]
+        Dictionary mapping perturbation names to SimpleNamespace objects with
+        genes, effect_size, statistic, and pvalue attributes
+    """
+    from types import SimpleNamespace
+    
+    stream_result_dict = {}
+    
+    # crispyx stores results in layers with obs=perturbations
+    # logfoldchange layer is optional (not present for t-test which stores effect in .X)
+    if "pvalue" in adata.layers and "perturbation" in adata.obs.columns:
+        perturbations = adata.obs["perturbation"].tolist()
+        for idx, group in enumerate(perturbations):
+            # Determine which statistic layer to use
+            if "z_score" in adata.layers:
+                statistic_values = adata.layers["z_score"][idx, :]
+            elif "statistic" in adata.layers:
+                statistic_values = adata.layers["statistic"][idx, :]
+            else:
+                statistic_values = None
+            
+            # Determine which effect size layer/matrix to use
+            if "logfoldchange" in adata.layers:
+                effect_size_values = adata.layers["logfoldchange"][idx, :]
+            elif adata.X is not None and adata.X.shape[0] > idx:
+                # t_test stores effect sizes in .X matrix
+                effect_size_values = adata.X[idx, :] if hasattr(adata.X, '__getitem__') else None
+            else:
+                effect_size_values = None
+            
+            stream_result_dict[group] = SimpleNamespace(
+                genes=adata.var_names.to_numpy(),
+                effect_size=effect_size_values,
+                statistic=statistic_values,
+                pvalue=adata.layers["pvalue"][idx, :],
+            )
+    # Fallback for Scanpy format
+    elif "rank_genes_groups" in adata.uns:
+        rgg = adata.uns["rank_genes_groups"]
+        # Get group names from structured array
+        if hasattr(rgg["names"], "dtype") and hasattr(rgg["names"].dtype, "names"):
+            groups = list(rgg["names"].dtype.names)
+        else:
+            groups = []
+        
+        for group in groups:
+            stream_result_dict[group] = SimpleNamespace(
+                genes=adata.uns.get("genes", adata.var_names.to_numpy()),
+                effect_size=rgg["logfoldchanges"][group] if "logfoldchanges" in rgg else None,
+                statistic=rgg["scores"][group] if "scores" in rgg else None,
+                pvalue=rgg["pvals"][group] if "pvals" in rgg else None,
+            )
+    
+    return stream_result_dict
 
 
 def _streaming_de_to_frame(result: Mapping[str, Any]) -> pd.DataFrame:
@@ -1700,8 +1827,8 @@ def _standardise_de_dataframe(df: Optional[pd.DataFrame]) -> pd.DataFrame:
     rename: Dict[str, str] = {}
     perturbation_col = _resolve_column(["perturbation", "group", "cluster", "label", "contrast"])
     gene_col = _resolve_column(["gene", "genes", "name", "names", "feature", "variable"])
-    effect_col = _resolve_column(["effect_size", "logfoldchange", "logfoldchanges", "lfc", "log_fc", "coefficient"])
-    stat_col = _resolve_column(["statistic", "statistics", "score", "scores", "wald_statistic", "zscore", "t_stat", "t_value", "t_statistic", "f", "f_value", "u_stat"])
+    effect_col = _resolve_column(["effect_size", "logfoldchange", "logfoldchanges", "logfc", "lfc", "log_fc", "coefficient"])
+    stat_col = _resolve_column(["statistic", "statistics", "stat", "score", "scores", "wald_statistic", "zscore", "t_stat", "t_value", "t_statistic", "f", "f_value", "u_stat"])
     pvalue_col = _resolve_column(["pvalue", "p_value", "pval", "pvals", "pvalue_raw", "pvalue_adj", "pvals_adj"])
 
     if perturbation_col is not None:
@@ -1826,40 +1953,100 @@ def _run_scanpy_de(
     min_cells_per_perturbation: int,
     method: str,
     output_dir: Path,
-) -> tuple[pd.DataFrame | None, Optional[Path], Optional[str]]:
-    """Execute Scanpy's differential expression workflow and return a DataFrame."""
+    baseline_memory_bytes: float | None = None,
+) -> tuple[pd.DataFrame | None, Optional[Path], Optional[str], Optional[float], Optional[float], Optional[float]]:
+    """Execute Scanpy's differential expression workflow and return a DataFrame.
+    
+    Parameters
+    ----------
+    baseline_memory_bytes : float | None
+        Baseline memory in bytes captured before any operations. If None, captures baseline now.
+    
+    Returns
+    -------
+    tuple
+        (dataframe, path, error, runtime_seconds, peak_memory_mb, avg_memory_mb)
+    """
+
+    # Start timing and memory tracking
+    if baseline_memory_bytes is None:
+        baseline_memory_bytes = _get_peak_memory_bytes()
+    start_time = time.perf_counter()
+    
+    # Start background memory sampling thread
+    stop_event = threading.Event()
+    memory_samples = []
+    memory_thread = threading.Thread(
+        target=_sample_memory_continuously,
+        args=(stop_event, memory_samples, 0.1),
+        daemon=True
+    )
+    memory_thread.start()
 
     try:
         import scanpy as sc
     except ImportError as exc:  # pragma: no cover - depends on optional dependency
-        return None, None, str(exc)
+        stop_event.set()
+        memory_thread.join(timeout=1.0)
+        return None, None, str(exc), None, None, None
 
-    adata = _prepare_reference_anndata(
-        dataset_path,
-        min_genes=min_genes,
-        min_cells_per_gene=min_cells_per_gene,
-        min_cells_per_perturbation=min_cells_per_perturbation,
-        perturbation_column=perturbation_column,
-        control_label=control_label,
-    )
+    try:
+        adata = _prepare_reference_anndata(
+            dataset_path,
+            min_genes=min_genes,
+            min_cells_per_gene=min_cells_per_gene,
+            min_cells_per_perturbation=min_cells_per_perturbation,
+            perturbation_column=perturbation_column,
+            control_label=control_label,
+        )
 
-    sc.pp.normalize_total(adata)
-    sc.pp.log1p(adata)
-    sc.tl.rank_genes_groups(
-        adata,
-        groupby=perturbation_column,
-        method=method,
-        reference=control_label,
-        n_genes=adata.n_vars,
-    )
-    df = sc.get.rank_genes_groups_df(adata, None)
+        sc.pp.normalize_total(adata)
+        sc.pp.log1p(adata)
+        sc.tl.rank_genes_groups(
+            adata,
+            groupby=perturbation_column,
+            method=method,
+            reference=control_label,
+            n_genes=adata.n_vars,
+        )
+        df = sc.get.rank_genes_groups_df(adata, None)
 
-    reference_path: Optional[Path] = None
-    if not df.empty:
-        # More descriptive name: comparison_reference_<tool>_<method>.csv
-        reference_path = output_dir / f"comparison_reference_scanpy_{method}.csv"
-        df.to_csv(reference_path, index=False)
-    return df, reference_path, None
+        reference_path: Optional[Path] = None
+        if not df.empty:
+            # Simplified name: scanpy_de_<method>.csv
+            reference_path = output_dir / f"scanpy_de_{method.replace('-', '_')}.csv"
+            df.to_csv(reference_path, index=False)
+    
+        # Stop memory sampling and calculate metrics
+        stop_event.set()
+        memory_thread.join(timeout=1.0)
+        
+        # Calculate timing and memory
+        runtime_seconds = time.perf_counter() - start_time
+        peak_memory_mb = _peak_memory_delta_mb(baseline_memory_bytes)
+        
+        # Calculate average memory from samples
+        avg_memory_mb = None
+        if memory_samples:
+            baseline_mb = baseline_memory_bytes / (1024.0 * 1024.0)
+            avg_memory_mb = max(0.0, np.mean(memory_samples) - baseline_mb)
+        
+        return df, reference_path, None, runtime_seconds, peak_memory_mb, avg_memory_mb
+        
+    except Exception as exc:
+        # Stop memory sampling
+        stop_event.set()
+        memory_thread.join(timeout=1.0)
+        
+        runtime_seconds = time.perf_counter() - start_time
+        peak_memory_mb = _peak_memory_delta_mb(baseline_memory_bytes)
+        
+        avg_memory_mb = None
+        if memory_samples:
+            baseline_mb = baseline_memory_bytes / (1024.0 * 1024.0)
+            avg_memory_mb = max(0.0, np.mean(memory_samples) - baseline_mb)
+        
+        return None, None, str(exc), runtime_seconds, peak_memory_mb, avg_memory_mb
 
 
 def _resolve_pertpy_runner(module: Any, method: str) -> Optional[Callable[..., Any]]:
@@ -1992,14 +2179,33 @@ def _run_edger_direct(
     min_cells_per_perturbation: int,
     output_dir: Path,
     n_jobs: int | None = None,
-) -> tuple[pd.DataFrame | None, Optional[Path], Optional[str]]:
+) -> tuple[pd.DataFrame | None, Optional[Path], Optional[str], Optional[float], Optional[float], Optional[float]]:
     """Execute edgeR directly via rpy2 without Pertpy wrapper.
     
     Parameters
     ----------
     n_jobs : int | None
         Number of threads for BLAS operations. If None, uses 1 thread.
+    
+    Returns
+    -------
+    tuple
+        (dataframe, path, error, runtime_seconds, peak_memory_mb, avg_memory_mb)
     """
+
+    # Start timing and memory tracking
+    baseline_memory = _get_peak_memory_bytes()
+    start_time = time.perf_counter()
+    
+    # Start background memory sampling thread
+    stop_event = threading.Event()
+    memory_samples = []
+    memory_thread = threading.Thread(
+        target=_sample_memory_continuously,
+        args=(stop_event, memory_samples, 0.1),
+        daemon=True
+    )
+    memory_thread.start()
 
     # Configure R environment before importing rpy2
     # Try to get R_HOME from global environment config, with fallback to hardcoded path
@@ -2021,7 +2227,9 @@ def _run_edger_direct(
         from rpy2.robjects import numpy2ri
         from rpy2.robjects.conversion import localconverter
     except ImportError as exc:
-        return None, None, str(exc)
+        stop_event.set()
+        memory_thread.join(timeout=1.0)
+        return None, None, str(exc), None, None, None
 
     try:
         adata = _prepare_reference_anndata(
@@ -2033,13 +2241,17 @@ def _run_edger_direct(
             control_label=control_label,
         )
     except ImportError as exc:
-        return None, None, str(exc)
+        stop_event.set()
+        memory_thread.join(timeout=1.0)
+        return None, None, str(exc), None, None, None
 
     groups = adata.obs[perturbation_column].astype(str).values
     unique_groups = [g for g in np.unique(groups) if g != control_label]
 
     if not unique_groups:
-        return None, None, "No perturbation groups available for comparison"
+        stop_event.set()
+        memory_thread.join(timeout=1.0)
+        return None, None, "No perturbation groups available for comparison", None, None, None
 
     try:
         # Set BLAS thread limit for R
@@ -2121,14 +2333,40 @@ def _run_edger_direct(
 
         reference_path: Optional[Path] = None
         if not final_results.empty:
-            # More descriptive name: comparison_reference_<tool>.csv
-            reference_path = output_dir / "comparison_reference_edger.csv"
+            # Save to de/ subdirectory with module prefix
+            reference_path = output_dir / "edger_de_glm.csv"
             final_results.to_csv(reference_path, index=False)
 
-        return final_results, reference_path, None
+        # Stop memory sampling and calculate metrics
+        stop_event.set()
+        memory_thread.join(timeout=1.0)
+        
+        # Calculate timing and memory
+        runtime_seconds = time.perf_counter() - start_time
+        peak_memory_mb = _peak_memory_delta_mb(baseline_memory)
+        
+        # Calculate average memory from samples
+        avg_memory_mb = None
+        if memory_samples:
+            baseline_mb = baseline_memory / (1024.0 * 1024.0)
+            avg_memory_mb = max(0.0, np.mean(memory_samples) - baseline_mb)
+
+        return final_results, reference_path, None, runtime_seconds, peak_memory_mb, avg_memory_mb
 
     except Exception as exc:
-        return None, None, str(exc)
+        # Stop memory sampling
+        stop_event.set()
+        memory_thread.join(timeout=1.0)
+        
+        runtime_seconds = time.perf_counter() - start_time
+        peak_memory_mb = _peak_memory_delta_mb(baseline_memory)
+        
+        avg_memory_mb = None
+        if memory_samples:
+            baseline_mb = baseline_memory / (1024.0 * 1024.0)
+            avg_memory_mb = max(0.0, np.mean(memory_samples) - baseline_mb)
+        
+        return None, None, str(exc), runtime_seconds, peak_memory_mb, avg_memory_mb
 
 
 def _run_pertpy_de(
@@ -2142,7 +2380,7 @@ def _run_pertpy_de(
     backend: str,
     output_dir: Path,
     n_jobs: int | None = None,
-) -> tuple[pd.DataFrame | None, Optional[Path], Optional[str]]:
+) -> tuple[pd.DataFrame | None, Optional[Path], Optional[str], Optional[float], Optional[float], Optional[float]]:
     """Execute a Pertpy-backed differential expression method.
     
     Parameters
@@ -2150,19 +2388,42 @@ def _run_pertpy_de(
     n_jobs : int | None
         Number of parallel jobs. Passed to Pertpy methods that support parallelization
         (e.g., statsmodels, pydeseq2).
+    
+    Returns
+    -------
+    tuple
+        (dataframe, path, error, runtime_seconds, peak_memory_mb, avg_memory_mb)
     """
+
+    # Start timing and memory tracking
+    baseline_memory = _get_peak_memory_bytes()
+    start_time = time.perf_counter()
+    
+    # Start background memory sampling thread
+    stop_event = threading.Event()
+    memory_samples = []
+    memory_thread = threading.Thread(
+        target=_sample_memory_continuously,
+        args=(stop_event, memory_samples, 0.1),
+        daemon=True
+    )
+    memory_thread.start()
 
     try:
         import pertpy as pt
         import scanpy as sc  # Needed for AnnData IO
     except ImportError as exc:  # pragma: no cover - optional dependency
-        return None, None, str(exc)
+        stop_event.set()
+        memory_thread.join(timeout=1.0)
+        return None, None, str(exc), None, None, None
 
     _ = sc  # Silence unused import warnings in environments without Scanpy
 
     module = getattr(pt, "tools", None)
     if module is None:
-        return None, None, "pertpy.tools module unavailable"
+        stop_event.set()
+        memory_thread.join(timeout=1.0)
+        return None, None, "pertpy.tools module unavailable", None, None, None
 
     candidate_modules: list[Any] = []
     de_module = getattr(module, "differential_expression", None)
@@ -2184,7 +2445,9 @@ def _run_pertpy_de(
             break
 
     if runner is None:
-        return None, None, f"Pertpy differential expression runner '{backend}' not found"
+        stop_event.set()
+        memory_thread.join(timeout=1.0)
+        return None, None, f"Pertpy differential expression runner '{backend}' not found", None, None, None
 
     try:
         adata = _prepare_reference_anndata(
@@ -2196,7 +2459,9 @@ def _run_pertpy_de(
             control_label=control_label,
         )
     except ImportError as exc:  # pragma: no cover - optional dependency
-        return None, None, str(exc)
+        stop_event.set()
+        memory_thread.join(timeout=1.0)
+        return None, None, str(exc), None, None, None
 
     # Prepare kwargs with optional parallelization support
     # Try multiple combinations to handle different Pertpy API versions
@@ -2228,21 +2493,50 @@ def _run_pertpy_de(
             last_type_error = exc
             continue
         except Exception as exc:  # pragma: no cover - defensive
-            return None, None, str(exc)
+            stop_event.set()
+            memory_thread.join(timeout=1.0)
+            return None, None, str(exc), None, None, None
         else:
             break
     else:
+        # Stop memory sampling
+        stop_event.set()
+        memory_thread.join(timeout=1.0)
+        
+        runtime_seconds = time.perf_counter() - start_time
+        peak_memory_mb = _peak_memory_delta_mb(baseline_memory)
+        
+        avg_memory_mb = None
+        if memory_samples:
+            baseline_mb = baseline_memory / (1024.0 * 1024.0)
+            avg_memory_mb = max(0.0, np.mean(memory_samples) - baseline_mb)
+        
         if last_type_error is not None:
-            return None, None, str(last_type_error)
-        return None, None, "Pertpy differential expression runner failed to execute"
+            return None, None, str(last_type_error), runtime_seconds, peak_memory_mb, avg_memory_mb
+        return None, None, "Pertpy differential expression runner failed to execute", runtime_seconds, peak_memory_mb, avg_memory_mb
 
     df = _convert_reference_result_to_dataframe(result)
     reference_path: Optional[Path] = None
     if df is not None and not df.empty:
-        # More descriptive name: comparison_reference_<tool>_<backend>.csv
-        reference_path = output_dir / f"comparison_reference_pertpy_{backend}.csv"
+        # Save to de/ subdirectory with module prefix
+        reference_path = output_dir / f"pertpy_de_{backend}.csv"
         df.to_csv(reference_path, index=False)
-    return df, reference_path, None
+    
+    # Stop memory sampling and calculate metrics
+    stop_event.set()
+    memory_thread.join(timeout=1.0)
+    
+    # Calculate timing and memory
+    runtime_seconds = time.perf_counter() - start_time
+    peak_memory_mb = _peak_memory_delta_mb(baseline_memory)
+    
+    # Calculate average memory from samples
+    avg_memory_mb = None
+    if memory_samples:
+        baseline_mb = baseline_memory / (1024.0 * 1024.0)
+        avg_memory_mb = max(0.0, np.mean(memory_samples) - baseline_mb)
+    
+    return df, reference_path, None, runtime_seconds, peak_memory_mb, avg_memory_mb
 
 
 def run_scanpy_qc_comparison(
@@ -2315,41 +2609,57 @@ def run_scanpy_de_comparison(
 ) -> DifferentialComparisonSummary:
     """Compare streaming differential expression against Scanpy.
     
-    This function runs DE tests independently since the QC comparison
-    now skips DE to save time.
+    This function loads cached streaming results and executes the reference method.
+    Standardized pipeline: all comparison functions load cached streaming results
+    instead of executing streaming methods inline.
     """
     # Use de directory for differential expression comparison outputs
     de_dir = output_dir / "de"
     de_dir.mkdir(parents=True, exist_ok=True)
 
+    # Determine streaming method name and reference method
     if test_type == "wilcoxon":
-        stream_result = wilcoxon_test(
-            path=dataset_path,
-            perturbation_column=perturbation_column,
-            control_label=control_label,
-            gene_name_column=gene_name_column,
-            output_dir=de_dir,
-            data_name="de",
-        )
+        streaming_method_name = "crispyx_de_wilcoxon"
         reference_method = "wilcoxon"
     else:
-        stream_result = wald_test(
-            path=dataset_path,
-            perturbation_column=perturbation_column,
-            control_label=control_label,
-            gene_name_column=gene_name_column,
-            output_dir=de_dir,
-            data_name="de",
-        )
+        streaming_method_name = "crispyx_de_t_test"
         reference_method = "t-test"
 
-    streaming_frame = _streaming_de_to_frame(stream_result)
-    streaming_path = None
-    if not streaming_frame.empty:
-        any_result = next(iter(stream_result.values()))
-        streaming_path = str(getattr(any_result, "result_path", "")) or None
+    # Load cached streaming results - explicit validation
+    cached_stream = _load_method_result(streaming_method_name, output_dir)
+    if not cached_stream or cached_stream.get("status") != "success":
+        raise RuntimeError(
+            f"Required cached method '{streaming_method_name}' not found or failed. "
+            f"Please run the streaming method first before running this comparison."
+        )
+    
+    # Extract streaming metrics from cache
+    stream_runtime = cached_stream.get("elapsed_seconds") or cached_stream.get("runtime_seconds")
+    stream_peak_memory = cached_stream.get("max_memory_mb") or cached_stream.get("peak_memory_mb")
+    stream_avg_memory = cached_stream.get("avg_memory_mb")
 
-    reference_df, reference_path, error = _run_scanpy_de(
+    # Load streaming results from file
+    streaming_path_obj = de_dir / f"{streaming_method_name}.h5ad"
+    if not streaming_path_obj.exists():
+        raise RuntimeError(
+            f"Streaming results file not found: {streaming_path_obj}. "
+            f"Please ensure '{streaming_method_name}' completed successfully."
+        )
+    
+    try:
+        import anndata as ad
+        stream_adata = ad.read_h5ad(str(streaming_path_obj))
+        stream_result = _anndata_to_de_dict(stream_adata)
+        streaming_frame = _streaming_de_to_frame(stream_result)
+        streaming_path = str(streaming_path_obj)
+    except Exception as exc:
+        raise RuntimeError(
+            f"Failed to load streaming results from {streaming_path_obj}: {exc}"
+        )
+
+    # Execute reference method with memory tracking
+    baseline_memory_bytes = _get_peak_memory_bytes()
+    reference_df, reference_path, error, ref_runtime, ref_peak_memory, ref_avg_memory = _run_scanpy_de(
         dataset_path,
         perturbation_column=perturbation_column,
         control_label=control_label,
@@ -2358,8 +2668,10 @@ def run_scanpy_de_comparison(
         min_cells_per_perturbation=min_cells_per_perturbation,
         method=reference_method,
         output_dir=de_dir,
+        baseline_memory_bytes=baseline_memory_bytes,
     )
 
+    # Compute comparison metrics
     metrics = {key: None for key in DE_METRIC_KEYS}
     if reference_df is not None:
         metrics = _compare_de_frames(streaming_frame, _standardise_de_dataframe(reference_df))
@@ -2371,6 +2683,12 @@ def run_scanpy_de_comparison(
         streaming_result_path=streaming_path,
         reference_result_path=str(reference_path) if reference_path else None,
         error=error,
+        stream_runtime_seconds=stream_runtime,
+        reference_runtime_seconds=ref_runtime,
+        stream_peak_memory_mb=stream_peak_memory,
+        stream_avg_memory_mb=stream_avg_memory,
+        reference_peak_memory_mb=ref_peak_memory,
+        reference_avg_memory_mb=ref_avg_memory,
     )
 
 
@@ -2388,6 +2706,9 @@ def run_edger_direct_comparison(
 ) -> DifferentialComparisonSummary:
     """Compare streaming GLM-based tests against edgeR (via direct rpy2).
     
+    Standardized pipeline: loads cached streaming results (prefers nb_glm, falls back to t_test)
+    and executes reference method. No inline streaming execution.
+    
     Parameters
     ----------
     n_jobs : int | None
@@ -2397,22 +2718,58 @@ def run_edger_direct_comparison(
     # Use de directory for differential expression comparison outputs
     de_dir = output_dir / "de"
     de_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Use comparisons directory for detailed comparison CSVs
+    comparisons_dir = output_dir / "comparisons"
+    comparisons_dir.mkdir(parents=True, exist_ok=True)
+    
+    cache_dir = output_dir / ".benchmark_cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
 
-    stream_result = wald_test(
-        path=dataset_path,
-        perturbation_column=perturbation_column,
-        control_label=control_label,
-        gene_name_column=gene_name_column,
-        output_dir=de_dir,
-        data_name="de",
-    )
-    streaming_frame = _streaming_de_to_frame(stream_result)
+    # Check for cached comparison
+    cache_file = cache_dir / "edger_comparison.json"
+    comparison_csv = comparisons_dir / "edger_glm.csv"
+    
+    # Try to load nb_glm results first (preferred), fall back to t_test
+    nb_glm_path = de_dir / "crispyx_de_nb_glm.h5ad"
+    t_test_path = de_dir / "crispyx_de_t_test.h5ad"
+    
     streaming_path = None
-    if not streaming_frame.empty:
-        any_result = next(iter(stream_result.values()))
-        streaming_path = str(getattr(any_result, "result_path", "")) or None
+    test_method = None
+    stream_result = None
+    
+    if nb_glm_path.exists():
+        try:
+            import anndata as ad
+            nb_glm_adata = ad.read_h5ad(str(nb_glm_path))
+            stream_result = _anndata_to_de_dict(nb_glm_adata)
+            streaming_path = str(nb_glm_path)
+            test_method = "nb_glm"
+        except Exception as exc:
+            # If nb_glm loading fails, try t_test
+            pass
+    
+    if stream_result is None and t_test_path.exists():
+        try:
+            import anndata as ad
+            t_test_adata = ad.read_h5ad(str(t_test_path))
+            stream_result = _anndata_to_de_dict(t_test_adata)
+            streaming_path = str(t_test_path)
+            test_method = "t_test"
+        except Exception as exc:
+            pass
+    
+    # Explicit validation - require cached streaming results
+    if stream_result is None:
+        raise RuntimeError(
+            f"Required cached streaming method not found. Expected either 'crispyx_de_nb_glm' "
+            f"or 'crispyx_de_t_test' results in {de_dir}/. Please run these methods first before "
+            f"running this comparison."
+        )
+    
+    streaming_frame = _streaming_de_to_frame(stream_result)
 
-    reference_df, reference_path, error = _run_edger_direct(
+    reference_df, reference_path, error, ref_runtime, ref_peak_memory, ref_avg_memory = _run_edger_direct(
         dataset_path,
         perturbation_column=perturbation_column,
         control_label=control_label,
@@ -2422,10 +2779,59 @@ def run_edger_direct_comparison(
         output_dir=de_dir,
         n_jobs=n_jobs,
     )
+    
+    # Get streaming method timing from cache
+    stream_runtime = None
+    stream_peak_memory = None
+    stream_avg_memory = None
+    streaming_method_name = f"crispyx_de_{test_method}"
+    cached_stream = _load_method_result(streaming_method_name, output_dir)
+    if cached_stream:
+        # Handle both old and new field names
+        stream_runtime = cached_stream.get("runtime_seconds") or cached_stream.get("elapsed_seconds")
+        stream_peak_memory = cached_stream.get("peak_memory_mb") or cached_stream.get("max_memory_mb")
+        stream_avg_memory = cached_stream.get("avg_memory_mb")
 
     metrics = {key: None for key in DE_METRIC_KEYS}
     if reference_df is not None:
-        metrics = _compare_de_frames(streaming_frame, _standardise_de_dataframe(reference_df))
+        ref_standardized = _standardise_de_dataframe(reference_df)
+        metrics = _compare_de_frames(streaming_frame, ref_standardized)
+        
+        # Write standardized comparison CSV
+        if not streaming_frame.empty and not ref_standardized.empty:
+            # Merge on perturbation and gene
+            merged = streaming_frame.merge(
+                ref_standardized,
+                on=["perturbation", "gene"],
+                how="inner",
+                suffixes=("_crispyx", "_edger")
+            )
+            # Create standardized CSV with required columns
+            comparison_df = pd.DataFrame({
+                "gene": merged["gene"],
+                "perturbation": merged["perturbation"],
+                "crispyx_effect": merged["effect_size_crispyx"],
+                "reference_effect": merged["effect_size_edger"],
+                "crispyx_pvalue": merged["pvalue_crispyx"],
+                "reference_pvalue": merged["pvalue_edger"],
+                "pearson_corr": metrics.get("effect_pearson_corr"),
+                "spearman_corr": metrics.get("effect_spearman_corr"),
+                "top_k_overlap": metrics.get("effect_top_k_overlap"),
+                "auroc": metrics.get("pvalue_stream_auroc"),
+            })
+            comparison_df.to_csv(comparison_csv, index=False)
+            
+            # Update cache
+            cache_data = {
+                "comparison_file": str(comparison_csv),
+                "timestamp": time.time(),
+                "nb_glm_file": str(nb_glm_path) if nb_glm_path.exists() else None,
+                "test_method": test_method,
+                "metrics": {k: float(v) if v is not None and not pd.isna(v) else None 
+                           for k, v in metrics.items()}
+            }
+            with cache_file.open('w') as f:
+                json.dump(cache_data, f, indent=2)
 
     return DifferentialComparisonSummary(
         test_type="glm",
@@ -2434,6 +2840,12 @@ def run_edger_direct_comparison(
         streaming_result_path=streaming_path,
         reference_result_path=str(reference_path) if reference_path else None,
         error=error,
+        stream_runtime_seconds=stream_runtime,
+        reference_runtime_seconds=ref_runtime,
+        stream_peak_memory_mb=stream_peak_memory,
+        stream_avg_memory_mb=stream_avg_memory,
+        reference_peak_memory_mb=ref_peak_memory,
+        reference_avg_memory_mb=ref_avg_memory,
     )
 
 
@@ -2452,31 +2864,74 @@ def run_pertpy_de_comparison(
 ) -> DifferentialComparisonSummary:
     """Compare streaming GLM-based tests against a Pertpy backend.
     
+    This function implements lazy-loading: if nb_glm_test results exist,
+    they will be used for comparison. Otherwise, falls back to t_test.
+    Results are cached as CSV files with standardized columns.
+    
     Parameters
     ----------
     n_jobs : int | None
         Number of parallel jobs for Pertpy methods that support parallelization.
     """
 
+    # Start timing for the reference comparison (includes data loading overhead)
+    reference_start_time = time.perf_counter()
+    
     # Use de directory for differential expression comparison outputs
     de_dir = output_dir / "de"
     de_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Use comparisons directory for detailed comparison CSVs
+    comparisons_dir = output_dir / "comparisons"
+    comparisons_dir.mkdir(parents=True, exist_ok=True)
+    
+    cache_dir = output_dir / ".benchmark_cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
 
-    stream_result = wald_test(
-        path=dataset_path,
-        perturbation_column=perturbation_column,
-        control_label=control_label,
-        gene_name_column=gene_name_column,
-        output_dir=de_dir,
-        data_name="de",
-    )
-    streaming_frame = _streaming_de_to_frame(stream_result)
+    # Check for cached comparison
+    cache_file = cache_dir / f"pertpy_{backend}_comparison.json"
+    comparison_csv = comparisons_dir / f"pertpy_{backend}.csv"
+    
+    # Try to load nb_glm results first (preferred), fall back to t_test
+    nb_glm_path = de_dir / "crispyx_de_nb_glm.h5ad"
+    t_test_path = de_dir / "crispyx_de_t_test.h5ad"
+    
     streaming_path = None
-    if not streaming_frame.empty:
-        any_result = next(iter(stream_result.values()))
-        streaming_path = str(getattr(any_result, "result_path", "")) or None
+    test_method = None
+    stream_result = None
+    
+    if nb_glm_path.exists():
+        try:
+            import anndata as ad
+            nb_glm_adata = ad.read_h5ad(str(nb_glm_path))
+            stream_result = _anndata_to_de_dict(nb_glm_adata)
+            streaming_path = str(nb_glm_path)
+            test_method = "nb_glm"
+        except Exception as exc:
+            # If nb_glm loading fails, try t_test
+            pass
+    
+    if stream_result is None and t_test_path.exists():
+        try:
+            import anndata as ad
+            t_test_adata = ad.read_h5ad(str(t_test_path))
+            stream_result = _anndata_to_de_dict(t_test_adata)
+            streaming_path = str(t_test_path)
+            test_method = "t_test"
+        except Exception as exc:
+            pass
+    
+    # Explicit validation - require cached streaming results
+    if stream_result is None:
+        raise RuntimeError(
+            f"Required cached streaming method not found. Expected either 'crispyx_de_nb_glm' "
+            f"or 'crispyx_de_t_test' results in {de_dir}/. Please run these methods first before "
+            f"running this comparison."
+        )
+    
+    streaming_frame = _streaming_de_to_frame(stream_result)
 
-    reference_df, reference_path, error = _run_pertpy_de(
+    reference_df, reference_path, error, ref_runtime, ref_peak_memory, ref_avg_memory = _run_pertpy_de(
         dataset_path,
         perturbation_column=perturbation_column,
         control_label=control_label,
@@ -2487,10 +2942,67 @@ def run_pertpy_de_comparison(
         output_dir=de_dir,
         n_jobs=n_jobs,
     )
+    
+    # Get streaming method timing from cache
+    stream_runtime = None
+    stream_peak_memory = None
+    stream_avg_memory = None
+    streaming_method_name = f"crispyx_de_{test_method}"
+    cached_stream = _load_method_result(streaming_method_name, output_dir)
+    if cached_stream:
+        # Handle both old and new field names
+        stream_runtime = cached_stream.get("runtime_seconds") or cached_stream.get("elapsed_seconds")
+        stream_peak_memory = cached_stream.get("peak_memory_mb") or cached_stream.get("max_memory_mb")
+        stream_avg_memory = cached_stream.get("avg_memory_mb")
 
     metrics = {key: None for key in DE_METRIC_KEYS}
     if reference_df is not None:
-        metrics = _compare_de_frames(streaming_frame, _standardise_de_dataframe(reference_df))
+        ref_standardized = _standardise_de_dataframe(reference_df)
+        metrics = _compare_de_frames(streaming_frame, ref_standardized)
+        
+        # Write standardized comparison CSV
+        if not streaming_frame.empty and not ref_standardized.empty:
+            # Merge on perturbation and gene
+            merged = streaming_frame.merge(
+                ref_standardized,
+                on=["perturbation", "gene"],
+                how="inner",
+                suffixes=("_crispyx", f"_{backend}")
+            )
+            # Create standardized CSV with required columns
+            comparison_df = pd.DataFrame({
+                "gene": merged["gene"],
+                "perturbation": merged["perturbation"],
+                "crispyx_effect": merged["effect_size_crispyx"],
+                "reference_effect": merged[f"effect_size_{backend}"],
+                "crispyx_pvalue": merged["pvalue_crispyx"],
+                "reference_pvalue": merged[f"pvalue_{backend}"],
+                "pearson_corr": metrics.get("effect_pearson_corr"),
+                "spearman_corr": metrics.get("effect_spearman_corr"),
+                "top_k_overlap": metrics.get("effect_top_k_overlap"),
+                "auroc": metrics.get("pvalue_stream_auroc"),
+            })
+            comparison_df.to_csv(comparison_csv, index=False)
+            
+            # Update cache
+            cache_data = {
+                "comparison_file": str(comparison_csv),
+                "timestamp": time.time(),
+                "nb_glm_file": str(nb_glm_path) if nb_glm_path.exists() else None,
+                "test_method": test_method,
+                "metrics": {k: float(v) if v is not None and not pd.isna(v) else None 
+                           for k, v in metrics.items()}
+            }
+            with cache_file.open('w') as f:
+                json.dump(cache_data, f, indent=2)
+
+    # Calculate total reference time including data loading overhead
+    # This captures the ~10 minutes spent loading nb_glm h5ad file
+    total_reference_time = time.perf_counter() - reference_start_time
+    
+    # Use the total time as reference runtime since it includes all overhead
+    # The ref_runtime from _run_pertpy_de only captures PyDESeq2 execution
+    actual_reference_runtime = total_reference_time if stream_runtime is not None else ref_runtime
 
     return DifferentialComparisonSummary(
         test_type="glm",
@@ -2499,7 +3011,35 @@ def run_pertpy_de_comparison(
         streaming_result_path=streaming_path,
         reference_result_path=str(reference_path) if reference_path else None,
         error=error,
+        stream_runtime_seconds=stream_runtime,
+        reference_runtime_seconds=actual_reference_runtime,
+        stream_peak_memory_mb=stream_peak_memory,
+        stream_avg_memory_mb=stream_avg_memory,
+        reference_peak_memory_mb=ref_peak_memory,
+        reference_avg_memory_mb=ref_avg_memory,
     )
+
+def _compute_performance_diff(stream_val: Optional[float], ref_val: Optional[float]) -> tuple[Optional[float], Optional[float]]:
+    """Compute absolute and percentage difference between stream and reference values.
+    
+    Returns
+    -------
+    tuple[Optional[float], Optional[float]]
+        (absolute_diff, percentage_diff) where percentage_diff is ((stream - ref) / ref) * 100
+        Negative percentage means stream is faster/uses less memory
+    """
+    if stream_val is None or ref_val is None:
+        return (None, None)
+    
+    abs_diff = stream_val - ref_val
+    
+    if ref_val == 0:
+        pct_diff = None
+    else:
+        pct_diff = (abs_diff / ref_val) * 100
+    
+    return (abs_diff, pct_diff)
+
 
 def _summarise_quality_control(result: Any, context: Dict[str, Any]) -> Dict[str, Any]:
     total_cells = int(context.get("dataset_cells", 0))
@@ -2586,6 +3126,13 @@ def _summarise_scanpy_comparison(result: ComparisonResult, context: Dict[str, An
 
     stream_total = sum(result.streamlined_timings.values()) if result.streamlined_timings else None
     reference_total = sum(result.reference_timings.values()) if result.reference_timings else None
+    
+    # Compute performance differences
+    runtime_diff, runtime_diff_pct = _compute_performance_diff(stream_total, reference_total)
+    memory_diff, memory_diff_pct = _compute_performance_diff(
+        result.streamlined_peak_memory_mb, result.reference_peak_memory_mb
+    )
+    
     summary = {
         "comparison_category": "quality_control_preprocessing",
         "reference_tool": "scanpy",
@@ -2598,9 +3145,13 @@ def _summarise_scanpy_comparison(result: ComparisonResult, context: Dict[str, An
         "streamlined_gene_count": result.streamlined_gene_count,
         "reference_gene_count": result.reference_gene_count,
         "stream_peak_memory_mb": result.streamlined_peak_memory_mb,
+        "stream_avg_memory_mb": result.streamlined_avg_memory_mb,
         "reference_peak_memory_mb": result.reference_peak_memory_mb,
-        "stream_total_seconds": stream_total,
-        "reference_total_seconds": reference_total,
+        "reference_avg_memory_mb": result.reference_avg_memory_mb,
+        "runtime_diff_seconds": runtime_diff,
+        "runtime_diff_pct": runtime_diff_pct,
+        "memory_diff_mb": memory_diff,
+        "memory_diff_pct": memory_diff_pct,
         "stream_timing_breakdown": _format_timing_summary(result.streamlined_timings),
         "reference_timing_breakdown": _format_timing_summary(result.reference_timings),
     }
@@ -2622,6 +3173,36 @@ def _summarise_de_comparison(
         "reference_result_path": _normalise_path(result.reference_result_path, context),
     }
     summary.update(result.metrics)
+    
+    # Add timing and memory data if available
+    if result.stream_runtime_seconds is not None:
+        summary["stream_runtime_seconds"] = result.stream_runtime_seconds
+    if result.reference_runtime_seconds is not None:
+        summary["reference_runtime_seconds"] = result.reference_runtime_seconds
+    if result.stream_peak_memory_mb is not None:
+        summary["stream_peak_memory_mb"] = result.stream_peak_memory_mb
+    if result.stream_avg_memory_mb is not None:
+        summary["stream_avg_memory_mb"] = result.stream_avg_memory_mb
+    if result.reference_peak_memory_mb is not None:
+        summary["reference_peak_memory_mb"] = result.reference_peak_memory_mb
+    if result.reference_avg_memory_mb is not None:
+        summary["reference_avg_memory_mb"] = result.reference_avg_memory_mb
+    
+    # Compute performance differences if both values available
+    runtime_diff, runtime_diff_pct = _compute_performance_diff(
+        result.stream_runtime_seconds, result.reference_runtime_seconds
+    )
+    memory_diff, memory_diff_pct = _compute_performance_diff(
+        result.stream_peak_memory_mb, result.reference_peak_memory_mb
+    )
+    
+    if runtime_diff is not None:
+        summary["runtime_diff_seconds"] = runtime_diff
+        summary["runtime_diff_pct"] = runtime_diff_pct
+    if memory_diff is not None:
+        summary["memory_diff_mb"] = memory_diff
+        summary["memory_diff_pct"] = memory_diff_pct
+    
     if result.error:
         summary["error"] = result.error
     return summary
@@ -2651,38 +3232,70 @@ def _worker(
     if time_limit and time_limit > 0:
         resource.setrlimit(resource.RLIMIT_CPU, (time_limit, time_limit))
 
+    # Start background memory sampling thread
+    stop_event = threading.Event()
+    memory_samples = []
+    memory_thread = threading.Thread(
+        target=_sample_memory_continuously,
+        args=(stop_event, memory_samples, 0.1),
+        daemon=True
+    )
+    memory_thread.start()
+    
     start = time.perf_counter()
     try:
         result = method.function(**method.kwargs)
         elapsed = time.perf_counter() - start
+        
+        # Stop memory sampling
+        stop_event.set()
+        memory_thread.join(timeout=1.0)
+        
         usage = resource.getrusage(resource.RUSAGE_SELF)
         max_rss_kb = usage.ru_maxrss
+        
+        # Calculate average memory from samples
+        avg_memory_mb = None
+        if memory_samples:
+            avg_memory_mb = np.mean(memory_samples)
+        
         summary = method.summary(result, context)
         queue.put(
             {
                 "status": "success",
                 "elapsed_seconds": elapsed,
                 "max_rss_kb": max_rss_kb,
+                "avg_memory_mb": avg_memory_mb,
                 "summary": summary,
             }
         )
     except MemoryError as exc:
+        # Stop memory sampling
+        stop_event.set()
+        memory_thread.join(timeout=1.0)
+        
         elapsed = time.perf_counter() - start
         queue.put(
             {
                 "status": "memory_limit",
                 "elapsed_seconds": elapsed,
                 "max_rss_kb": None,
+                "avg_memory_mb": None,
                 "error": f"MemoryError: {exc}",
             }
         )
     except Exception as exc:  # pragma: no cover - defensive reporting
+        # Stop memory sampling
+        stop_event.set()
+        memory_thread.join(timeout=1.0)
+        
         elapsed = time.perf_counter() - start
         queue.put(
             {
                 "status": "error",
                 "elapsed_seconds": elapsed,
                 "max_rss_kb": None,
+                "avg_memory_mb": None,
                 "error": f"{exc}",
                 "traceback": traceback.format_exc(),
             }
@@ -2705,25 +3318,57 @@ def _run_with_limits(
     if 'edger_direct' in method.name.lower():
         set_thread_env_vars(n_threads)
         
+        # Start background memory sampling thread
+        stop_event = threading.Event()
+        memory_samples = []
+        memory_thread = threading.Thread(
+            target=_sample_memory_continuously,
+            args=(stop_event, memory_samples, 0.1),
+            daemon=True
+        )
+        memory_thread.start()
+        
         start = time.perf_counter()
         try:
             result = method.function(**method.kwargs)
             elapsed = time.perf_counter() - start
+            
+            # Stop memory sampling
+            stop_event.set()
+            memory_thread.join(timeout=1.0)
+            
             usage = resource.getrusage(resource.RUSAGE_SELF)
             max_rss_kb = usage.ru_maxrss
+            
+            # Calculate average memory from samples
+            avg_memory_mb = None
+            if memory_samples:
+                avg_memory_mb = np.mean(memory_samples)
+            
             summary = method.summary(result, context)
             return {
                 "status": "success",
                 "elapsed_seconds": elapsed,
                 "max_memory_mb": max_rss_kb / 1024,
+                "avg_memory_mb": avg_memory_mb,
                 "summary": summary,
             }
         except Exception as exc:
+            # Stop memory sampling
+            stop_event.set()
+            memory_thread.join(timeout=1.0)
+            
             elapsed = time.perf_counter() - start
+            
+            avg_memory_mb = None
+            if memory_samples:
+                avg_memory_mb = np.mean(memory_samples)
+            
             return {
                 "status": "error",
                 "elapsed_seconds": elapsed,
                 "max_memory_mb": None,
+                "avg_memory_mb": avg_memory_mb,
                 "error": str(exc),
                 "traceback": traceback.format_exc(),
             }
@@ -2731,6 +3376,9 @@ def _run_with_limits(
     # Use spawn context for R/rpy2 compatibility (avoids fork() issues with R threading)
     needs_spawn = 'pertpy' in method.name.lower()
     mp_context = mp.get_context('spawn') if needs_spawn else mp
+    
+    # Track wall-clock time at parent process level for accuracy
+    parent_start_time = time.perf_counter()
     
     queue = mp_context.Queue()
     process = mp_context.Process(
@@ -2743,13 +3391,18 @@ def _run_with_limits(
     if time_limit and time_limit > 0:
         join_timeout = time_limit + 5
     process.join(timeout=join_timeout)
+    
+    # Calculate actual wall-clock elapsed time from parent process
+    parent_elapsed_time = time.perf_counter() - parent_start_time
+    
     if process.is_alive():
         process.terminate()
         process.join()
         return {
             "status": "timeout",
-            "elapsed_seconds": None,
+            "elapsed_seconds": parent_elapsed_time,
             "max_memory_mb": None,
+            "avg_memory_mb": None,
             "summary": {},
             "error": f"Exceeded time limit of {time_limit} seconds",
         }
@@ -2759,8 +3412,9 @@ def _run_with_limits(
     else:
         payload = {
             "status": "error",
-            "elapsed_seconds": None,
+            "elapsed_seconds": parent_elapsed_time,
             "max_rss_kb": None,
+            "avg_memory_mb": None,
             "error": f"Process exited with code {process.exitcode}",
         }
 
@@ -2770,6 +3424,14 @@ def _run_with_limits(
         payload["max_memory_mb"] = max_rss_kb / 1024
     else:
         payload.setdefault("max_memory_mb", None)
+    
+    # Ensure avg_memory_mb is present (may be None)
+    payload.setdefault("avg_memory_mb", None)
+    
+    # Override elapsed_seconds with parent process timing for accuracy
+    # (subprocess timing can be incorrect for methods that spawn external processes)
+    payload["elapsed_seconds"] = parent_elapsed_time
+    
     return payload
 
 
@@ -2860,8 +3522,8 @@ def create_benchmark_suite(
     de_dir.mkdir(parents=True, exist_ok=True)
 
     methods = {
-        "quality_control": BenchmarkMethod(
-            name="quality_control",
+        "crispyx_qc_filtered": BenchmarkMethod(
+            name="crispyx_qc_filtered",
             description="Streaming quality control filters",
             function=quality_control_summary,
             kwargs={
@@ -2872,68 +3534,76 @@ def create_benchmark_suite(
                 "chunk_size": chunk_size,
                 **shared_kwargs,
                 "output_dir": preprocessing_dir,
-                "data_name": "qc",
+                "data_name": "qc_filtered",
             },
             summary=_summarise_quality_control,
-            category="Streaming pipeline",
         ),
-        "average_log_expression": BenchmarkMethod(
-            name="average_log_expression",
+        "crispyx_pb_avg_log": BenchmarkMethod(
+            name="crispyx_pb_avg_log",
             description="Average log-normalised expression per perturbation",
             function=compute_average_log_expression,
             kwargs={
                 "path": dataset_path,
                 **shared_kwargs,
                 "output_dir": preprocessing_dir,
-                "data_name": "pb",
+                "data_name": "pb_avg_log",
             },
             summary=_summarise_dataframe,
-            category="Streaming pipeline",
         ),
-        "pseudobulk_expression": BenchmarkMethod(
-            name="pseudobulk_expression",
+        "crispyx_pb_pseudobulk": BenchmarkMethod(
+            name="crispyx_pb_pseudobulk",
             description="Pseudo-bulk log fold-change per perturbation",
             function=compute_pseudobulk_expression,
             kwargs={
                 "path": dataset_path,
                 **shared_kwargs,
                 "output_dir": preprocessing_dir,
-                "data_name": "pb",
+                "data_name": "pb_pseudobulk",
             },
             summary=_summarise_dataframe,
-            category="Streaming pipeline",
         ),
-        "wald_test": BenchmarkMethod(
-            name="wald_test",
-            description="Wald differential expression test",
-            function=wald_test,
+        "crispyx_de_t_test": BenchmarkMethod(
+            name="crispyx_de_t_test",
+            description="t-test differential expression test",
+            function=t_test,
             kwargs={
                 "path": dataset_path,
                 **shared_kwargs,
                 "output_dir": de_dir,
-                "data_name": "de",
+                "data_name": "de_t_test",
                 "n_jobs": n_cores,
             },
             summary=_summarise_de_mapping,
-            category="Differential expression",
         ),
-        "wilcoxon_test": BenchmarkMethod(
-            name="wilcoxon_test",
+        "crispyx_de_wilcoxon": BenchmarkMethod(
+            name="crispyx_de_wilcoxon",
             description="Wilcoxon rank-sum differential expression",
             function=wilcoxon_test,
             kwargs={
                 "path": dataset_path,
                 **shared_kwargs,
                 "output_dir": de_dir,
-                "data_name": "de",
+                "data_name": "de_wilcoxon",
                 "n_jobs": n_cores,
             },
             summary=_summarise_de_mapping,
-            category="Differential expression",
         ),
-        "scanpy_quality_control_comparison": BenchmarkMethod(
-            name="scanpy_quality_control_comparison",
-            description="Quality control comparison against Scanpy",
+        "crispyx_de_nb_glm": BenchmarkMethod(
+            name="crispyx_de_nb_glm",
+            description="Negative binomial GLM differential expression",
+            function=nb_glm_test,
+            kwargs={
+                "path": dataset_path,
+                **shared_kwargs,
+                "output_dir": de_dir,
+                "data_name": "de_nb_glm",
+                "n_jobs": n_cores,
+            },
+            summary=_summarise_de_mapping,
+        ),
+        "scanpy_qc_filtered": BenchmarkMethod(
+            name="scanpy_qc_filtered",
+            description="Quality control using Scanpy",
             function=run_scanpy_qc_comparison,
             kwargs={
                 "dataset_path": dataset_path,
@@ -2946,11 +3616,10 @@ def create_benchmark_suite(
                 "output_dir": output_dir,
             },
             summary=_summarise_scanpy_comparison,
-            category="Reference: Scanpy",
         ),
-        "scanpy_wald_comparison": BenchmarkMethod(
-            name="scanpy_wald_comparison",
-            description="Wald/t-test comparison against Scanpy",
+        "scanpy_de_t_test": BenchmarkMethod(
+            name="scanpy_de_t_test",
+            description="Differential expression using Scanpy (t-test)",
             function=run_scanpy_de_comparison,
             kwargs={
                 "dataset_path": dataset_path,
@@ -2961,14 +3630,13 @@ def create_benchmark_suite(
                 "min_cells_per_perturbation": min_cells_per_perturbation,
                 "min_cells_per_gene": min_cells_per_gene,
                 "output_dir": output_dir,
-                "test_type": "wald",
+                "test_type": "t-test",
             },
             summary=_summarise_de_comparison,
-            category="Reference: Scanpy",
         ),
-        "scanpy_wilcoxon_comparison": BenchmarkMethod(
-            name="scanpy_wilcoxon_comparison",
-            description="Wilcoxon comparison against Scanpy",
+        "scanpy_de_wilcoxon": BenchmarkMethod(
+            name="scanpy_de_wilcoxon",
+            description="Differential expression using Scanpy (Wilcoxon)",
             function=run_scanpy_de_comparison,
             kwargs={
                 "dataset_path": dataset_path,
@@ -2982,11 +3650,10 @@ def create_benchmark_suite(
                 "test_type": "wilcoxon",
             },
             summary=_summarise_de_comparison,
-            category="Reference: Scanpy",
         ),
-        "edger_direct_comparison": BenchmarkMethod(
-            name="edger_direct_comparison",
-            description="GLM comparison against edgeR (direct rpy2)",
+        "edger_de_glm": BenchmarkMethod(
+            name="edger_de_glm",
+            description="Differential expression using edgeR (GLM)",
             function=run_edger_direct_comparison,
             kwargs={
                 "dataset_path": dataset_path,
@@ -3000,11 +3667,10 @@ def create_benchmark_suite(
                 "n_jobs": n_cores,
             },
             summary=_summarise_de_comparison,
-            category="Reference: edgeR",
         ),
-        "pertpy_pydeseq2_comparison": BenchmarkMethod(
-            name="pertpy_pydeseq2_comparison",
-            description="GLM comparison against PyDESeq2 via Pertpy",
+        "pertpy_de_pydeseq2": BenchmarkMethod(
+            name="pertpy_de_pydeseq2",
+            description="Differential expression using PyDESeq2 via Pertpy (GLM)",
             function=run_pertpy_de_comparison,
             kwargs={
                 "dataset_path": dataset_path,
@@ -3019,7 +3685,6 @@ def create_benchmark_suite(
                 "n_jobs": n_cores,
             },
             summary=_summarise_de_comparison,
-            category="Reference: Pertpy",
         ),
         # Note: pertpy_statsmodels_comparison is excluded because statsmodels via Pertpy
         # does not support parallelization and is extremely slow on large datasets.
@@ -3143,24 +3808,7 @@ def _format_summary_markdown(summary: Dict[str, Any]) -> str:
     if average_runtime is not None:
         lines.append(f"- **Average runtime:** {average_runtime:.3f}s")
 
-    categories = summary.get("categories", [])
-    if categories:
-        lines.append("- **Average runtime by category:**")
-        for category_summary in categories:
-            category_name = category_summary.get("category", "Uncategorised")
-            method_count = category_summary.get("method_count", 0)
-            category_runtime = category_summary.get("average_runtime_seconds")
-            status_counts = category_summary.get("status_counts", {})
-            runtime_fragment = (
-                f"{category_runtime:.3f}s"
-                if category_runtime is not None
-                else "no runtime recorded"
-            )
-            status_fragments = [f"{status}={count}" for status, count in status_counts.items()]
-            status_clause = f" ({', '.join(status_fragments)})" if status_fragments else ""
-            lines.append(
-                f"  - {category_name}: {runtime_fragment} across {method_count} method(s){status_clause}"
-            )
+    # Remove category-based runtime summary since categories no longer exist
 
     dependency_errors = summary.get("dependency_errors", [])
     other_errors = summary.get("other_errors", [])
@@ -3206,10 +3854,41 @@ def _frame_to_markdown_table(table: pd.DataFrame) -> str:
     return "\n".join([header_row, separator_row, *data_rows]) + "\n"
 
 
+def _extract_task_and_test_type(method_name: str) -> tuple[str, str]:
+    """Extract task type and test type from method name.
+    
+    Returns
+    -------
+    tuple[str, str]
+        (task, test_type) where task is 'preprocessing' or 'differential_expression'
+        and test_type is like 'qc', 't_test', 'wilcoxon', 'nb_glm'
+    """
+    # Handle NaN or non-string values
+    if not isinstance(method_name, str):
+        return ("other", "unknown")
+    
+    if "_qc_" in method_name or method_name.endswith("_qc_filtered"):
+        return ("preprocessing", "qc")
+    elif "_pb_avg" in method_name:
+        return ("preprocessing", "pb_avg")
+    elif "_pb_pseudobulk" in method_name:
+        return ("preprocessing", "pb_pseudobulk")
+    elif "_de_t_test" in method_name:
+        return ("differential_expression", "t_test")
+    elif "_de_wilcoxon" in method_name:
+        return ("differential_expression", "wilcoxon")
+    elif "_de_nb_glm" in method_name or "_de_glm" in method_name:
+        return ("differential_expression", "nb_glm")
+    elif "_de_pydeseq2" in method_name:
+        return ("differential_expression", "pydeseq2")
+    else:
+        return ("other", "unknown")
+
+
 def _dataframe_to_markdown(
     df: pd.DataFrame, summary: Optional[Dict[str, Any]] = None
 ) -> str:
-    """Render ``df`` as grouped Markdown tables, one section per category."""
+    """Render benchmark results as task-based Markdown tables with comparisons."""
 
     computed_summary = summary or _compute_aggregate_statistics(df)
     narrative = _format_summary_markdown(computed_summary)
@@ -3217,19 +3896,115 @@ def _dataframe_to_markdown(
     if df.empty:
         return narrative + "\n| |\n|---|\n"
 
-    if "category" not in df.columns:
-        tables = _frame_to_markdown_table(df)
-        return narrative + "\n" + tables
-
     sections: list[str] = []
-    for category, group in df.groupby("category", sort=False):
-        reduced = group.drop(columns=["category"]).copy()
-        drop_cols = [col for col in reduced.columns if reduced[col].isna().all()]
-        if drop_cols:
-            reduced = reduced.drop(columns=drop_cols)
-        sections.append(f"### {category}\n\n" + _frame_to_markdown_table(reduced))
+    
+    # Separate crispyx methods from reference methods
+    crispyx_methods = df[df["method"].str.startswith("crispyx_", na=False)].copy()
+    reference_methods = df[~df["method"].str.startswith("crispyx_", na=False)].copy()
+    
+    # Group by task (preprocessing vs differential_expression)
+    for task in ["preprocessing", "differential_expression"]:
+        task_crispyx = crispyx_methods[
+            crispyx_methods["method"].apply(lambda x: _extract_task_and_test_type(x)[0] == task)
+        ].copy()
+        task_reference = reference_methods[
+            reference_methods["method"].apply(lambda x: _extract_task_and_test_type(x)[0] == task)
+        ].copy()
+        
+        if task_crispyx.empty and task_reference.empty:
+            continue
+        
+        # Create task header
+        task_title = "Preprocessing" if task == "preprocessing" else "Differential Expression"
+        sections.append(f"## {task_title}\n")
+        
+        # Table 1: crispyx basic info
+        if not task_crispyx.empty:
+            sections.append("### crispyx Methods\n")
+            
+            # Select relevant columns for crispyx table
+            crispyx_cols = ["method", "description", "status", "runtime_seconds", "peak_memory_mb"]
+            if task == "preprocessing":
+                crispyx_cols.extend(["cells_kept", "genes_kept", "result_path"])
+            else:  # differential_expression
+                crispyx_cols.extend(["groups", "genes", "result_path"])
+            
+            # Keep only columns that exist
+            crispyx_table_cols = [col for col in crispyx_cols if col in task_crispyx.columns]
+            crispyx_table = task_crispyx[crispyx_table_cols].copy()
+            
+            # Sort by test type
+            crispyx_table["_sort_key"] = crispyx_table["method"].apply(
+                lambda x: _extract_task_and_test_type(x)[1]
+            )
+            crispyx_table = crispyx_table.sort_values("_sort_key").drop(columns=["_sort_key"])
+            
+            # Drop all-NA columns
+            crispyx_table = crispyx_table.dropna(axis=1, how="all")
+            
+            sections.append(_frame_to_markdown_table(crispyx_table) + "\n")
+        
+        # Table 2: Reference comparisons
+        if not task_reference.empty:
+            sections.append("### Reference Comparisons\n")
+            
+            # Select relevant columns for comparison table
+            comparison_cols = [
+                "method", "reference_tool", "test_type", "status",
+                "runtime_seconds", "peak_memory_mb"
+            ]
+            
+            # Add comparison-specific metrics
+            if task == "preprocessing":
+                # Add performance difference columns for preprocessing
+                perf_diff_cols = [
+                    "runtime_diff_seconds", "runtime_diff_pct",
+                    "memory_diff_mb", "memory_diff_pct"
+                ]
+                comparison_cols.extend([col for col in perf_diff_cols if col in task_reference.columns])
+                
+                comparison_specific = [
+                    "normalization_max_abs_diff", "log1p_max_abs_diff",
+                    "avg_log_effect_max_abs_diff", "pseudobulk_effect_max_abs_diff"
+                ]
+            else:  # differential_expression
+                # For DE comparisons, add performance difference columns and correlation metrics
+                perf_diff_cols = [
+                    "runtime_diff_seconds", "runtime_diff_pct",
+                    "stream_peak_memory_mb", "stream_avg_memory_mb",
+                    "reference_peak_memory_mb", "reference_avg_memory_mb",
+                    "memory_diff_mb", "memory_diff_pct"
+                ]
+                comparison_cols.extend([col for col in perf_diff_cols if col in task_reference.columns])
+                
+                comparison_specific = [
+                    "effect_pearson_corr", "effect_spearman_corr", "effect_top_k_overlap",
+                    "statistic_pearson_corr", "statistic_spearman_corr", "statistic_top_k_overlap",
+                    "pvalue_pearson_corr", "pvalue_spearman_corr", "pvalue_top_k_overlap"
+                ]
+            comparison_cols.extend([col for col in comparison_specific if col in task_reference.columns])
+            
+            # Add result paths
+            comparison_cols.extend(["streaming_result_path", "reference_result_path"])
+            
+            # Keep only columns that exist
+            comparison_table_cols = [col for col in comparison_cols if col in task_reference.columns]
+            comparison_table = task_reference[comparison_table_cols].copy()
+            
+            # Sort by test type then by method
+            comparison_table["_sort_key"] = comparison_table["method"].apply(
+                lambda x: (_extract_task_and_test_type(x)[1], x)
+            )
+            comparison_table = comparison_table.sort_values("_sort_key").drop(columns=["_sort_key"])
+            
+            # Drop all-NA columns
+            comparison_table = comparison_table.dropna(axis=1, how="all")
+            
+            sections.append(_frame_to_markdown_table(comparison_table) + "\n")
+    
     tables = "\n".join(sections)
     return narrative + "\n" + tables
+
 
 
 def _run_single_benchmark(
@@ -3404,7 +4179,6 @@ def _run_single_benchmark(
                 
                 existing_path = _get_expected_output_path(method.name, config.output_dir)
                 row = {
-                    "category": method.category,
                     "method": method.name,
                     "description": method.description,
                     "status": "skipped_existing",
@@ -3445,18 +4219,19 @@ def _run_single_benchmark(
             )
         
         row = {
-            "category": method.category,
             "method": method.name,
             "description": method.description,
             "status": result.get("status"),
             "elapsed_seconds": result.get("elapsed_seconds"),
             "max_memory_mb": result.get("max_memory_mb"),
+            "avg_memory_mb": result.get("avg_memory_mb"),
         }
         summary = result.get("summary", {})
         if summary:
             row.update(summary)
         if result.get("error"):
             row["error"] = result["error"]
+        
         rows.append(row)
         
         # Save result to cache immediately after completion

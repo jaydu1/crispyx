@@ -165,32 +165,59 @@ python inspect_datasets.py
 
 ## Output Structure
 
+All CRISPYx outputs now use the `crispyx_` prefix to clearly distinguish them from reference tool outputs.
+
 ```
 benchmarking/results/
 ├── DatasetName/
 │   ├── .cache/
 │   │   └── standardized_DatasetName.h5ad  # Cached standardized dataset
+│   ├── .benchmark_cache/                  # Cached benchmark results (JSON metadata)
+│   │   ├── crispyx_qc_filtered.json       # QC benchmark cache
+│   │   ├── crispyx_pb_avg_log.json        # Avg log expression cache
+│   │   ├── crispyx_pb_pseudobulk.json     # Pseudobulk cache
+│   │   ├── crispyx_de_t_test.json         # t-test cache
+│   │   ├── crispyx_de_wilcoxon.json       # Wilcoxon cache
+│   │   ├── crispyx_de_nb_glm.json         # NB-GLM cache
+│   │   ├── scanpy_qc_filtered.json        # Scanpy QC comparison cache
+│   │   ├── scanpy_de_t_test.json          # Scanpy t-test comparison cache
+│   │   ├── scanpy_de_wilcoxon.json        # Scanpy Wilcoxon comparison cache
+│   │   ├── edger_de_glm.json              # edgeR comparison cache
+│   │   └── pertpy_de_pydeseq2.json        # PyDESeq2 comparison cache
 │   ├── preprocessing/
-│   │   ├── qc_filtered.h5ad               # Quality control output
-│   │   ├── pb_avg_log_effects.h5ad        # Average log expression
-│   │   └── pb_pseudobulk_effects.h5ad     # Pseudobulk expression
+│   │   ├── crispyx_qc_filtered.h5ad       # Quality control filtered data
+│   │   ├── crispyx_pb_avg_log.h5ad        # Average log expression pseudobulk
+│   │   └── crispyx_pb_pseudobulk.h5ad     # Sum-based pseudobulk expression
 │   ├── de/
-│   │   ├── de_wald.h5ad                   # Wald test DE results
-│   │   └── de_wilcoxon.h5ad               # Wilcoxon test DE results
-│   ├── scanpy/                            # Scanpy comparison outputs
-│   │   ├── qc_comparison.json
-│   │   ├── wald_comparison.csv
-│   │   └── wilcoxon_comparison.csv
-│   ├── edger/                             # edgeR comparison outputs
-│   │   └── direct_comparison.csv
-│   ├── pertpy/                            # Pertpy comparison outputs
-│   │   └── pydeseq2_comparison.csv
+│   │   ├── crispyx_de_t_test.h5ad         # CRISPYx t-test results
+│   │   ├── crispyx_de_wilcoxon.h5ad       # CRISPYx Wilcoxon test results
+│   │   ├── crispyx_de_nb_glm.h5ad         # CRISPYx negative binomial GLM results
+│   │   ├── scanpy_de_t_test.csv           # Scanpy t-test results
+│   │   ├── scanpy_de_wilcoxon.csv         # Scanpy Wilcoxon test results
+│   │   ├── edger_de_glm.csv               # edgeR GLM results
+│   │   └── pertpy_de_pydeseq2.csv         # PyDESeq2 results via Pertpy
+│   ├── comparisons/                       # Detailed comparison data (optional)
+│   │   ├── edger_glm.csv                  # CRISPYx vs edgeR detailed comparison
+│   │   └── pertpy_pydeseq2.csv            # CRISPYx vs PyDESeq2 detailed comparison
 │   ├── results.csv                        # Benchmark summary table
 │   ├── results.md                         # Markdown report
 │   └── summary.json                       # Metadata with adaptive QC params
 └── logs/
     └── {timestamp}_*.log
 ```
+
+### File Naming Convention
+
+**CRISPYx outputs**: `crispyx_{operation}_{method}.h5ad`
+- Examples: `crispyx_qc_filtered.h5ad`, `crispyx_de_t_test.h5ad`, `crispyx_pb_avg_log.h5ad`
+
+**Reference tool outputs**: `{tool}_de_{method}.csv`
+- Examples: `scanpy_de_t_test.csv`, `edger_de_glm.csv`, `pertpy_de_pydeseq2.csv`
+
+**Comparison files**: `{tool}_{method}.csv` (in `comparisons/` directory)
+- Examples: `comparisons/edger_glm.csv`, `comparisons/pertpy_pydeseq2.csv`
+
+This naming convention makes it easy to identify the source and type of each file at a glance.
 
 ### Summary Metadata
 `summary.json` includes adaptive decisions:
@@ -211,21 +238,38 @@ benchmarking/results/
 
 ## Benchmark Methods
 
-**CRISPYx Streaming Pipeline** (5 methods):
-1. `quality_control` - Streaming quality control filters
-2. `average_log_expression` - Average log-normalized expression per perturbation
-3. `pseudobulk_expression` - Pseudo-bulk log fold-change per perturbation
-4. `wald_test` - Wald differential expression test (parallelized)
-5. `wilcoxon_test` - Wilcoxon rank-sum differential expression (parallelized)
+**CRISPYx Streaming Pipeline** (6 methods):
+1. `crispyx_qc_filtered` - Streaming quality control filters
+2. `crispyx_pb_avg_log` - Average log-normalized expression per perturbation
+3. `crispyx_pb_pseudobulk` - Pseudo-bulk log fold-change per perturbation
+4. `crispyx_de_t_test` - t-test differential expression (parallelized)
+5. `crispyx_de_wilcoxon` - Wilcoxon rank-sum differential expression (parallelized)
+6. `crispyx_de_nb_glm` - Negative binomial GLM differential expression (parallelized)
 
 **Reference Comparisons** (5 methods):
-6. `scanpy_quality_control_comparison` - QC comparison against Scanpy
-7. `scanpy_wald_comparison` - Wald/t-test comparison against Scanpy
-8. `scanpy_wilcoxon_comparison` - Wilcoxon comparison against Scanpy
-9. `edger_direct_comparison` - GLM comparison against edgeR (via rpy2, parallelized)
-10. `pertpy_pydeseq2_comparison` - GLM comparison against PyDESeq2 via Pertpy (parallelized)
+7. `scanpy_qc_filtered` - QC comparison against Scanpy
+8. `scanpy_de_t_test` - t-test comparison against Scanpy
+9. `scanpy_de_wilcoxon` - Wilcoxon comparison against Scanpy
+10. `edger_de_glm` - GLM comparison against edgeR (via rpy2, parallelized, uses `crispyx_de_nb_glm` if available)
+11. `pertpy_de_pydeseq2` - GLM comparison against PyDESeq2 via Pertpy (parallelized, uses `crispyx_de_nb_glm` if available)
 
-**Comparison Metrics**: Pearson/Spearman correlation, top-k overlap, max absolute difference, AUROC
+**Comparison Metrics**: 
+- **Accuracy**: Pearson/Spearman correlation, top-k overlap, max absolute difference, AUROC
+- **Performance**: Runtime (seconds), peak memory (MB), average memory (MB)
+  - **Runtime**: Measured excluding data loading overhead (timer starts after cache files are loaded)
+  - **Peak Memory**: Maximum memory usage during execution
+  - **Average Memory**: Mean memory usage sampled at 0.1-second intervals via background thread
+
+**Standardized Comparison Pipeline**: All comparison methods (scanpy, edgeR, pertpy) load pre-computed CRISPYx streaming results from cache files to ensure consistent timing and avoid pipeline variation. This means:
+- **t-test/Wilcoxon comparisons** require `crispyx_de_t_test` or `crispyx_de_wilcoxon` to exist first
+- **GLM comparisons** (edgeR, PyDESeq2) require `crispyx_de_nb_glm` to exist first
+- If required cache files are missing, the benchmark will fail explicitly with a clear error message
+
+**Cache Dependencies**:
+- `scanpy_de_t_test`: Loads from `crispyx_de_t_test.h5ad`
+- `scanpy_de_wilcoxon`: Loads from `crispyx_de_wilcoxon.h5ad`
+- `edger_de_glm`: Loads from `crispyx_de_nb_glm.h5ad` (GLM-to-GLM comparison)
+- `pertpy_de_pydeseq2`: Loads from `crispyx_de_nb_glm.h5ad` (GLM-to-GLM comparison)
 
 **Note**: The `pertpy_statsmodels` comparison is excluded because it does not support parallelization and is extremely slow on large datasets. PyDESeq2 provides equivalent GLM-based validation.
 

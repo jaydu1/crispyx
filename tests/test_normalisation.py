@@ -23,7 +23,7 @@ import h5py
 from scipy.stats import norm, rankdata
 
 from crispyx.data import ensure_gene_symbol_column, normalize_total_block
-from crispyx.de import _tie_correction, wald_test, wilcoxon_test
+from crispyx.de import _tie_correction, t_test, wilcoxon_test
 from crispyx.pseudobulk import (
     compute_average_log_expression,
     compute_pseudobulk_expression,
@@ -70,7 +70,7 @@ def test_average_log_expression_matches_scanpy(small_adata, tmp_path):
         output_dir=tmp_path,
     )
 
-    output_path = tmp_path / "small_avg_log_effects.h5ad"
+    output_path = tmp_path / "crispyx_avg_log_effects.h5ad"
     assert output_path.exists()
 
     result_mem = result.to_memory()
@@ -108,7 +108,7 @@ def test_pseudobulk_expression_matches_scanpy(small_adata, tmp_path):
         output_dir=tmp_path,
     )
 
-    output_path = tmp_path / "small_pseudobulk_effects.h5ad"
+    output_path = tmp_path / "crispyx_pseudobulk_effects.h5ad"
     assert output_path.exists()
 
     result_mem = result.to_memory()
@@ -134,9 +134,9 @@ def test_pseudobulk_expression_matches_scanpy(small_adata, tmp_path):
     result.close()
 
 
-def test_wald_test_matches_scanpy(small_adata, tmp_path):
+def test_t_test_matches_scanpy(small_adata, tmp_path):
     path, adata = small_adata
-    results = wald_test(
+    results = t_test(
         path,
         perturbation_column="perturbation",
         control_label="ctrl",
@@ -145,7 +145,7 @@ def test_wald_test_matches_scanpy(small_adata, tmp_path):
         output_dir=tmp_path,
     )
 
-    output_path = tmp_path / "small_wald.h5ad"
+    output_path = tmp_path / "crispyx_t_test.h5ad"
     assert output_path.exists()
 
     sc_adata = adata.copy()
@@ -196,7 +196,7 @@ def test_wilcoxon_test_matches_scanpy(small_adata, tmp_path):
         output_dir=tmp_path,
     )
 
-    output_path = tmp_path / "small_wilcoxon.h5ad"
+    output_path = tmp_path / "crispyx_wilcoxon.h5ad"
     assert output_path.exists()
 
     raw = np.asarray(adata.X)
@@ -252,12 +252,12 @@ def test_ensure_gene_symbol_column_fallback_to_index():
     assert list(names) == ["GeneA", "GeneB"]
 
 
-def test_wald_test_with_n_jobs(small_adata, tmp_path):
-    """Test that wald_test works with n_jobs parameter."""
+def test_t_test_with_n_jobs(small_adata, tmp_path):
+    """Test that t_test works with n_jobs parameter."""
     path, adata = small_adata
     
     # Run with n_jobs=2
-    results_parallel = wald_test(
+    results_parallel = t_test(
         path,
         perturbation_column="perturbation",
         control_label="ctrl",
@@ -269,7 +269,7 @@ def test_wald_test_with_n_jobs(small_adata, tmp_path):
     )
     
     # Run without parallelization
-    results_serial = wald_test(
+    results_serial = t_test(
         path,
         perturbation_column="perturbation",
         control_label="ctrl",

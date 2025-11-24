@@ -22,7 +22,7 @@ from crispyx import (
     compute_average_log_expression,
     compute_pseudobulk_expression,
     quality_control_summary,
-    wald_test,
+    t_test,
     wilcoxon_test,
 )
 from crispyx.data import iter_matrix_chunks, normalize_total_block
@@ -273,7 +273,7 @@ def test_differential_expression_matches_scanpy(subset_dataset, tmp_path):
         expected_wald_z[label] = z
         expected_wald_p[label] = p
 
-    wald_results = wald_test(
+    wald_results = t_test(
         qc_result.filtered_path,
         perturbation_column=PERTURBATION_COLUMN,
         control_label=control_label,
