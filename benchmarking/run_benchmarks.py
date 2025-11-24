@@ -82,6 +82,50 @@ def clear_scanpy_cache():
     _SCANPY_REFERENCE_CACHE.clear()
 
 
+def _run_crispyx_t_test_with_qc(
+    path: Path,
+    *,
+    min_genes: int,
+    min_cells_per_gene: int,
+    min_cells_per_perturbation: int,
+    chunk_size: int,
+    perturbation_column: str,
+    control_label: str,
+    gene_name_column: str,
+    output_dir: Path,
+    preprocessing_dir: Path,
+    data_name: str,
+    n_jobs: int | None = None,
+):
+    """Apply QC filters before running the CRISPYx t-test benchmark."""
+
+    preprocessing_dir.mkdir(parents=True, exist_ok=True)
+
+    qc_result = quality_control_summary(
+        path,
+        min_genes=min_genes,
+        min_cells_per_perturbation=min_cells_per_perturbation,
+        min_cells_per_gene=min_cells_per_gene,
+        perturbation_column=perturbation_column,
+        control_label=control_label,
+        gene_name_column=gene_name_column,
+        chunk_size=chunk_size,
+        output_dir=preprocessing_dir,
+        data_name="qc_filtered",
+    )
+
+    return t_test(
+        qc_result.filtered_path,
+        perturbation_column=perturbation_column,
+        control_label=control_label,
+        gene_name_column=gene_name_column,
+        chunk_size=chunk_size,
+        output_dir=output_dir,
+        data_name=data_name,
+        n_jobs=n_jobs,
+    )
+
+
 @dataclass
 class ComparisonResult:
     """Summary of how the streamlined pipeline compares to a Scanpy-style workflow."""
@@ -3565,11 +3609,16 @@ def create_benchmark_suite(
         "crispyx_de_t_test": BenchmarkMethod(
             name="crispyx_de_t_test",
             description="t-test differential expression test",
-            function=t_test,
+            function=_run_crispyx_t_test_with_qc,
             kwargs={
                 "path": dataset_path,
+                "min_genes": min_genes,
+                "min_cells_per_perturbation": min_cells_per_perturbation,
+                "min_cells_per_gene": min_cells_per_gene,
+                "chunk_size": chunk_size,
                 **shared_kwargs,
                 "output_dir": de_dir,
+                "preprocessing_dir": preprocessing_dir,
                 "data_name": "de_t_test",
                 "n_jobs": n_cores,
             },
