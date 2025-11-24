@@ -250,11 +250,19 @@ def resolve_output_path(
     input_path = Path(input_path)
     output_dir = Path(output_dir) if output_dir is not None else input_path.parent
     if data_name:
-        # If data_name already includes the full name (e.g., "qc_filtered"), use it directly
-        # Otherwise append suffix for backward compatibility
-        if module and not data_name.startswith(f"{module}_"):
-            return output_dir / f"{module}_{data_name}.h5ad"
-        return output_dir / f"{data_name}.h5ad"
+        # Preserve any existing module prefix supplied by the caller.
+        base = data_name
+        if module and not base.startswith(f"{module}_"):
+            base = f"{module}_{base}"
+
+        # If the provided name does not already encode the suffix, append it to avoid
+        # different intermediates overwriting each other when the same ``data_name``
+        # is reused across pipeline steps.
+        if not base.endswith(f"_{suffix}"):
+            base = f"{base}_{suffix}"
+
+        return output_dir / f"{base}.h5ad"
+
     return output_dir / f"{module}_{suffix}.h5ad"
 
 

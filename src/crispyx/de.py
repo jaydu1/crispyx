@@ -301,35 +301,35 @@ def t_test(
         n_genes = backed.n_vars
         candidates = _resolve_candidates(labels, control_label, perturbations)
         groups = [control_label] + candidates
-        sums = {label: np.zeros(n_genes, dtype=np.float64) for label in groups}
-        sumsq = {label: np.zeros(n_genes, dtype=np.float64) for label in groups}
-        counts = {label: 0 for label in groups}
-        expr_counts = {label: np.zeros(n_genes, dtype=np.int64) for label in groups}
+        group_index = {label: idx for idx, label in enumerate(groups)}
+        label_codes = pd.Categorical(labels, categories=groups).codes
+
+        n_groups_total = len(groups)
+        sums = np.zeros((n_groups_total, n_genes), dtype=np.float64)
+        sumsq = np.zeros_like(sums)
+        counts = np.zeros(n_groups_total, dtype=np.int64)
+        expr_counts = np.zeros((n_groups_total, n_genes), dtype=np.int64)
         for slc, block in iter_matrix_chunks(backed, axis=0, chunk_size=chunk_size):
-            slice_labels = labels[slc]
+            slice_codes = label_codes[slc]
             normalised_block, _ = normalize_total_block(block)
             raw_block = np.asarray(block)
             log_block = np.log1p(normalised_block)
-            for label in groups:
-                mask = slice_labels == label
-                if not np.any(mask):
-                    continue
-                selected = log_block[mask]
-                counts[label] += int(mask.sum())
-                sums[label] += selected.sum(axis=0)
-                sumsq[label] += np.square(selected).sum(axis=0)
-                expr_counts[label] += np.asarray((raw_block[mask] > 0).sum(axis=0)).ravel()
+            np.add.at(sums, slice_codes, log_block)
+            np.add.at(sumsq, slice_codes, np.square(log_block))
+            np.add.at(expr_counts, slice_codes, raw_block > 0)
+            counts += np.bincount(slice_codes, minlength=n_groups_total)
     finally:
         backed.file.close()
 
-    control_n = counts[control_label]
+    control_idx = group_index[control_label]
+    control_n = counts[control_idx]
     if control_n == 0:
         raise ValueError("Control group contains no cells")
 
-    control_mean = sums[control_label] / control_n
+    control_mean = sums[control_idx] / control_n
     control_var = np.zeros_like(control_mean)
     if control_n > 1:
-        control_var = (sumsq[control_label] - (sums[control_label] ** 2) / control_n) / (control_n - 1)
+        control_var = (sumsq[control_idx] - (sums[control_idx] ** 2) / control_n) / (control_n - 1)
     control_var = np.clip(control_var, a_min=0, a_max=None)
 
     effect_matrix = []
@@ -342,7 +342,7 @@ def t_test(
 
     # Calculate control pts (proportion of cells expressing each gene)
     control_pts = np.divide(
-        expr_counts[control_label],
+        expr_counts[control_idx],
         control_n,
         out=np.zeros(n_genes, dtype=float),
         where=control_n > 0,
@@ -359,27 +359,28 @@ def t_test(
 
     def compute_perturbation(label: str) -> tuple[str, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """Compute statistics for a single perturbation."""
-        n_cells = counts[label]
+        idx = group_index[label]
+        n_cells = counts[idx]
         if n_cells == 0:
             raise ValueError(f"Perturbation '{label}' contains no cells")
-        mean = sums[label] / n_cells
+        mean = sums[idx] / n_cells
         var = np.zeros_like(mean)
         if n_cells > 1:
-            var = (sumsq[label] - (sums[label] ** 2) / n_cells) / (n_cells - 1)
+            var = (sumsq[idx] - (sums[idx] ** 2) / n_cells) / (n_cells - 1)
         var = np.clip(var, a_min=0, a_max=None)
         effect = mean - control_mean
         log_fc = effect  # For t-test, effect size is log fold change
         se = np.sqrt(control_var / control_n + var / n_cells)
-        total_expr = expr_counts[label] + expr_counts[control_label]
+        total_expr = expr_counts[idx] + expr_counts[control_idx]
         valid = (se > 0) & (total_expr >= min_cells_expressed)
         z = np.zeros_like(effect)
         pvalue = np.ones_like(effect)
         z[valid] = effect[valid] / se[valid]
         pvalue[valid] = 2 * norm.sf(np.abs(z[valid]))
-        
+
         # Calculate pts (proportion of cells expressing each gene)
         pts = np.divide(
-            expr_counts[label],
+            expr_counts[idx],
             n_cells,
             out=np.zeros(n_genes, dtype=float),
             where=n_cells > 0,

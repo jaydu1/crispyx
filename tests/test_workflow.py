@@ -211,8 +211,8 @@ def test_downstream_effect_outputs(tmp_path):
     expected = ko1.mean() - ctrl.mean()
     assert np.isclose(avg_df.loc["KO1", "gene0"], expected)
 
-    assert (tmp_path / "crispyx_avg_effects.h5ad").exists()
-    assert (tmp_path / "crispyx_pseudo_effects.h5ad").exists()
+    assert (tmp_path / "crispyx_avg_effects_avg_log_effects.h5ad").exists()
+    assert (tmp_path / "crispyx_pseudo_effects_pseudobulk_effects.h5ad").exists()
     assert (tmp_path / "crispyx_t_test.h5ad").exists()
     assert (tmp_path / "crispyx_wilcoxon.h5ad").exists()
 
