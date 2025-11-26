@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -13,6 +14,7 @@ import anndata as ad
 import numpy as np
 import pandas as pd
 import scipy.sparse as sp
+import h5py
 from scipy.stats import norm, rankdata
 
 from .data import (
@@ -202,10 +204,22 @@ def _tie_correction(ranks: np.ndarray) -> np.ndarray:
 def _adjust_pvalue_matrix(
     matrix: np.ndarray,
     method: Literal["benjamini-hochberg", "bonferroni"],
+    out: np.ndarray | None = None,
 ) -> np.ndarray:
-    """Return a p-value matrix adjusted per row using the requested method."""
+    """Return a p-value matrix adjusted per row using the requested method.
 
-    adjusted = np.ones_like(matrix)
+    Parameters
+    ----------
+    matrix
+        P-value matrix to correct.
+    method
+        Correction method to apply.
+    out
+        Optional array to write results into. If provided, must be the same shape
+        as ``matrix``.
+    """
+
+    adjusted = out if out is not None else np.ones_like(matrix)
     for row_idx in range(matrix.shape[0]):
         row = matrix[row_idx]
         valid = np.isfinite(row)
@@ -260,9 +274,11 @@ def t_test(
     like a dict: `result[perturbation_label]` returns a DifferentialExpressionResult
     for that perturbation.
 
-    Input data **must already be normalized and log-transformed** (for example
-    using `scanpy.pp.normalize_total` followed by `scanpy.pp.log1p`). Raw counts
-    are no longer automatically normalized; count-like inputs will raise an error.
+    Input data **should already be normalized and log-transformed** (for example
+    using `scanpy.pp.normalize_total` followed by `scanpy.pp.log1p`). To maintain
+    backward compatibility with Scanpy-style workflows, count-like inputs are
+    automatically normalized and log-transformed in streaming fashion, with a
+    warning to encourage explicit preprocessing upstream.
     
     Parameters
     ----------
@@ -300,6 +316,7 @@ def t_test(
         The h5ad file path is available at `result.result_path`.
     """
 
+    normalize_and_log = False
     backed = read_backed(path)
     try:
         gene_symbols = ensure_gene_symbol_column(backed, gene_name_column)
@@ -318,20 +335,20 @@ def t_test(
         # Validate that input data is already normalized/log-transformed
         for _, chunk in iter_matrix_chunks(backed, axis=0, chunk_size=100, convert_to_dense=True):
             if np.issubdtype(chunk.dtype, np.integer):
-                raise ValueError(
-                    "t_test requires pre-normalized, log-transformed expression data. "
-                    "Integer inputs appear to be raw counts. Please run preprocessing "
-                    "such as scanpy.pp.normalize_total followed by scanpy.pp.log1p before calling t_test."
+                normalize_and_log = True
+                logger.warning(
+                    "Detected integer count data in t_test; automatically applying normalize_total + log1p. "
+                    "For reproducibility, please preprocess explicitly upstream."
                 )
-            if np.issubdtype(chunk.dtype, np.floating):
+            elif np.issubdtype(chunk.dtype, np.floating):
                 # Treat float data that is effectively count-like as raw counts
                 non_zero = chunk[chunk > 0]
                 is_count_like = non_zero.size > 0 and np.all(np.isclose(non_zero, np.round(non_zero)))
                 if is_count_like:
-                    raise ValueError(
-                        "t_test requires pre-normalized, log-transformed expression data. "
-                        "Detected count-like floating point values; please apply normalization "
-                        "and log-transformation upstream."
+                    normalize_and_log = True
+                    logger.warning(
+                        "Detected count-like floating point values; proceeding with normalize_total + log1p. "
+                        "Please ensure preprocessing is applied upstream for consistent results."
                     )
             break  # Only check the first chunk
 
@@ -345,35 +362,36 @@ def t_test(
             backed, axis=0, chunk_size=cell_chunk_size, convert_to_dense=False
         ):
             slice_codes = label_codes[slc]
-            
+
+            expr_block = block
+            if normalize_and_log:
+                expr_block, _ = normalize_total_block(block, target_sum=1e4, dtype=np.float32)
+                np.log1p(expr_block, out=expr_block)
+
             # Optimize memory: sparse-aware expression counting
-            if sp.issparse(block):
+            if sp.issparse(expr_block):
                 # Convert to CSR for efficient row iteration, then get binary indicator per gene
-                csr = sp.csr_matrix(block)
-                # For each unique group code in this slice, accumulate expression counts
+                csr = sp.csr_matrix(expr_block)
                 for code in np.unique(slice_codes):
                     row_mask = slice_codes == code
                     group_block = csr[row_mask, :]
-                    # Count non-zeros per column (gene) - getnnz returns count per column
                     expr_counts[code] += np.asarray(group_block.getnnz(axis=0), dtype=np.int32)
             else:
-                mask = block > 0
+                mask = expr_block > 0
                 np.add.at(expr_counts, slice_codes, mask)
                 del mask
 
-            if sp.issparse(block):
-                log_block = block.toarray()
+            if sp.issparse(expr_block):
+                log_block = expr_block.toarray()
             else:
-                log_block = block
-            # Ensure float32 for consistency
+                log_block = expr_block
             if log_block.dtype != np.float32:
                 log_block = log_block.astype(np.float32)
-            
+
             np.add.at(sums, slice_codes, log_block)
-            # Compute squared values in-place to avoid temporary array allocation
             np.square(log_block, out=log_block)
             np.add.at(sumsq, slice_codes, log_block)
-            del log_block  # Explicitly free the chunk memory
+            del log_block
             counts += np.bincount(slice_codes, minlength=n_groups_total)
     finally:
         backed.file.close()
@@ -406,137 +424,156 @@ def t_test(
         worker_count = min(n_groups, abs(n_jobs))
     worker_count = max(worker_count, 1)
 
-    # Pre-allocate result arrays to avoid memory spikes from list collection and vstack
-    # Use float32 for effect/lfc/pts to match scanpy's approach; keep float64 for p-values and statistics
+    # Prepare on-disk buffers for results
     shape = (n_groups, n_genes)
-    effect_arr = np.zeros(shape, dtype=np.float32)
-    stat_arr = np.zeros(shape, dtype=np.float64)
-    p_arr = np.ones(shape, dtype=np.float64)
-    lfc_arr = np.zeros(shape, dtype=np.float32)
-    pts_arr = np.zeros(shape, dtype=np.float32)
-    # Store control_pts as 1D array; broadcast when creating RankGenesGroupsResult
-    pts_rest_1d = control_pts.astype(np.float32)
-    order_arr = np.zeros(shape, dtype=np.int64)
-
-    def compute_perturbation(label: str) -> tuple[str, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        """Compute statistics for a single perturbation."""
-        idx = group_index[label]
-        n_cells = counts[idx]
-        if n_cells == 0:
-            raise ValueError(f"Perturbation '{label}' contains no cells")
-        # Use in-place operations to minimize temporary arrays
-        mean = sums[idx] / n_cells
-        # Compute variance in-place
-        var = sumsq[idx].copy()
-        if n_cells > 1:
-            np.subtract(var, np.square(sums[idx]) / n_cells, out=var)
-            np.divide(var, n_cells - 1, out=var)
-        else:
-            var.fill(0)
-        np.clip(var, a_min=0, a_max=None, out=var)
-        
-        # effect = mean - control_mean (reuse mean array)
-        effect = mean
-        np.subtract(effect, control_mean, out=effect)
-        
-        # Compute standard error in-place using var array
-        se = var  # Reuse var array for se
-        np.divide(se, n_cells, out=se)
-        np.add(se, control_var / control_n, out=se)
-        np.sqrt(se, out=se)
-        
-        total_expr = expr_counts[idx] + expr_counts[control_idx]
-        valid = (se > 0) & (total_expr >= min_cells_expressed)
-        
-        z = np.zeros(n_genes, dtype=np.float64)
-        pvalue = np.ones(n_genes, dtype=np.float64)
-        z[valid] = effect[valid] / se[valid]
-        pvalue[valid] = 2 * norm.sf(np.abs(z[valid]))
-
-        # Calculate pts (proportion of cells expressing each gene)
-        pts = np.zeros(n_genes, dtype=np.float32)
-        np.divide(expr_counts[idx], n_cells, out=pts, where=n_cells > 0, casting='unsafe')
-        
-        # Create ranking order (descending by absolute z-score)
-        order = np.argsort(-np.abs(z))
-        
-        # Return effect as float32 for memory efficiency
-        return label, effect.astype(np.float32), z, pvalue, effect.astype(np.float32), pts, order
-
-    # Compute in parallel or sequentially based on worker count
-    if n_groups > 0:
-        # Map candidates to their index in the result arrays
-        candidate_indices = {label: i for i, label in enumerate(candidates)}
-        
-        if n_groups == 1 or worker_count == 1:
-            for label in candidates:
-                _, effect, z, pvalue, log_fc, pts, order = compute_perturbation(label)
-                i = candidate_indices[label]
-                effect_arr[i] = effect
-                stat_arr[i] = z
-                p_arr[i] = pvalue
-                lfc_arr[i] = log_fc
-                pts_arr[i] = pts
-                order_arr[i] = order
-        else:
-            with ThreadPoolExecutor(max_workers=worker_count) as executor:
-                futures = {executor.submit(compute_perturbation, label): label for label in candidates}
-                for future in as_completed(futures):
-                    label_res, effect, z, pvalue, log_fc, pts, order = future.result()
-                    i = candidate_indices[label_res]
-                    effect_arr[i] = effect
-                    stat_arr[i] = z
-                    p_arr[i] = pvalue
-                    lfc_arr[i] = log_fc
-                    pts_arr[i] = pts
-                    order_arr[i] = order
-                    # Help GC
-                    del effect, z, pvalue, log_fc, pts, order
-
-    # Apply p-value correction
-    pvalue_adj_arr = _adjust_pvalue_matrix(p_arr, method="benjamini-hochberg")
-
-    # Create AnnData with rank_genes_groups format in uns
+    output_path = resolve_output_path(path, suffix="t_test", output_dir=output_dir, data_name=data_name)
     obs_index = pd.Index(candidates, name="perturbation").astype(str)
     obs = pd.DataFrame({perturbation_column: obs_index.to_list()}, index=obs_index)
-    var = pd.DataFrame(index=gene_symbols)
-    
-    # Create minimal AnnData - the actual results are in uns["rank_genes_groups"]
+
     adata = ad.AnnData(np.zeros((len(candidates), 0)), obs=obs, var=pd.DataFrame(index=[]))
     adata.uns["method"] = "t_test"
     adata.uns["control_label"] = control_label
     adata.uns["genes"] = gene_symbols.to_numpy()
     adata.uns["pvalue_correction"] = "benjamini-hochberg"
-    
-    output_path = resolve_output_path(path, suffix="t_test", output_dir=output_dir, data_name=data_name)
-    
-    # Broadcast pts_rest from 1D to 2D at final result construction (avoids storing full copy)
-    pts_rest_arr = np.broadcast_to(pts_rest_1d, shape).copy()
-    
-    result = RankGenesGroupsResult(
-        genes=gene_symbols,
-        groups=candidates,
-        statistics=stat_arr,
-        pvalues=p_arr,
-        pvalues_adj=pvalue_adj_arr,
-        logfoldchanges=lfc_arr,
-        effect_size=effect_arr,
-        u_statistics=np.zeros(shape, dtype=np.float32),  # Not used in t-test
-        pts=pts_arr,
-        pts_rest=pts_rest_arr,
-        order=order_arr,
-        groupby=perturbation_column,
-        method="t_test",
-        control_label=control_label,
-        tie_correct=False,
-        pvalue_correction="benjamini-hochberg",
-        result=None,
-    )
-    
-    # Add rank_genes_groups to uns for Scanpy compatibility
-    adata.uns["rank_genes_groups"] = result.to_rank_genes_groups_dict()
     adata.write(output_path)
-    
+
+    candidate_indices = {label: i for i, label in enumerate(candidates)}
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_path = Path(tmpdir)
+        stat_memmap = np.memmap(tmp_path / "statistics.dat", mode="w+", dtype=np.float64, shape=shape)
+        pval_memmap = np.memmap(tmp_path / "pvalues.dat", mode="w+", dtype=np.float64, shape=shape)
+        lfc_memmap = np.memmap(tmp_path / "logfoldchanges.dat", mode="w+", dtype=np.float32, shape=shape)
+        effect_memmap = np.memmap(tmp_path / "effect_size.dat", mode="w+", dtype=np.float32, shape=shape)
+        pts_memmap = np.memmap(tmp_path / "pts.dat", mode="w+", dtype=np.float32, shape=shape)
+        order_memmap = np.memmap(tmp_path / "order.dat", mode="w+", dtype=np.int64, shape=shape)
+        pts_rest_memmap = np.memmap(
+            tmp_path / "pts_rest.dat", mode="w+", dtype=np.float32, shape=shape
+        )
+        pts_rest_memmap[:] = control_pts.astype(np.float32)
+
+        with h5py.File(output_path, "r+") as handle:
+            uns_group = handle.require_group("uns")
+            if "rank_genes_groups" in uns_group:
+                del uns_group["rank_genes_groups"]
+            rgg = uns_group.create_group("rank_genes_groups")
+            full = rgg.create_group("full")
+            ds_scores = full.create_dataset("scores", shape=shape, dtype="float64")
+            ds_pvals = full.create_dataset("pvals", shape=shape, dtype="float64")
+            ds_pvals_adj = full.create_dataset("pvals_adj", shape=shape, dtype="float64")
+            ds_lfc = full.create_dataset("logfoldchanges", shape=shape, dtype="float32")
+            ds_auc = full.create_dataset("auc", shape=shape, dtype="float32")
+            ds_u = full.create_dataset("u_stat", shape=shape, dtype="float32")
+            ds_pts = full.create_dataset("pts", shape=shape, dtype="float32")
+            ds_pts_rest = full.create_dataset("pts_rest", shape=shape, dtype="float32")
+            ds_order = rgg.create_dataset("order", shape=shape, dtype="int64")
+
+            ds_auc[:] = 0.0
+            ds_u[:] = 0.0
+            ds_pts_rest[:] = pts_rest_memmap
+
+            batch_size = worker_count
+            effect_buffer = np.zeros((batch_size, n_genes), dtype=np.float32)
+            stat_buffer = np.zeros((batch_size, n_genes), dtype=np.float64)
+            pval_buffer = np.ones((batch_size, n_genes), dtype=np.float64)
+            lfc_buffer = np.zeros((batch_size, n_genes), dtype=np.float32)
+            pts_buffer = np.zeros((batch_size, n_genes), dtype=np.float32)
+            order_buffer = np.zeros((batch_size, n_genes), dtype=np.int64)
+            mean_buffer = np.zeros(n_genes, dtype=np.float64)
+            var_buffer = np.zeros(n_genes, dtype=np.float64)
+            se_buffer = np.zeros(n_genes, dtype=np.float64)
+
+            def compute_into_buffers(label: str, slot: int) -> None:
+                idx = group_index[label]
+                n_cells = counts[idx]
+                if n_cells == 0:
+                    raise ValueError(f"Perturbation '{label}' contains no cells")
+
+                np.divide(sums[idx], n_cells, out=mean_buffer)
+                np.copyto(var_buffer, sumsq[idx])
+                if n_cells > 1:
+                    np.subtract(var_buffer, np.square(sums[idx]) / n_cells, out=var_buffer)
+                    np.divide(var_buffer, n_cells - 1, out=var_buffer)
+                else:
+                    var_buffer.fill(0)
+                np.clip(var_buffer, a_min=0, a_max=None, out=var_buffer)
+
+                np.subtract(mean_buffer, control_mean, out=effect_buffer[slot])
+
+                np.divide(var_buffer, n_cells, out=se_buffer)
+                np.add(se_buffer, control_var / control_n, out=se_buffer)
+                np.sqrt(se_buffer, out=se_buffer)
+
+                total_expr = expr_counts[idx] + expr_counts[control_idx]
+                valid = (se_buffer > 0) & (total_expr >= min_cells_expressed)
+
+                stat_buffer[slot].fill(0)
+                pval_buffer[slot].fill(1)
+                stat_buffer[slot][valid] = effect_buffer[slot][valid] / se_buffer[valid]
+                pval_buffer[slot][valid] = 2 * norm.sf(np.abs(stat_buffer[slot][valid]))
+
+                np.divide(
+                    expr_counts[idx],
+                    n_cells,
+                    out=pts_buffer[slot],
+                    where=n_cells > 0,
+                    casting="unsafe",
+                )
+
+                order_buffer[slot] = np.argsort(-np.abs(stat_buffer[slot]))
+                np.subtract(mean_buffer, control_mean, out=lfc_buffer[slot], casting="unsafe")
+
+            if n_groups > 0:
+                for batch_start in range(0, n_groups, batch_size):
+                    batch_labels = candidates[batch_start : batch_start + batch_size]
+                    for local_idx, label in enumerate(batch_labels):
+                        compute_into_buffers(label, local_idx)
+
+                    for local_idx, label in enumerate(batch_labels):
+                        global_idx = candidate_indices[label]
+                        effect_memmap[global_idx] = effect_buffer[local_idx]
+                        stat_memmap[global_idx] = stat_buffer[local_idx]
+                        pval_memmap[global_idx] = pval_buffer[local_idx]
+                        lfc_memmap[global_idx] = lfc_buffer[local_idx]
+                        pts_memmap[global_idx] = pts_buffer[local_idx]
+                        order_memmap[global_idx] = order_buffer[local_idx]
+
+                        ds_scores[global_idx] = stat_buffer[local_idx]
+                        ds_pvals[global_idx] = pval_buffer[local_idx]
+                        ds_lfc[global_idx] = lfc_buffer[local_idx]
+                        ds_pts[global_idx] = pts_buffer[local_idx]
+                        ds_order[global_idx] = order_buffer[local_idx]
+
+            pvalue_adj_memmap = np.memmap(
+                tmp_path / "pvalues_adj.dat", mode="w+", dtype=np.float64, shape=shape
+            )
+            _adjust_pvalue_matrix(pval_memmap, method="benjamini-hochberg", out=pvalue_adj_memmap)
+            ds_pvals_adj[:] = pvalue_adj_memmap
+
+        pts_rest_arr = np.asarray(pts_rest_memmap)
+        result = RankGenesGroupsResult(
+            genes=gene_symbols,
+            groups=candidates,
+            statistics=np.asarray(stat_memmap),
+            pvalues=np.asarray(pval_memmap),
+            pvalues_adj=np.asarray(pvalue_adj_memmap),
+            logfoldchanges=np.asarray(lfc_memmap),
+            effect_size=np.asarray(effect_memmap),
+            u_statistics=np.zeros(shape, dtype=np.float32),
+            pts=np.asarray(pts_memmap),
+            pts_rest=pts_rest_arr,
+            order=np.asarray(order_memmap),
+            groupby=perturbation_column,
+            method="t_test",
+            control_label=control_label,
+            tie_correct=False,
+            pvalue_correction="benjamini-hochberg",
+            result=None,
+        )
+
+        adata.uns["rank_genes_groups"] = result.to_rank_genes_groups_dict()
+        adata.write(output_path)
+
     result.result = AnnData(output_path)
     return result
 

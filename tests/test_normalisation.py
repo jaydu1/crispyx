@@ -59,6 +59,58 @@ def small_adata(tmp_path):
     return path, adata
 
 
+def _assert_t_test_matches_scanpy(path, adata, tmp_path):
+    results = t_test(
+        path,
+        perturbation_column="perturbation",
+        control_label="ctrl",
+        gene_name_column="gene_symbols",
+        cell_chunk_size=2,
+        output_dir=tmp_path,
+    )
+
+    output_path = tmp_path / "crispyx_t_test.h5ad"
+    assert output_path.exists()
+
+    sc_adata = adata.copy()
+    sc.pp.normalize_total(sc_adata, target_sum=1e4)
+    sc.pp.log1p(sc_adata)
+
+    ctrl_mask = sc_adata.obs["perturbation"] == "ctrl"
+    ctrl_data = np.asarray(sc_adata[ctrl_mask].X)
+    ctrl_mean = ctrl_data.mean(axis=0)
+    if ctrl_data.shape[0] > 1:
+        ctrl_var = ctrl_data.var(axis=0, ddof=1)
+    else:
+        ctrl_var = np.zeros_like(ctrl_mean)
+    ctrl_expr = np.asarray((adata[ctrl_mask].X > 0).sum(axis=0)).ravel()
+
+    for label, result in results.items():
+        mask = sc_adata.obs["perturbation"] == label
+        pert_data = np.asarray(sc_adata[mask].X)
+        mean = pert_data.mean(axis=0)
+        if pert_data.shape[0] > 1:
+            var = pert_data.var(axis=0, ddof=1)
+        else:
+            var = np.zeros_like(mean)
+        effect = mean - ctrl_mean
+        se = np.sqrt(ctrl_var / ctrl_data.shape[0] + var / pert_data.shape[0])
+        pert_expr = np.asarray((adata[mask].X > 0).sum(axis=0)).ravel()
+        total_expr = ctrl_expr + pert_expr
+        valid = se > 0
+        z = np.zeros_like(effect)
+        pvalue = np.ones_like(effect)
+        z[valid] = effect[valid] / se[valid]
+        pvalue[valid] = 2 * norm.sf(np.abs(z[valid]))
+
+        # Use looser tolerance due to float32 intermediate values in crispyx
+        # (matches scanpy's approach for memory efficiency)
+        np.testing.assert_allclose(result.effect_size, effect, rtol=1e-4, atol=1e-5)
+        np.testing.assert_allclose(result.statistic, z, rtol=1e-4, atol=1e-2)
+        np.testing.assert_allclose(result.pvalue, pvalue, rtol=1e-4, atol=1e-8)
+        assert result.result_path == output_path
+
+
 def test_average_log_expression_matches_scanpy(small_adata, tmp_path):
     path, adata = small_adata
     result = compute_average_log_expression(
@@ -136,55 +188,17 @@ def test_pseudobulk_expression_matches_scanpy(small_adata, tmp_path):
 
 def test_t_test_matches_scanpy(small_adata, tmp_path):
     path, adata = small_adata
-    results = t_test(
-        path,
-        perturbation_column="perturbation",
-        control_label="ctrl",
-        gene_name_column="gene_symbols",
-        cell_chunk_size=2,
-        output_dir=tmp_path,
-    )
+    _assert_t_test_matches_scanpy(path, adata, tmp_path)
 
-    output_path = tmp_path / "crispyx_t_test.h5ad"
-    assert output_path.exists()
 
-    sc_adata = adata.copy()
-    sc.pp.normalize_total(sc_adata, target_sum=1e4)
-    sc.pp.log1p(sc_adata)
+def test_t_test_accepts_integer_counts(small_adata, tmp_path):
+    path, adata = small_adata
+    adata_int = adata.copy()
+    adata_int.X = np.asarray(adata_int.X, dtype=np.int32)
+    int_path = tmp_path / "small_int.h5ad"
+    adata_int.write(int_path)
 
-    ctrl_mask = sc_adata.obs["perturbation"] == "ctrl"
-    ctrl_data = np.asarray(sc_adata[ctrl_mask].X)
-    ctrl_mean = ctrl_data.mean(axis=0)
-    if ctrl_data.shape[0] > 1:
-        ctrl_var = ctrl_data.var(axis=0, ddof=1)
-    else:
-        ctrl_var = np.zeros_like(ctrl_mean)
-    ctrl_expr = np.asarray((adata[ctrl_mask].X > 0).sum(axis=0)).ravel()
-
-    for label, result in results.items():
-        mask = sc_adata.obs["perturbation"] == label
-        pert_data = np.asarray(sc_adata[mask].X)
-        mean = pert_data.mean(axis=0)
-        if pert_data.shape[0] > 1:
-            var = pert_data.var(axis=0, ddof=1)
-        else:
-            var = np.zeros_like(mean)
-        effect = mean - ctrl_mean
-        se = np.sqrt(ctrl_var / ctrl_data.shape[0] + var / pert_data.shape[0])
-        pert_expr = np.asarray((adata[mask].X > 0).sum(axis=0)).ravel()
-        total_expr = ctrl_expr + pert_expr
-        valid = se > 0
-        z = np.zeros_like(effect)
-        pvalue = np.ones_like(effect)
-        z[valid] = effect[valid] / se[valid]
-        pvalue[valid] = 2 * norm.sf(np.abs(z[valid]))
-
-        # Use looser tolerance due to float32 intermediate values in crispyx
-        # (matches scanpy's approach for memory efficiency)
-        np.testing.assert_allclose(result.effect_size, effect, rtol=1e-4, atol=1e-5)
-        np.testing.assert_allclose(result.statistic, z, rtol=1e-4, atol=1e-2)
-        np.testing.assert_allclose(result.pvalue, pvalue, rtol=1e-4, atol=1e-8)
-        assert result.result_path == output_path
+    _assert_t_test_matches_scanpy(int_path, adata_int, tmp_path)
 
 
 def test_wilcoxon_test_matches_scanpy(small_adata, tmp_path):
