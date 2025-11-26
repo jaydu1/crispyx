@@ -483,7 +483,7 @@ def t_test(
             var_buffer = np.zeros(n_genes, dtype=np.float64)
             se_buffer = np.zeros(n_genes, dtype=np.float64)
 
-            def compute_into_buffers(label: str, slot: int) -> None:
+            def compute_perturbation(label: str, slot: int) -> None:
                 idx = group_index[label]
                 n_cells = counts[idx]
                 if n_cells == 0:
@@ -499,6 +499,7 @@ def t_test(
                 np.clip(var_buffer, a_min=0, a_max=None, out=var_buffer)
 
                 np.subtract(mean_buffer, control_mean, out=effect_buffer[slot])
+                effect_f32 = effect_buffer[slot].astype(np.float32, copy=False)
 
                 np.divide(var_buffer, n_cells, out=se_buffer)
                 np.add(se_buffer, control_var / control_n, out=se_buffer)
@@ -509,7 +510,7 @@ def t_test(
 
                 stat_buffer[slot].fill(0)
                 pval_buffer[slot].fill(1)
-                stat_buffer[slot][valid] = effect_buffer[slot][valid] / se_buffer[valid]
+                stat_buffer[slot][valid] = effect_f32[valid] / se_buffer[valid]
                 pval_buffer[slot][valid] = 2 * norm.sf(np.abs(stat_buffer[slot][valid]))
 
                 np.divide(
@@ -521,13 +522,13 @@ def t_test(
                 )
 
                 order_buffer[slot] = np.argsort(-np.abs(stat_buffer[slot]))
-                np.subtract(mean_buffer, control_mean, out=lfc_buffer[slot], casting="unsafe")
+                np.copyto(lfc_buffer[slot], effect_f32)
 
             if n_groups > 0:
                 for batch_start in range(0, n_groups, batch_size):
                     batch_labels = candidates[batch_start : batch_start + batch_size]
                     for local_idx, label in enumerate(batch_labels):
-                        compute_into_buffers(label, local_idx)
+                        compute_perturbation(label, local_idx)
 
                     for local_idx, label in enumerate(batch_labels):
                         global_idx = candidate_indices[label]
