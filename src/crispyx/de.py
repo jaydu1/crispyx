@@ -21,7 +21,6 @@ from .data import (
     AnnData,
     ensure_gene_symbol_column,
     iter_matrix_chunks,
-    normalize_total_block,
     read_backed,
     resolve_control_label,
     resolve_output_path,
@@ -837,7 +836,14 @@ def wilcoxon_test(
     data_name: str | None = None,
     n_jobs: int | None = None,
 ) -> RankGenesGroupsResult:
-    """Perform a Wilcoxon rank-sum (Mann-Whitney U) test for each gene."""
+    """Perform a Wilcoxon rank-sum (Mann-Whitney U) test for each gene.
+
+    Input data **must already be library-size normalised and log-transformed**.
+    The function operates directly on the provided matrix without additional
+    preprocessing. As a safeguard, the first sparse chunk is inspected and a
+    warning is emitted if the data appear to be raw counts (integer or
+    count-like floats), encouraging explicit preprocessing upstream.
+    """
 
     backed = read_backed(path)
     try:
@@ -858,6 +864,26 @@ def wilcoxon_test(
         for label, mask in pert_masks.items():
             if not np.any(mask):
                 raise ValueError(f"Perturbation '{label}' contains no cells")
+
+        for _, chunk in iter_matrix_chunks(backed, axis=0, chunk_size=100, convert_to_dense=False):
+            if not sp.issparse(chunk):
+                raise ValueError(
+                    "wilcoxon_test only supports sparse input matrices. Please provide a scipy sparse matrix (e.g., CSR/CSC)."
+                )
+            if np.issubdtype(chunk.dtype, np.integer):
+                logger.warning(
+                    "Detected integer count data in wilcoxon_test; input should be normalized/log-transformed. "
+                    "For reproducibility, please preprocess explicitly upstream."
+                )
+            elif np.issubdtype(chunk.dtype, np.floating):
+                non_zero = chunk.data[chunk.data > 0]
+                is_count_like = non_zero.size > 0 and np.all(np.isclose(non_zero, np.round(non_zero)))
+                if is_count_like:
+                    logger.warning(
+                        "Detected count-like floating point values in wilcoxon_test; input should be normalized/log-transformed. "
+                        "Please ensure preprocessing is applied upstream for consistent results."
+                    )
+            break
     finally:
         backed.file.close()
 
@@ -873,15 +899,6 @@ def wilcoxon_test(
 
     backed = read_backed(path)
     try:
-        library_sizes = np.zeros(backed.n_obs, dtype=np.float64)
-        for slc, block in iter_matrix_chunks(backed, axis=0, chunk_size=chunk_size):
-            _, lib = normalize_total_block(block)
-            library_sizes[slc] = lib
-    finally:
-        backed.file.close()
-
-    backed = read_backed(path)
-    try:
         labels = backed.obs[perturbation_column].astype(str).to_numpy()
         control_mask = labels == control_label
         pert_masks = {label: labels == label for label in candidates}
@@ -893,12 +910,9 @@ def wilcoxon_test(
         worker_count = max(worker_count, 1)
 
         for slc, block in iter_matrix_chunks(backed, axis=1, chunk_size=chunk_size):
-            raw_block = np.asarray(block)
-            normalised_block, _ = normalize_total_block(block, library_size=library_sizes)
-            normalised_block = normalised_block.astype(np.float32, copy=False)
-            log_block = np.log1p(normalised_block, dtype=np.float32)
+            log_block = np.asarray(block, dtype=np.float32)
             control_values = log_block[control_mask, :]
-            control_expr = np.asarray(np.count_nonzero(raw_block[control_mask], axis=0))
+            control_expr = np.asarray(np.count_nonzero(control_values, axis=0))
             control_mean = (
                 control_values.mean(axis=0, dtype=np.float64)
                 if control_values.size
@@ -917,7 +931,7 @@ def wilcoxon_test(
             ) -> tuple[int, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
                 mask = pert_masks[label]
                 group_values = log_block[mask, :]
-                group_expr = np.asarray(np.count_nonzero(raw_block[mask], axis=0))
+                group_expr = np.asarray(np.count_nonzero(group_values, axis=0))
                 group_mean = (
                     group_values.mean(axis=0, dtype=np.float64)
                     if group_values.size
