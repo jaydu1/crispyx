@@ -12,7 +12,7 @@ set -e  # Exit on error
 # Configuration
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
-PYTHON_ENV="/data/miniforge3/envs/pert/bin/python"
+PYTHON_ENV="${PYTHON_ENV:-$(command -v python)}"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 LOG_DIR="${SCRIPT_DIR}/logs"
 MAIN_LOG="${LOG_DIR}/${TIMESTAMP}_benchmark.log"

@@ -393,11 +393,15 @@ class _ToolsNamespace:
             return result.result
 
         if normalised == "t_test":
-            allowed = {"min_cells_expressed", "chunk_size", "n_jobs"}
+            allowed = {"min_cells_expressed", "cell_chunk_size", "n_jobs"}
             unexpected = set(kwargs) - allowed
             if unexpected:
                 raise TypeError(
-                    "Unexpected keyword arguments for t_test method: %s"
+                    (
+                        "Unexpected keyword arguments for t_test method: %s. "
+                        "Supported options include cell_chunk_size (cells per chunk), "
+                        "min_cells_expressed, and n_jobs; perturbation_chunk_size is not yet supported."
+                    )
                     % ", ".join(sorted(unexpected))
                 )
             method_kwargs = {key: kwargs[key] for key in allowed if key in kwargs}

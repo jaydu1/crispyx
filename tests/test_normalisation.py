@@ -141,7 +141,7 @@ def test_t_test_matches_scanpy(small_adata, tmp_path):
         perturbation_column="perturbation",
         control_label="ctrl",
         gene_name_column="gene_symbols",
-        chunk_size=2,
+        cell_chunk_size=2,
         output_dir=tmp_path,
     )
 
@@ -264,7 +264,7 @@ def test_t_test_with_n_jobs(small_adata, tmp_path):
         perturbation_column="perturbation",
         control_label="ctrl",
         gene_name_column="gene_symbols",
-        chunk_size=2,
+        cell_chunk_size=2,
         output_dir=tmp_path,
         data_name="parallel",
         n_jobs=2,
@@ -276,7 +276,7 @@ def test_t_test_with_n_jobs(small_adata, tmp_path):
         perturbation_column="perturbation",
         control_label="ctrl",
         gene_name_column="gene_symbols",
-        chunk_size=2,
+        cell_chunk_size=2,
         output_dir=tmp_path,
         data_name="serial",
         n_jobs=1,

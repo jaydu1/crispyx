@@ -278,7 +278,7 @@ def test_differential_expression_matches_scanpy(subset_dataset, tmp_path):
         perturbation_column=PERTURBATION_COLUMN,
         control_label=control_label,
         gene_name_column="gene_symbols",
-        chunk_size=CHUNK_SIZE,
+        cell_chunk_size=CHUNK_SIZE,
         output_dir=tmp_path,
         data_name="scanpy_parity",
     )
