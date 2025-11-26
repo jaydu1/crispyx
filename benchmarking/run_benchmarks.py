@@ -20,6 +20,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Union
 import numpy as np
 import pandas as pd
 import yaml
+import anndata as ad
 from tqdm import tqdm
 
 # Ensure the local package is importable when the project has not been installed.
@@ -52,7 +53,7 @@ from crispyx.qc import quality_control_summary
 
 
 # ============================================================================
-# Scanpy validation utilities
+# Reference Method Runners
 # ============================================================================
 
 import importlib
@@ -64,129 +65,6 @@ from crispyx.data import (
     normalize_total_block,
 )
 from crispyx.de import _tie_correction
-
-
-# Cache for scanpy comparison results to avoid reloading data multiple times
-_SCANPY_COMPARISON_CACHE: Dict[str, Any] = {}
-
-# Cache for prepared reference AnnData objects (used by Pertpy and Scanpy DE comparisons)
-_REFERENCE_ANNDATA_CACHE: Dict[str, Any] = {}
-
-# Global cache for loaded scanpy reference data to avoid reloading for multiple comparisons
-_SCANPY_REFERENCE_CACHE: Dict[str, Any] = {}
-
-
-def clear_scanpy_cache():
-    """Clear the cached scanpy reference data."""
-    global _SCANPY_REFERENCE_CACHE
-    _SCANPY_REFERENCE_CACHE.clear()
-
-
-def _run_crispyx_t_test_with_qc(
-    path: Path,
-    *,
-    min_genes: int,
-    min_cells_per_gene: int,
-    min_cells_per_perturbation: int,
-    chunk_size: int,
-    perturbation_column: str,
-    control_label: str,
-    gene_name_column: str,
-    output_dir: Path,
-    preprocessing_dir: Path,
-    data_name: str,
-    n_jobs: int | None = None,
-):
-    """Apply QC filters before running the CRISPYx t-test benchmark."""
-
-    preprocessing_dir.mkdir(parents=True, exist_ok=True)
-
-    qc_result = quality_control_summary(
-        path,
-        min_genes=min_genes,
-        min_cells_per_perturbation=min_cells_per_perturbation,
-        min_cells_per_gene=min_cells_per_gene,
-        perturbation_column=perturbation_column,
-        control_label=control_label,
-        gene_name_column=gene_name_column,
-        chunk_size=chunk_size,
-        output_dir=preprocessing_dir,
-        data_name="qc_filtered",
-    )
-
-    return t_test(
-        qc_result.filtered_path,
-        perturbation_column=perturbation_column,
-        control_label=control_label,
-        gene_name_column=gene_name_column,
-        chunk_size=chunk_size,
-        output_dir=output_dir,
-        data_name=data_name,
-        n_jobs=n_jobs,
-    )
-
-
-@dataclass
-class ComparisonResult:
-    """Summary of how the streamlined pipeline compares to a Scanpy-style workflow."""
-
-    normalization_max_abs_diff: float
-    log1p_max_abs_diff: float
-    streamlined_cell_count: int
-    reference_cell_count: int
-    streamlined_gene_count: int
-    reference_gene_count: int
-    avg_log_effect_max_abs_diff: float
-    pseudobulk_effect_max_abs_diff: float
-    wald_metrics: Mapping[str, Optional[float]]
-    wilcoxon_metrics: Mapping[str, Optional[float]]
-    streamlined_peak_memory_mb: float
-    streamlined_avg_memory_mb: Optional[float]
-    reference_peak_memory_mb: float
-    reference_avg_memory_mb: Optional[float]
-    streamlined_timings: Mapping[str, float]
-    reference_timings: Mapping[str, float]
-    streamlined_effects: Mapping[str, pd.DataFrame]
-    reference_effects: Mapping[str, pd.DataFrame]
-
-    @property
-    def wald_effect_max_abs_diff(self) -> Optional[float]:
-        return self.wald_metrics.get("effect_max_abs_diff")
-
-    @property
-    def wald_statistic_max_abs_diff(self) -> Optional[float]:
-        return self.wald_metrics.get("statistic_max_abs_diff")
-
-    @property
-    def wald_pvalue_max_abs_diff(self) -> Optional[float]:
-        return self.wald_metrics.get("pvalue_max_abs_diff")
-
-    @property
-    def wilcoxon_effect_max_abs_diff(self) -> Optional[float]:
-        return self.wilcoxon_metrics.get("effect_max_abs_diff")
-
-    @property
-    def wilcoxon_statistic_max_abs_diff(self) -> Optional[float]:
-        return self.wilcoxon_metrics.get("statistic_max_abs_diff")
-
-    @property
-    def wilcoxon_pvalue_max_abs_diff(self) -> Optional[float]:
-        return self.wilcoxon_metrics.get("pvalue_max_abs_diff")
-
-
-@dataclass
-class _ReferenceComputationResult:
-    normalization_max_abs_diff: float
-    log1p_max_abs_diff: float
-    filtered_cell_count: int
-    filtered_gene_count: int
-    avg_log_effects: pd.DataFrame
-    pseudobulk_effects: pd.DataFrame
-    wald_results: Dict[str, Dict[str, np.ndarray]]
-    wilcoxon_results: Dict[str, Dict[str, np.ndarray]]
-    timings: Dict[str, float]
-    stream_chunk_timing: float
-    peak_memory_mb: float
 
 
 def _get_peak_memory_bytes() -> float:
@@ -264,6 +142,83 @@ def _peak_memory_delta_mb(baseline_bytes: float) -> float:
     return max(0.0, (_get_peak_memory_bytes() - baseline_bytes) / (1024.0 * 1024.0))
 
 
+# Global flag to track if current RSS warning has been logged
+_CURRENT_RSS_WARNING_LOGGED = False
+
+
+def _get_current_rss_bytes() -> Optional[float]:
+    """Return the current process RSS in bytes (not peak).
+    
+    Platform-specific implementation:
+    - Linux: Reads /proc/self/statm (VmRSS field)
+    - macOS: Falls back to peak RSS (ru_maxrss) - not true current
+    - Windows: Attempts psutil if available
+    
+    Returns
+    -------
+    float | None
+        Current RSS in bytes, or None if unavailable
+        
+    Notes
+    -----
+    On macOS, this function returns peak RSS (same as _get_peak_memory_bytes())
+    because macOS lacks a direct API for current RSS without psutil.
+    A warning is logged once when this limitation is detected.
+    Users should install psutil for accurate average memory tracking on macOS.
+    """
+    global _CURRENT_RSS_WARNING_LOGGED
+    
+    if sys.platform.startswith('linux'):
+        # Linux: Read /proc/self/statm
+        # Format: size resident shared text lib data dt
+        # We want resident (field 2), which is in pages
+        try:
+            with open('/proc/self/statm', 'r') as f:
+                fields = f.readline().split()
+                if len(fields) >= 2:
+                    resident_pages = int(fields[1])
+                    page_size = resource.getpagesize()
+                    return float(resident_pages * page_size)
+        except (IOError, OSError, ValueError) as exc:
+            if not _CURRENT_RSS_WARNING_LOGGED:
+                print(f"Warning: Failed to read /proc/self/statm for current RSS: {exc}")
+                _CURRENT_RSS_WARNING_LOGGED = True
+            return None
+    
+    elif sys.platform == 'darwin':
+        # macOS: No direct current RSS API without psutil
+        # Fall back to peak RSS (ru_maxrss)
+        if not _CURRENT_RSS_WARNING_LOGGED:
+            print("Warning: macOS does not support current RSS without psutil. "
+                  "Average memory will equal peak memory. Install psutil for accurate tracking.")
+            _CURRENT_RSS_WARNING_LOGGED = True
+        return _get_peak_memory_bytes()
+    
+    elif sys.platform == 'win32':
+        # Windows: Try psutil if available
+        try:
+            import psutil
+            process = psutil.Process()
+            return float(process.memory_info().rss)
+        except ImportError:
+            if not _CURRENT_RSS_WARNING_LOGGED:
+                print("Warning: psutil not available on Windows for current RSS. "
+                      "Average memory tracking unavailable.")
+                _CURRENT_RSS_WARNING_LOGGED = True
+            return None
+        except Exception as exc:
+            if not _CURRENT_RSS_WARNING_LOGGED:
+                print(f"Warning: Failed to get current RSS via psutil: {exc}")
+                _CURRENT_RSS_WARNING_LOGGED = True
+            return None
+    
+    # Unknown platform
+    if not _CURRENT_RSS_WARNING_LOGGED:
+        print(f"Warning: Platform {sys.platform} not supported for current RSS tracking.")
+        _CURRENT_RSS_WARNING_LOGGED = True
+    return None
+
+
 def _sample_memory_continuously(
     stop_event: threading.Event,
     memory_samples: list,
@@ -271,18 +226,21 @@ def _sample_memory_continuously(
 ) -> None:
     """Background thread function to sample memory usage continuously.
     
+    Samples current RSS (not peak) for accurate average memory calculation.
+    On platforms where current RSS is unavailable, samples will be None.
+    
     Parameters
     ----------
     stop_event : threading.Event
         Event to signal when to stop sampling
     memory_samples : list
-        List to store memory samples (in MB)
+        List to store memory samples in bytes (float or None)
     sample_interval : float
         Time interval between samples in seconds (default: 0.1)
     """
     while not stop_event.is_set():
-        memory_mb = _get_peak_memory_mb()
-        memory_samples.append(memory_mb)
+        current_rss_bytes = _get_current_rss_bytes()
+        memory_samples.append(current_rss_bytes)
         time.sleep(sample_interval)
 
 
@@ -391,62 +349,6 @@ def _load_into_memory(path: Path, use_cache: bool = True):
     return adata
 
 
-def _compute_reference_effects(
-    adata,
-    *,
-    perturbation_column: str,
-    control_label: str,
-    baseline_count: float,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    import scipy.sparse as sp
-    
-    labels = adata.obs[perturbation_column].astype(str).values
-    unique_labels = np.unique(labels)
-    
-    # Compute group means directly on sparse matrices
-    # This is much more memory efficient than converting to dense DataFrame
-    log_means_dict = {}
-    for label in unique_labels:
-        mask = labels == label
-        if sp.issparse(adata.X):
-            group_mean = np.asarray(adata.X[mask].mean(axis=0)).flatten()
-        else:
-            group_mean = adata.X[mask].mean(axis=0)
-        log_means_dict[label] = group_mean
-    
-    log_means = pd.DataFrame(log_means_dict, index=adata.var_names).T
-    control_log_mean = log_means.loc[control_label]
-    avg_effects = log_means.drop(index=control_label).subtract(control_log_mean, axis=1)
-
-    # Same approach for normalized counts
-    norm_matrix = adata.layers["normalized_counts"]
-    norm_means_dict = {}
-    for label in unique_labels:
-        mask = labels == label
-        if sp.issparse(norm_matrix):
-            group_mean = np.asarray(norm_matrix[mask].mean(axis=0)).flatten()
-        else:
-            group_mean = norm_matrix[mask].mean(axis=0)
-        norm_means_dict[label] = group_mean
-    
-    norm_means = pd.DataFrame(norm_means_dict, index=adata.var_names).T
-    control_bulk = np.log1p(baseline_count * norm_means.loc[control_label])
-    pert_bulk = np.log1p(baseline_count * norm_means.drop(index=control_label))
-    pseudo_effects = pert_bulk.subtract(control_bulk, axis=1)
-    return avg_effects, pseudo_effects
-
-
-def _align_frames(left: pd.DataFrame, right: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
-    left_aligned = left.sort_index().sort_index(axis=1)
-    right_aligned = right.sort_index().sort_index(axis=1)
-    common_rows = left_aligned.index.intersection(right_aligned.index)
-    common_cols = left_aligned.columns.intersection(right_aligned.columns)
-    return (
-        left_aligned.loc[common_rows, common_cols],
-        right_aligned.loc[common_rows, common_cols],
-    )
-
-
 def _normalise_metric_array(values: object, length: int) -> np.ndarray:
     if length == 0:
         return np.array([], dtype=float)
@@ -487,536 +389,256 @@ def _stream_results_to_frame(results: Mapping[str, object]) -> pd.DataFrame:
     return pd.DataFrame(columns=columns)
 
 
-def _reference_results_to_frame(reference: Mapping[str, Dict[str, np.ndarray]]) -> pd.DataFrame:
-    columns = ["perturbation", "gene", "effect_size", "statistic", "pvalue"]
-    frames: list[pd.DataFrame] = []
-    for label, payload in reference.items():
-        genes = payload.get("genes")
-        if genes is None:
-            continue
-        gene_index = pd.Index(genes).astype(str)
-        n_genes = len(gene_index)
-        if n_genes == 0:
-            continue
-        data = {
-            "perturbation": [str(label)] * n_genes,
-            "gene": gene_index,
-            "effect_size": _normalise_metric_array(payload.get("effect"), n_genes),
-            "statistic": _normalise_metric_array(payload.get("statistic"), n_genes),
-            "pvalue": _normalise_metric_array(payload.get("pvalue"), n_genes),
-        }
-        frames.append(pd.DataFrame(data))
-    if frames:
-        return pd.concat(frames, ignore_index=True)
-    return pd.DataFrame(columns=columns)
-
-
-def _resolve_reference_candidates(
-    labels: np.ndarray,
-    control_label: str,
-    perturbations: Optional[Iterable[str]],
-) -> list[str]:
-    if perturbations is None:
-        unique = pd.Index(labels).unique().tolist()
-    else:
-        unique = [str(p) for p in perturbations]
-    candidates = [label for label in unique if label != control_label]
-    if not candidates:
-        raise ValueError(
-            "No perturbation groups available for differential expression testing"
-        )
-    return candidates
-
-
-def _compute_reference_wald(
-    adata,
+def run_scanpy_qc(
+    dataset_path: Path,
     *,
-    perturbation_column: str,
-    control_label: str,
-    gene_name_column: str | None,
-    perturbations: Optional[Iterable[str]],
-    min_cells_expressed: int,
-) -> Dict[str, Dict[str, np.ndarray]]:
-    labels = adata.obs[perturbation_column].astype(str).to_numpy()
-    candidates = _resolve_reference_candidates(labels, control_label, perturbations)
-    gene_symbols = ensure_gene_symbol_column(adata, gene_name_column)
-
-    log_matrix = np.asarray(adata.X, dtype=np.float64)
-    norm_matrix = np.asarray(adata.layers["normalized_counts"], dtype=np.float64)
-
-    control_mask = labels == control_label
-    control_n = int(control_mask.sum())
-    if control_n == 0:
-        raise ValueError("Control group contains no cells")
-
-    control_log = log_matrix[control_mask]
-    control_mean = control_log.mean(axis=0)
-    control_var = np.zeros_like(control_mean)
-    if control_n > 1:
-        control_var = control_log.var(axis=0, ddof=1)
-    control_var = np.clip(control_var, a_min=0, a_max=None)
-
-    control_expr = np.count_nonzero(norm_matrix[control_mask], axis=0)
-
-    results: Dict[str, Dict[str, np.ndarray]] = {}
-    for label in candidates:
-        mask = labels == label
-        n_cells = int(mask.sum())
-        if n_cells == 0:
-            raise ValueError(f"Perturbation '{label}' contains no cells")
-        group_log = log_matrix[mask]
-        group_mean = group_log.mean(axis=0)
-        group_var = np.zeros_like(group_mean)
-        if n_cells > 1:
-            group_var = group_log.var(axis=0, ddof=1)
-        group_var = np.clip(group_var, a_min=0, a_max=None)
-        effect = group_mean - control_mean
-        se = np.sqrt(control_var / control_n + group_var / n_cells)
-        expr_group = np.count_nonzero(norm_matrix[mask], axis=0)
-        total_expr = control_expr + expr_group
-        valid = (se > 0) & (total_expr >= min_cells_expressed)
-        z = np.zeros_like(effect)
-        pvalue = np.ones_like(effect)
-        if np.any(valid):
-            z[valid] = effect[valid] / se[valid]
-            pvalue[valid] = 2 * norm.sf(np.abs(z[valid]))
-        results[label] = {
-            "genes": gene_symbols,
-            "effect": effect,
-            "statistic": z,
-            "pvalue": pvalue,
-        }
-    return results
-
-
-def _compute_reference_wilcoxon(
-    adata,
-    *,
-    perturbation_column: str,
-    control_label: str,
-    gene_name_column: str | None,
-    perturbations: Optional[Iterable[str]],
-    min_cells_expressed: int,
-) -> Dict[str, Dict[str, np.ndarray]]:
-    labels = adata.obs[perturbation_column].astype(str).to_numpy()
-    candidates = _resolve_reference_candidates(labels, control_label, perturbations)
-    gene_symbols = ensure_gene_symbol_column(adata, gene_name_column)
-
-    log_matrix = np.asarray(adata.X, dtype=np.float64)
-    norm_matrix = np.asarray(adata.layers["normalized_counts"], dtype=np.float64)
-
-    control_mask = labels == control_label
-    control_n = int(control_mask.sum())
-    if control_n == 0:
-        raise ValueError("Control group contains no cells")
-
-    control_log = log_matrix[control_mask]
-    control_norm = norm_matrix[control_mask]
-    control_expr = np.count_nonzero(control_norm, axis=0)
-
-    results: Dict[str, Dict[str, np.ndarray]] = {}
-    for label in candidates:
-        mask = labels == label
-        n_cells = int(mask.sum())
-        if n_cells == 0:
-            raise ValueError(f"Perturbation '{label}' contains no cells")
-
-        pert_log = log_matrix[mask]
-        pert_norm = norm_matrix[mask]
-        pert_expr = np.count_nonzero(pert_norm, axis=0)
-        total_expr = control_expr + pert_expr
-
-        combined = np.vstack((pert_log, control_log))
-        ranks = rankdata(combined, axis=0)
-        rank_sum = ranks[:n_cells].sum(axis=0)
-        tie = _tie_correction(ranks)
-
-        expected = n_cells * (n_cells + control_n + 1.0) / 2.0
-        std = np.sqrt(tie * n_cells * control_n * (n_cells + control_n + 1.0) / 12.0)
-        u_stat = rank_sum - n_cells * (n_cells + 1.0) / 2.0
-
-        valid = (std > 0) & (total_expr >= min_cells_expressed)
-
-        effect = np.zeros(adata.n_vars, dtype=np.float64)
-        z = np.zeros_like(effect)
-        pvalue = np.ones_like(effect)
-
-        with np.errstate(divide="ignore", invalid="ignore"):
-            z[valid] = (rank_sum[valid] - expected) / std[valid]
-        pvalue[valid] = 2.0 * norm.sf(np.abs(z[valid]))
-        effect[valid] = u_stat[valid] / (n_cells * control_n) - 0.5
-
-        results[label] = {
-            "genes": gene_symbols,
-            "effect": effect,
-            "statistic": z,
-            "pvalue": pvalue,
-        }
-
-    return results
-
-
-def _compute_reference_pipeline(
-    path: Path,
-    *,
-    perturbation_column: str,
-    control_label: str,
     min_genes: int,
     min_cells_per_perturbation: int,
     min_cells_per_gene: int,
-    gene_name_column: str | None,
-    perturbations: Optional[Iterable[str]],
-    baseline_count: float,
-    chunk_size: int,
-    de_min_cells_expressed: int,
-    skip_de: bool = False,
-    use_cache: bool = True,
-) -> _ReferenceComputationResult:
-    baseline_bytes = _get_peak_memory_bytes()
-    timings_reference: Dict[str, float] = {}
+    perturbation_column: str,
+    control_label: str,
+    output_dir: Path,
+) -> Dict[str, Any]:
+    """Run Scanpy QC pipeline and save filtered dataset."""
+    import scanpy as sc
+    import scipy.sparse as sp
+    
+    adata = sc.read_h5ad(str(dataset_path))
+    
+    # Ensure CSR
+    if sp.issparse(adata.X) and not sp.isspmatrix_csr(adata.X):
+        adata.X = adata.X.tocsr()
+        
+    # Filter cells
+    if min_genes > 0:
+        sc.pp.filter_cells(adata, min_genes=min_genes)
+        
+    # Filter perturbations
+    if min_cells_per_perturbation > 0:
+        labels = adata.obs[perturbation_column].astype(str)
+        counts = labels.value_counts()
+        keep = labels.eq(control_label) | counts.loc[labels].ge(min_cells_per_perturbation).to_numpy()
+        adata = adata[keep].copy()
+        
+    # Filter genes
+    if min_cells_per_gene > 0:
+        sc.pp.filter_genes(adata, min_cells=min_cells_per_gene)
+        
+    # Save result
+    output_path = output_dir / "scanpy_qc_filtered.h5ad"
+    adata.write_h5ad(output_path)
+    
+    return {
+        "result_path": str(output_path),
+        "cells_kept": adata.n_obs,
+        "genes_kept": adata.n_vars,
+    }
 
-    raw = _load_into_memory(path, use_cache=use_cache)
-    reference_norm = raw.copy()
-
-    t0 = time.perf_counter()
-    normalised_matrix, _ = _normalize_total(reference_norm.X)
-    timings_reference["normalize_total"] = time.perf_counter() - t0
-    reference_norm.X = normalised_matrix
-
-    t0 = time.perf_counter()
-    log_matrix = _log1p(reference_norm.X)
-    timings_reference["log1p"] = time.perf_counter() - t0
-    reference_norm.X = log_matrix
-
-    max_norm_diff = 0.0
-    max_log_diff = 0.0
-    t0 = time.perf_counter()
-    backed = read_backed(path)
-    try:
-        for slc, block in iter_matrix_chunks(
-            backed, axis=0, chunk_size=chunk_size, convert_to_dense=False
-        ):
-            norm_block, _ = normalize_total_block(block)
-            max_norm_diff = max(
-                max_norm_diff, float(np.max(np.abs(norm_block - normalised_matrix[slc])))
-            )
-            log_block = np.log1p(norm_block)
-            max_log_diff = max(
-                max_log_diff, float(np.max(np.abs(log_block - log_matrix[slc])))
-            )
-    finally:
-        backed.file.close()
-    stream_chunk_timing = time.perf_counter() - t0
-
-    reference_filtered = raw.copy()
-    t0 = time.perf_counter()
-    cell_mask = _filter_cells(reference_filtered.X, min_genes=min_genes)
-    timings_reference["filter_cells"] = time.perf_counter() - t0
-    reference_filtered = reference_filtered[cell_mask].copy()
-
-    labels = reference_filtered.obs[perturbation_column].astype(str)
-    counts = labels.value_counts()
-    keep_mask = labels.eq(control_label) | counts.loc[labels].ge(min_cells_per_perturbation).to_numpy()
-    reference_filtered = reference_filtered[keep_mask].copy()
-
-    t0 = time.perf_counter()
-    gene_mask = _filter_genes(reference_filtered.X, min_cells=min_cells_per_gene)
-    timings_reference["filter_genes"] = time.perf_counter() - t0
-    reference_filtered = reference_filtered[:, gene_mask].copy()
-
-    t0 = time.perf_counter()
-    ref_norm_matrix, _ = _normalize_total(reference_filtered.X)
-    timings_reference["filtered_normalize_total"] = time.perf_counter() - t0
-    reference_filtered.layers["normalized_counts"] = ref_norm_matrix
-    reference_filtered.X = ref_norm_matrix
-
-    t0 = time.perf_counter()
-    reference_filtered.X = _log1p(reference_filtered.X)
-    timings_reference["filtered_log1p"] = time.perf_counter() - t0
-
-    t0 = time.perf_counter()
-    reference_avg, reference_pseudo = _compute_reference_effects(
-        reference_filtered,
-        perturbation_column=perturbation_column,
-        control_label=control_label,
-        baseline_count=baseline_count,
-    )
-    timings_reference["pseudobulk"] = time.perf_counter() - t0
-
-    # Conditionally run DE tests
-    if skip_de:
-        reference_wald = {}
-        reference_wilcoxon = {}
-        timings_reference["t_test"] = 0.0
-        timings_reference["wilcoxon_test"] = 0.0
-    else:
-        t0 = time.perf_counter()
-        reference_wald = _compute_reference_wald(
-            reference_filtered,
-            perturbation_column=perturbation_column,
-            control_label=control_label,
-            gene_name_column=gene_name_column,
-            perturbations=perturbations,
-            min_cells_expressed=de_min_cells_expressed,
-        )
-        timings_reference["t_test"] = time.perf_counter() - t0
-
-        t0 = time.perf_counter()
-        reference_wilcoxon = _compute_reference_wilcoxon(
-            reference_filtered,
-            perturbation_column=perturbation_column,
-            control_label=control_label,
-            gene_name_column=gene_name_column,
-            perturbations=perturbations,
-            min_cells_expressed=de_min_cells_expressed,
-        )
-        timings_reference["wilcoxon_test"] = time.perf_counter() - t0
-
-    peak_memory_mb = _peak_memory_delta_mb(baseline_bytes)
-
-    return _ReferenceComputationResult(
-        normalization_max_abs_diff=max_norm_diff,
-        log1p_max_abs_diff=max_log_diff,
-        filtered_cell_count=reference_filtered.n_obs,
-        filtered_gene_count=reference_filtered.n_vars,
-        avg_log_effects=reference_avg,
-        pseudobulk_effects=reference_pseudo,
-        wald_results=reference_wald,
-        wilcoxon_results=reference_wilcoxon,
-        timings=timings_reference,
-        stream_chunk_timing=stream_chunk_timing,
-        peak_memory_mb=peak_memory_mb,
-    )
-
-
-def compare_with_scanpy(
-    path: str | Path,
+def run_scanpy_de(
+    dataset_path: Path,
     *,
     perturbation_column: str,
-    control_label: str | None = None,
-    min_genes: int = 100,
-    min_cells_per_perturbation: int = 50,
-    min_cells_per_gene: int = 100,
-    gene_name_column: str | None = None,
-    perturbations: Optional[Iterable[str]] = None,
-    baseline_count: float = 1.0,
-    chunk_size: int = 2048,
-    output_dir: str | Path | None = None,
-    data_name: str | None = None,
-    skip_de: bool = False,
-) -> ComparisonResult:
-    """Run the streamlined pipeline and compare each step to a Scanpy-style workflow.
+    control_label: str,
+    method: str,
+    output_dir: Path,
+    preprocess: bool = True,
+) -> Dict[str, Any]:
+    """Run Scanpy DE on filtered dataset."""
+    import scanpy as sc
     
-    Parameters
-    ----------
-    skip_de : bool
-        If True, skip differential expression (wald and wilcoxon) tests to save time.
-        Only QC and preprocessing comparisons will be performed.
-    """
-    import anndata as ad
+    adata = sc.read_h5ad(str(dataset_path))
+    
+    # Preprocessing
+    if preprocess:
+        sc.pp.normalize_total(adata)
+        sc.pp.log1p(adata)
+    
+    # DE
+    sc.tl.rank_genes_groups(
+        adata,
+        groupby=perturbation_column,
+        method=method,
+        reference=control_label,
+        n_genes=adata.n_vars,
+    )
+    
+    df = sc.get.rank_genes_groups_df(adata, None)
+    
+    # Rename 'group' to perturbation_column if present
+    if "group" in df.columns:
+        df = df.rename(columns={"group": perturbation_column})
+        
+    output_path = output_dir / f"scanpy_de_{method.replace('-', '_')}.csv"
+    df.to_csv(output_path, index=False)
+    
+    return {
+        "result_path": str(output_path),
+        "groups": len(df[perturbation_column].unique()) if not df.empty else 0,
+    }
 
-    path = Path(path)
-
-    timings_streamlined: Dict[str, float] = {}
-    de_min_cells_expressed = 0
-
-    backed = read_backed(path)
-    try:
-        if perturbation_column not in backed.obs.columns:
-            raise KeyError(
-                f"Perturbation column '{perturbation_column}' was not found in adata.obs. Available columns: {list(backed.obs.columns)}"
+def run_edger_de(
+    dataset_path: Path,
+    *,
+    perturbation_column: str,
+    control_label: str,
+    output_dir: Path,
+    n_jobs: int | None = None,
+) -> Dict[str, Any]:
+    """Run edgeR DE on filtered dataset."""
+    import os
+    from benchmarking.env_config import get_global_env_config
+    
+    # Configure R
+    env_config = get_global_env_config()
+    r_home = env_config.r_home if env_config else None
+    if r_home is None and 'R_HOME' not in os.environ:
+        r_home = '/data/miniforge3/envs/pert/lib/R'
+    configure_r_environment(r_home)
+    
+    import scanpy as sc
+    from rpy2 import robjects as ro
+    from rpy2.robjects import numpy2ri
+    from rpy2.robjects.conversion import localconverter
+    
+    adata = sc.read_h5ad(str(dataset_path))
+    
+    groups = adata.obs[perturbation_column].astype(str).values
+    unique_groups = [g for g in np.unique(groups) if g != control_label]
+    
+    if not unique_groups:
+        raise ValueError("No perturbation groups found")
+        
+    # R setup
+    n_threads = n_jobs if n_jobs is not None and n_jobs > 0 else 1
+    ro.r('library(edgeR)')
+    ro.r(f'''
+    tryCatch({{
+        library(RhpcBLASctl)
+        blas_set_num_threads({n_threads})
+        omp_set_num_threads({n_threads})
+    }}, error=function(e) {{ }})
+    ''')
+    
+    # Convert data
+    counts = adata.X.T
+    if hasattr(counts, 'toarray'):
+        counts = counts.toarray()
+        
+    with localconverter(ro.default_converter + numpy2ri.converter):
+        ro.globalenv['counts'] = counts
+        ro.globalenv['groups'] = ro.StrVector(groups)
+        ro.globalenv['gene_names'] = ro.StrVector(adata.var_names)
+        
+        ro.r('''
+        rownames(counts) <- gene_names
+        y <- DGEList(counts=counts, group=groups)
+        y <- calcNormFactors(y)
+        design <- model.matrix(~0 + groups)
+        colnames(design) <- gsub("groups", "", colnames(design))
+        y <- estimateDisp(y, design)
+        fit <- glmQLFit(y, design)
+        ''')
+        
+        all_results = []
+        for group in unique_groups:
+            ro.globalenv['target_group'] = group
+            ro.globalenv['control'] = control_label
+            
+            ro.r('''
+            contrast_vec <- makeContrasts(
+                contrasts = paste0(target_group, "-", control),
+                levels = design
             )
-        labels = backed.obs[perturbation_column].astype(str).to_numpy()
-        control_label = resolve_control_label(labels, control_label)
-    finally:
-        backed.file.close()
+            lrt <- glmQLFTest(fit, contrast=contrast_vec)
+            ''')
+            
+            genes = np.array(ro.r('rownames(lrt$table)'))
+            logFC = np.array(ro.r('lrt$table$logFC'))
+            logCPM = np.array(ro.r('lrt$table$logCPM'))
+            F_stat = np.array(ro.r('lrt$table$F'))
+            PValue = np.array(ro.r('lrt$table$PValue'))
+            FDR = np.array(ro.r('p.adjust(lrt$table$PValue, method="BH")'))
+            
+            all_results.append(pd.DataFrame({
+                'gene': genes,
+                'logFC': logFC,
+                'logCPM': logCPM,
+                'F': F_stat,
+                'PValue': PValue,
+                'FDR': FDR,
+                'perturbation': group
+            }))
+            
+    final_results = pd.concat(all_results, ignore_index=True)
+    output_path = output_dir / "edger_de_glm.csv"
+    final_results.to_csv(output_path, index=False)
+    
+    return {
+        "result_path": str(output_path),
+        "groups": len(unique_groups),
+    }
 
-    baseline_bytes = _get_peak_memory_bytes()
-
-    # Streamlined QC and effect estimation
-    t0 = time.perf_counter()
-    qc_result = quality_control_summary(
-        path,
-        min_genes=min_genes,
-        min_cells_per_perturbation=min_cells_per_perturbation,
-        min_cells_per_gene=min_cells_per_gene,
-        perturbation_column=perturbation_column,
-        control_label=control_label,
-        gene_name_column=gene_name_column,
-        chunk_size=chunk_size,
-        output_dir=output_dir,
-        data_name="qc",
-    )
-    timings_streamlined["quality_control"] = time.perf_counter() - t0
-    streamlined_filtered = ad.read_h5ad(str(qc_result.filtered_path))
-
-    t0 = time.perf_counter()
-    avg_log_effects_handle = compute_average_log_expression(
-        qc_result.filtered_path,
-        perturbation_column=perturbation_column,
-        control_label=control_label,
-        gene_name_column=gene_name_column,
-        perturbations=perturbations,
-        chunk_size=chunk_size,
-        output_dir=output_dir,
-        data_name="pb",
-    )
-    avg_log_mem = avg_log_effects_handle.to_memory()
-    avg_log_effects = pd.DataFrame(
-        avg_log_mem.X,
-        index=avg_log_mem.obs.index,
-        columns=avg_log_mem.var_names,
-    )
-    avg_log_effects_handle.close()
-    timings_streamlined["average_log_expression"] = time.perf_counter() - t0
-
-    t0 = time.perf_counter()
-    pseudobulk_effects_handle = compute_pseudobulk_expression(
-        qc_result.filtered_path,
-        perturbation_column=perturbation_column,
-        control_label=control_label,
-        gene_name_column=gene_name_column,
-        perturbations=perturbations,
-        baseline_count=baseline_count,
-        chunk_size=chunk_size,
-        output_dir=output_dir,
-        data_name="pb",
-    )
-    pseudobulk_mem = pseudobulk_effects_handle.to_memory()
-    pseudobulk_effects = pd.DataFrame(
-        pseudobulk_mem.X,
-        index=pseudobulk_mem.obs.index,
-        columns=pseudobulk_mem.var_names,
-    )
-    pseudobulk_effects_handle.close()
-    timings_streamlined["pseudobulk_expression"] = time.perf_counter() - t0
-
-    # Conditionally run DE tests
-    if skip_de:
-        # Skip DE tests - set empty results
-        wald_results = {}
-        wilcoxon_results = {}
-        timings_streamlined["t_test"] = 0.0
-        timings_streamlined["wilcoxon_test"] = 0.0
-    else:
-        t0 = time.perf_counter()
-        wald_results = t_test(
-            qc_result.filtered_path,
-            perturbation_column=perturbation_column,
-            control_label=control_label,
-            gene_name_column=gene_name_column,
-            perturbations=perturbations,
-            min_cells_expressed=de_min_cells_expressed,
-            chunk_size=chunk_size,
-            output_dir=output_dir,
-            data_name="de",
-        )
-        timings_streamlined["t_test"] = time.perf_counter() - t0
-
-        t0 = time.perf_counter()
-        wilcoxon_results = wilcoxon_test(
-            qc_result.filtered_path,
-            perturbation_column=perturbation_column,
-            control_label=control_label,
-            gene_name_column=gene_name_column,
-            perturbations=perturbations,
-            min_cells_expressed=de_min_cells_expressed,
-            chunk_size=chunk_size,
-            output_dir=output_dir,
-            data_name="de",
-        )
-        timings_streamlined["wilcoxon_test"] = time.perf_counter() - t0
-
-    streamlined_peak_memory_mb = _peak_memory_delta_mb(baseline_bytes)
-
-    reference_result = _run_in_subprocess(
-        _compute_reference_pipeline,
-        path,
-        perturbation_column=perturbation_column,
-        control_label=control_label,
-        min_genes=min_genes,
-        min_cells_per_perturbation=min_cells_per_perturbation,
-        min_cells_per_gene=min_cells_per_gene,
-        gene_name_column=gene_name_column,
-        perturbations=perturbations,
-        baseline_count=baseline_count,
-        chunk_size=chunk_size,
-        de_min_cells_expressed=de_min_cells_expressed,
-        skip_de=skip_de,
-    )
-    timings_reference = reference_result.timings
-    timings_streamlined["normalize_total+log1p"] = reference_result.stream_chunk_timing
-    reference_peak_memory_mb = reference_result.peak_memory_mb
-
-    max_norm_diff = reference_result.normalization_max_abs_diff
-    max_log_diff = reference_result.log1p_max_abs_diff
-    reference_cell_count = reference_result.filtered_cell_count
-    reference_gene_count = reference_result.filtered_gene_count
-    reference_avg = reference_result.avg_log_effects
-    reference_pseudo = reference_result.pseudobulk_effects
-    reference_wald = reference_result.wald_results
-    reference_wilcoxon = reference_result.wilcoxon_results
-
-
-    aligned_avg, aligned_ref_avg = _align_frames(avg_log_effects, reference_avg)
-    aligned_pseudo, aligned_ref_pseudo = _align_frames(
-        pseudobulk_effects, reference_pseudo
-    )
-
-    avg_diff = float(np.max(np.abs(aligned_avg.to_numpy() - aligned_ref_avg.to_numpy())))
-    pseudo_diff = float(
-        np.max(np.abs(aligned_pseudo.to_numpy() - aligned_ref_pseudo.to_numpy()))
-    )
-
-    # Compute DE metrics only if DE tests were run
-    if skip_de:
-        wald_metrics = {key: None for key in ["effect_max_abs_diff", "statistic_max_abs_diff", "pvalue_max_abs_diff",
-                                                "effect_pearson_corr", "effect_spearman_corr", "effect_top_k_overlap",
-                                                "statistic_pearson_corr", "statistic_spearman_corr", "statistic_top_k_overlap",
-                                                "pvalue_pearson_corr", "pvalue_spearman_corr", "pvalue_top_k_overlap",
-                                                "pvalue_stream_auroc", "pvalue_reference_auroc"]}
-        wilcoxon_metrics = {key: None for key in ["effect_max_abs_diff", "statistic_max_abs_diff", "pvalue_max_abs_diff",
-                                                    "effect_pearson_corr", "effect_spearman_corr", "effect_top_k_overlap",
-                                                    "statistic_pearson_corr", "statistic_spearman_corr", "statistic_top_k_overlap",
-                                                    "pvalue_pearson_corr", "pvalue_spearman_corr", "pvalue_top_k_overlap",
-                                                    "pvalue_stream_auroc", "pvalue_reference_auroc"]}
-    else:
-        wald_stream_df = _stream_results_to_frame(wald_results)
-        wald_reference_df = _reference_results_to_frame(reference_wald)
-        wald_metrics = compute_de_comparison_metrics(wald_stream_df, wald_reference_df)
-
-        wilcoxon_stream_df = _stream_results_to_frame(wilcoxon_results)
-        wilcoxon_reference_df = _reference_results_to_frame(reference_wilcoxon)
-        wilcoxon_metrics = compute_de_comparison_metrics(
-            wilcoxon_stream_df, wilcoxon_reference_df
-        )
-
-    return ComparisonResult(
-        normalization_max_abs_diff=max_norm_diff,
-        log1p_max_abs_diff=max_log_diff,
-        streamlined_cell_count=streamlined_filtered.n_obs,
-        reference_cell_count=reference_cell_count,
-        streamlined_gene_count=streamlined_filtered.n_vars,
-        reference_gene_count=reference_gene_count,
-        avg_log_effect_max_abs_diff=avg_diff,
-        pseudobulk_effect_max_abs_diff=pseudo_diff,
-        wald_metrics=wald_metrics,
-        wilcoxon_metrics=wilcoxon_metrics,
-        streamlined_peak_memory_mb=streamlined_peak_memory_mb,
-        streamlined_avg_memory_mb=None,  # Average memory not tracked for QC comparison
-        reference_peak_memory_mb=reference_peak_memory_mb,
-        reference_avg_memory_mb=None,  # Average memory not tracked for QC comparison
-        streamlined_timings=timings_streamlined,
-        reference_timings=timings_reference,
-        streamlined_effects={
-            "average_log_effects": avg_log_effects,
-            "pseudobulk_effects": pseudobulk_effects,
-        },
-        reference_effects={
-            "average_log_effects": reference_avg,
-            "pseudobulk_effects": reference_pseudo,
-        },
-    )
+def run_pertpy_de(
+    dataset_path: Path,
+    *,
+    perturbation_column: str,
+    control_label: str,
+    backend: str,
+    output_dir: Path,
+    n_jobs: int | None = None,
+) -> Dict[str, Any]:
+    """Run Pertpy DE on filtered dataset."""
+    import pertpy as pt
+    import scanpy as sc
+    
+    adata = sc.read_h5ad(str(dataset_path))
+    
+    # Resolve runner
+    module = getattr(pt, "tools", None)
+    candidate_modules = [
+        getattr(module, "differential_expression", None),
+        module,
+    ]
+    try:
+        candidate_modules.append(import_module("pertpy.tools._differential_gene_expression"))
+    except Exception:
+        pass
+        
+    runner = None
+    for candidate in candidate_modules:
+        if candidate:
+            runner = _resolve_pertpy_runner(candidate, backend) or _resolve_pertpy_class_runner(candidate, backend)
+            if runner: break
+            
+    if not runner:
+        raise ValueError(f"Pertpy runner {backend} not found")
+        
+    # Run
+    kwargs = {"groupby": perturbation_column, "control": control_label}
+    if n_jobs: kwargs["n_cpus"] = n_jobs
+    
+    try:
+        result = runner(adata, **kwargs)
+    except TypeError:
+        # Fallback for different API
+        kwargs = {"group_key": perturbation_column, "control": control_label}
+        if n_jobs: kwargs["n_cpus"] = n_jobs
+        result = runner(adata, **kwargs)
+        
+    df = _convert_reference_result_to_dataframe(result)
+    
+    # Rename 'contrast' to perturbation_column if present (PyDESeq2)
+    if df is not None and "contrast" in df.columns and perturbation_column not in df.columns:
+        df = df.rename(columns={"contrast": perturbation_column})
+        
+    output_path = output_dir / f"pertpy_de_{backend}.csv"
+    if df is not None:
+        df.to_csv(output_path, index=False)
+    
+    return {
+        "result_path": str(output_path),
+        "groups": len(df[perturbation_column].unique()) if df is not None and "perturbation" in df.columns else 0,
+    }
 
 # End of scanpy validation utilities
 # ============================================================================
@@ -1071,6 +693,7 @@ class BenchmarkConfig:
     adaptive_qc_mode: str = "conservative"
     skip_existing: bool = True  # Skip methods with existing output files
     environment_config: Optional[EnvironmentConfig] = None
+    chunk_size: Optional[int] = None  # Override chunk size for all operations
 
     @classmethod
     def from_dict(
@@ -1120,6 +743,7 @@ class BenchmarkConfig:
         force_restandardize = data.get("force_restandardize", False)
         adaptive_qc_mode = data.get("adaptive_qc_mode", "conservative")
         skip_existing = data.get("skip_existing", True)
+        chunk_size = data.get("chunk_size")
 
         return cls(
             dataset_path=dataset_path,
@@ -1138,6 +762,7 @@ class BenchmarkConfig:
             adaptive_qc_mode=adaptive_qc_mode,
             skip_existing=skip_existing,
             environment_config=environment_config,
+            chunk_size=chunk_size,
         )
 
     @classmethod
@@ -1736,11 +1361,11 @@ def _compute_aggregate_statistics(df: pd.DataFrame) -> Dict[str, Any]:
     return summary
 
 
-def _anndata_to_de_dict(adata: Any) -> Dict[str, Any]:
-    """Convert AnnData with DE results to a dictionary of result objects.
+def _anndata_to_de_dict_legacy(adata: Any) -> Dict[str, Any]:
+    """Convert AnnData with DE results to a dictionary of result objects (legacy version - not used).
     
-    Extracts differential expression results from CRISPYx AnnData format
-    where results are stored in layers with obs=perturbations.
+    This function has been replaced by the updated _anndata_to_de_dict with proper
+    sparse matrix handling. Kept for reference only.
     """
     from types import SimpleNamespace
     
@@ -1764,6 +1389,11 @@ def _anndata_to_de_dict(adata: Any) -> Dict[str, Any]:
 def _anndata_to_de_dict(adata) -> Dict[str, Any]:
     """Convert AnnData with DE results to dictionary format.
     
+    Sparse Matrix Handling
+    ----------------------
+    Properly extracts 1D dense arrays from sparse matrices in adata.X and adata.layers.
+    Uses np.asarray() to convert sparse row slices to dense without full matrix densification.
+    
     Parameters
     ----------
     adata : AnnData
@@ -1777,6 +1407,20 @@ def _anndata_to_de_dict(adata) -> Dict[str, Any]:
     """
     from types import SimpleNamespace
     
+    def _extract_row(matrix, idx: int) -> np.ndarray | None:
+        """Extract row from matrix (sparse or dense) as 1D dense array."""
+        if matrix is None:
+            return None
+        if idx >= matrix.shape[0]:
+            return None
+        try:
+            row = matrix[idx, :]
+            # Convert to dense and flatten to 1D
+            # For sparse matrices, this extracts only one row (memory efficient)
+            return np.asarray(row).flatten()
+        except Exception:
+            return None
+    
     stream_result_dict = {}
     
     # crispyx stores results in layers with obs=perturbations
@@ -1786,18 +1430,18 @@ def _anndata_to_de_dict(adata) -> Dict[str, Any]:
         for idx, group in enumerate(perturbations):
             # Determine which statistic layer to use
             if "z_score" in adata.layers:
-                statistic_values = adata.layers["z_score"][idx, :]
+                statistic_values = _extract_row(adata.layers["z_score"], idx)
             elif "statistic" in adata.layers:
-                statistic_values = adata.layers["statistic"][idx, :]
+                statistic_values = _extract_row(adata.layers["statistic"], idx)
             else:
                 statistic_values = None
             
             # Determine which effect size layer/matrix to use
             if "logfoldchange" in adata.layers:
-                effect_size_values = adata.layers["logfoldchange"][idx, :]
-            elif adata.X is not None and adata.X.shape[0] > idx:
+                effect_size_values = _extract_row(adata.layers["logfoldchange"], idx)
+            elif adata.X is not None:
                 # t_test stores effect sizes in .X matrix
-                effect_size_values = adata.X[idx, :] if hasattr(adata.X, '__getitem__') else None
+                effect_size_values = _extract_row(adata.X, idx)
             else:
                 effect_size_values = None
             
@@ -1805,7 +1449,7 @@ def _anndata_to_de_dict(adata) -> Dict[str, Any]:
                 genes=adata.var_names.to_numpy(),
                 effect_size=effect_size_values,
                 statistic=statistic_values,
-                pvalue=adata.layers["pvalue"][idx, :],
+                pvalue=_extract_row(adata.layers["pvalue"], idx),
             )
     # Fallback for Scanpy format
     elif "rank_genes_groups" in adata.uns:
@@ -1817,8 +1461,14 @@ def _anndata_to_de_dict(adata) -> Dict[str, Any]:
             groups = []
         
         for group in groups:
+            # Use names from rank_genes_groups if available, otherwise fallback
+            if "names" in rgg:
+                genes = rgg["names"][group]
+            else:
+                genes = adata.uns.get("genes", adata.var_names.to_numpy())
+
             stream_result_dict[group] = SimpleNamespace(
-                genes=adata.uns.get("genes", adata.var_names.to_numpy()),
+                genes=genes,
                 effect_size=rgg["logfoldchanges"][group] if "logfoldchanges" in rgg else None,
                 statistic=rgg["scores"][group] if "scores" in rgg else None,
                 pvalue=rgg["pvals"][group] if "pvals" in rgg else None,
@@ -1909,188 +1559,7 @@ def _compare_de_frames(
     return compute_de_comparison_metrics(streaming, reference)
 
 
-def _prepare_reference_anndata(
-    dataset_path: Path,
-    *,
-    min_genes: int,
-    min_cells_per_gene: int,
-    min_cells_per_perturbation: int,
-    perturbation_column: str,
-    control_label: str,
-    use_cache: bool = True,
-):
-    """Return a filtered in-memory AnnData object for reference comparisons.
-    
-    Parameters
-    ----------
-    dataset_path : Path
-        Path to the h5ad dataset file
-    min_genes : int
-        Minimum genes per cell
-    min_cells_per_gene : int
-        Minimum cells per gene
-    min_cells_per_perturbation : int
-        Minimum cells per perturbation
-    perturbation_column : str
-        Column name for perturbations
-    control_label : str
-        Label for control group
-    use_cache : bool
-        If True, cache the loaded and filtered AnnData to avoid reloading.
-        Cache is keyed by dataset path and filter parameters.
-    
-    Returns
-    -------
-    ad.AnnData
-        Filtered in-memory AnnData object
-    """
-    global _REFERENCE_ANNDATA_CACHE
-    
-    import scanpy as sc  # Imported lazily to keep runtime dependencies optional
-    import scipy.sparse as sp
-    
-    # Create cache key from parameters
-    cache_key = (
-        str(dataset_path),
-        min_genes,
-        min_cells_per_gene,
-        min_cells_per_perturbation,
-        perturbation_column,
-        control_label,
-    )
-    
-    # Check cache first
-    if use_cache and cache_key in _REFERENCE_ANNDATA_CACHE:
-        return _REFERENCE_ANNDATA_CACHE[cache_key]
 
-    # Load and filter the dataset
-    adata = sc.read_h5ad(str(dataset_path))
-    
-    # Ensure matrix is in CSR format for Scanpy compatibility
-    if sp.issparse(adata.X) and not sp.isspmatrix_csr(adata.X):
-        adata.X = adata.X.tocsr()
-    
-    if min_genes:
-        sc.pp.filter_cells(adata, min_genes=min_genes)
-    if min_cells_per_gene:
-        sc.pp.filter_genes(adata, min_cells=min_cells_per_gene)
-    if min_cells_per_perturbation:
-        labels = adata.obs[perturbation_column].astype(str)
-        counts = labels.value_counts()
-        keep = labels.eq(control_label) | counts.loc[labels].ge(min_cells_per_perturbation).to_numpy()
-        adata = adata[keep].copy()
-    
-    # Cache the result
-    if use_cache:
-        _REFERENCE_ANNDATA_CACHE[cache_key] = adata
-    
-    return adata
-
-
-def _run_scanpy_de(
-    dataset_path: Path,
-    *,
-    perturbation_column: str,
-    control_label: str,
-    min_genes: int,
-    min_cells_per_gene: int,
-    min_cells_per_perturbation: int,
-    method: str,
-    output_dir: Path,
-    baseline_memory_bytes: float | None = None,
-) -> tuple[pd.DataFrame | None, Optional[Path], Optional[str], Optional[float], Optional[float], Optional[float]]:
-    """Execute Scanpy's differential expression workflow and return a DataFrame.
-    
-    Parameters
-    ----------
-    baseline_memory_bytes : float | None
-        Baseline memory in bytes captured before any operations. If None, captures baseline now.
-    
-    Returns
-    -------
-    tuple
-        (dataframe, path, error, runtime_seconds, peak_memory_mb, avg_memory_mb)
-    """
-
-    # Start timing and memory tracking
-    if baseline_memory_bytes is None:
-        baseline_memory_bytes = _get_peak_memory_bytes()
-    start_time = time.perf_counter()
-    
-    # Start background memory sampling thread
-    stop_event = threading.Event()
-    memory_samples = []
-    memory_thread = threading.Thread(
-        target=_sample_memory_continuously,
-        args=(stop_event, memory_samples, 0.1),
-        daemon=True
-    )
-    memory_thread.start()
-
-    try:
-        import scanpy as sc
-    except ImportError as exc:  # pragma: no cover - depends on optional dependency
-        stop_event.set()
-        memory_thread.join(timeout=1.0)
-        return None, None, str(exc), None, None, None
-
-    try:
-        adata = _prepare_reference_anndata(
-            dataset_path,
-            min_genes=min_genes,
-            min_cells_per_gene=min_cells_per_gene,
-            min_cells_per_perturbation=min_cells_per_perturbation,
-            perturbation_column=perturbation_column,
-            control_label=control_label,
-        )
-
-        sc.pp.normalize_total(adata)
-        sc.pp.log1p(adata)
-        sc.tl.rank_genes_groups(
-            adata,
-            groupby=perturbation_column,
-            method=method,
-            reference=control_label,
-            n_genes=adata.n_vars,
-        )
-        df = sc.get.rank_genes_groups_df(adata, None)
-
-        reference_path: Optional[Path] = None
-        if not df.empty:
-            # Simplified name: scanpy_de_<method>.csv
-            reference_path = output_dir / f"scanpy_de_{method.replace('-', '_')}.csv"
-            df.to_csv(reference_path, index=False)
-    
-        # Stop memory sampling and calculate metrics
-        stop_event.set()
-        memory_thread.join(timeout=1.0)
-        
-        # Calculate timing and memory
-        runtime_seconds = time.perf_counter() - start_time
-        peak_memory_mb = _peak_memory_delta_mb(baseline_memory_bytes)
-        
-        # Calculate average memory from samples
-        avg_memory_mb = None
-        if memory_samples:
-            baseline_mb = baseline_memory_bytes / (1024.0 * 1024.0)
-            avg_memory_mb = max(0.0, np.mean(memory_samples) - baseline_mb)
-        
-        return df, reference_path, None, runtime_seconds, peak_memory_mb, avg_memory_mb
-        
-    except Exception as exc:
-        # Stop memory sampling
-        stop_event.set()
-        memory_thread.join(timeout=1.0)
-        
-        runtime_seconds = time.perf_counter() - start_time
-        peak_memory_mb = _peak_memory_delta_mb(baseline_memory_bytes)
-        
-        avg_memory_mb = None
-        if memory_samples:
-            baseline_mb = baseline_memory_bytes / (1024.0 * 1024.0)
-            avg_memory_mb = max(0.0, np.mean(memory_samples) - baseline_mb)
-        
-        return None, None, str(exc), runtime_seconds, peak_memory_mb, avg_memory_mb
 
 
 def _resolve_pertpy_runner(module: Any, method: str) -> Optional[Callable[..., Any]]:
@@ -2213,876 +1682,167 @@ def _convert_reference_result_to_dataframe(result: Any) -> Optional[pd.DataFrame
     return None
 
 
-def _run_edger_direct(
-    dataset_path: Path,
-    *,
-    perturbation_column: str,
-    control_label: str,
-    min_genes: int,
-    min_cells_per_gene: int,
-    min_cells_per_perturbation: int,
-    output_dir: Path,
-    n_jobs: int | None = None,
-) -> tuple[pd.DataFrame | None, Optional[Path], Optional[str], Optional[float], Optional[float], Optional[float]]:
-    """Execute edgeR directly via rpy2 without Pertpy wrapper.
+def evaluate_benchmarks(output_dir: Path) -> None:
+    """Evaluate benchmark results and generate report."""
+    from crispyx.comparison import compute_de_comparison_metrics
     
-    Parameters
-    ----------
-    n_jobs : int | None
-        Number of threads for BLAS operations. If None, uses 1 thread.
-    
-    Returns
-    -------
-    tuple
-        (dataframe, path, error, runtime_seconds, peak_memory_mb, avg_memory_mb)
-    """
-
-    # Start timing and memory tracking
-    baseline_memory = _get_peak_memory_bytes()
-    start_time = time.perf_counter()
-    
-    # Start background memory sampling thread
-    stop_event = threading.Event()
-    memory_samples = []
-    memory_thread = threading.Thread(
-        target=_sample_memory_continuously,
-        args=(stop_event, memory_samples, 0.1),
-        daemon=True
-    )
-    memory_thread.start()
-
-    # Configure R environment before importing rpy2
-    # Try to get R_HOME from global environment config, with fallback to hardcoded path
-    import os
-    from benchmarking.env_config import get_global_env_config
-    
-    env_config = get_global_env_config()
-    r_home = env_config.r_home if env_config else None
-    
-    # Fallback to hardcoded path for backward compatibility
-    if r_home is None and 'R_HOME' not in os.environ:
-        r_home = '/data/miniforge3/envs/pert/lib/R'
-    
-    configure_r_environment(r_home)
-
-    try:
-        import scanpy as sc
-        from rpy2 import robjects as ro
-        from rpy2.robjects import numpy2ri
-        from rpy2.robjects.conversion import localconverter
-    except ImportError as exc:
-        stop_event.set()
-        memory_thread.join(timeout=1.0)
-        return None, None, str(exc), None, None, None
-
-    try:
-        adata = _prepare_reference_anndata(
-            dataset_path,
-            min_genes=min_genes,
-            min_cells_per_gene=min_cells_per_gene,
-            min_cells_per_perturbation=min_cells_per_perturbation,
-            perturbation_column=perturbation_column,
-            control_label=control_label,
-        )
-    except ImportError as exc:
-        stop_event.set()
-        memory_thread.join(timeout=1.0)
-        return None, None, str(exc), None, None, None
-
-    groups = adata.obs[perturbation_column].astype(str).values
-    unique_groups = [g for g in np.unique(groups) if g != control_label]
-
-    if not unique_groups:
-        stop_event.set()
-        memory_thread.join(timeout=1.0)
-        return None, None, "No perturbation groups available for comparison", None, None, None
-
-    try:
-        # Set BLAS thread limit for R
-        n_threads = n_jobs if n_jobs is not None and n_jobs > 0 else 1
+    results_dir = output_dir / ".benchmark_cache"
+    if not results_dir.exists():
+        return
         
-        # Load edgeR and set thread limits
-        ro.r('library(edgeR)')
+    # Load all results
+    results = []
+    for f in results_dir.glob("*.json"):
+        if f.name == "config.json": continue
+        try:
+            with open(f) as fh:
+                data = json.load(fh)
+                if "summary" in data:
+                    # Flatten summary into main dict
+                    summary = data.pop("summary")
+                    data.update(summary)
+                results.append(data)
+        except Exception:
+            pass
+            
+    if not results:
+        return
         
-        # Try to set BLAS thread limits if RhpcBLASctl is available
-        ro.r(f'''
-        tryCatch({{
-            library(RhpcBLASctl)
-            blas_set_num_threads({n_threads})
-            omp_set_num_threads({n_threads})
-        }}, error=function(e) {{
-            # RhpcBLASctl not available, rely on environment variables
-        }})
-        ''')
-
-        # Convert count matrix to R
-        counts = adata.X.T  # genes x cells
-        if hasattr(counts, 'toarray'):
-            counts = counts.toarray()
-
-        with localconverter(ro.default_converter + numpy2ri.converter):
-            ro.globalenv['counts'] = counts
-            ro.globalenv['groups'] = ro.StrVector(groups)
-            ro.globalenv['gene_names'] = ro.StrVector(adata.var_names)
-
-            # Run edgeR analysis
-            ro.r('''
-            rownames(counts) <- gene_names
-            y <- DGEList(counts=counts, group=groups)
-            y <- calcNormFactors(y)
-            design <- model.matrix(~0 + groups)
-            colnames(design) <- gsub("groups", "", colnames(design))
-            y <- estimateDisp(y, design)
-            fit <- glmQLFit(y, design)
-            ''')
-
-            # Run tests for each non-control group
-            all_results = []
-
-            for group in unique_groups:
-                ro.globalenv['target_group'] = group
-                ro.globalenv['control'] = control_label
-
-                # Make contrast and run test
-                ro.r('''
-                contrast_vec <- makeContrasts(
-                    contrasts = paste0(target_group, "-", control),
-                    levels = design
-                )
-                lrt <- glmQLFTest(fit, contrast=contrast_vec)
-                ''')
-
-                # Extract results manually as vectors (avoids pickling issues)
-                genes = np.array(ro.r('rownames(lrt$table)'))
-                logFC = np.array(ro.r('lrt$table$logFC'))
-                logCPM = np.array(ro.r('lrt$table$logCPM'))
-                F_stat = np.array(ro.r('lrt$table$F'))
-                PValue = np.array(ro.r('lrt$table$PValue'))
-                FDR = np.array(ro.r('p.adjust(lrt$table$PValue, method="BH")'))
-
-                # Create DataFrame
-                results_df = pd.DataFrame({
-                    'gene': genes,
-                    'logFC': logFC,
-                    'logCPM': logCPM,
-                    'F': F_stat,
-                    'PValue': PValue,
-                    'FDR': FDR,
-                    'perturbation': group
-                })
-
-                all_results.append(results_df)
-
-        final_results = pd.concat(all_results, ignore_index=True)
-
-        reference_path: Optional[Path] = None
-        if not final_results.empty:
-            # Save to de/ subdirectory with module prefix
-            reference_path = output_dir / "edger_de_glm.csv"
-            final_results.to_csv(reference_path, index=False)
-
-        # Stop memory sampling and calculate metrics
-        stop_event.set()
-        memory_thread.join(timeout=1.0)
-        
-        # Calculate timing and memory
-        runtime_seconds = time.perf_counter() - start_time
-        peak_memory_mb = _peak_memory_delta_mb(baseline_memory)
-        
-        # Calculate average memory from samples
-        avg_memory_mb = None
-        if memory_samples:
-            baseline_mb = baseline_memory / (1024.0 * 1024.0)
-            avg_memory_mb = max(0.0, np.mean(memory_samples) - baseline_mb)
-
-        return final_results, reference_path, None, runtime_seconds, peak_memory_mb, avg_memory_mb
-
-    except Exception as exc:
-        # Stop memory sampling
-        stop_event.set()
-        memory_thread.join(timeout=1.0)
-        
-        runtime_seconds = time.perf_counter() - start_time
-        peak_memory_mb = _peak_memory_delta_mb(baseline_memory)
-        
-        avg_memory_mb = None
-        if memory_samples:
-            baseline_mb = baseline_memory / (1024.0 * 1024.0)
-            avg_memory_mb = max(0.0, np.mean(memory_samples) - baseline_mb)
-        
-        return None, None, str(exc), runtime_seconds, peak_memory_mb, avg_memory_mb
-
-
-def _run_pertpy_de(
-    dataset_path: Path,
-    *,
-    perturbation_column: str,
-    control_label: str,
-    min_genes: int,
-    min_cells_per_gene: int,
-    min_cells_per_perturbation: int,
-    backend: str,
-    output_dir: Path,
-    n_jobs: int | None = None,
-) -> tuple[pd.DataFrame | None, Optional[Path], Optional[str], Optional[float], Optional[float], Optional[float]]:
-    """Execute a Pertpy-backed differential expression method.
+    df = pd.DataFrame(results)
     
-    Parameters
-    ----------
-    n_jobs : int | None
-        Number of parallel jobs. Passed to Pertpy methods that support parallelization
-        (e.g., statsmodels, pydeseq2).
+    # Rename max_memory_mb to peak_memory_mb if needed
+    if "max_memory_mb" in df.columns and "peak_memory_mb" not in df.columns:
+        df = df.rename(columns={"max_memory_mb": "peak_memory_mb"})
     
-    Returns
-    -------
-    tuple
-        (dataframe, path, error, runtime_seconds, peak_memory_mb, avg_memory_mb)
-    """
-
-    # Start timing and memory tracking
-    baseline_memory = _get_peak_memory_bytes()
-    start_time = time.perf_counter()
+    # Generate Performance Table
+    perf_cols = [
+        "method", "status", "elapsed_seconds", "peak_memory_mb", "avg_memory_mb",
+        "cells_kept", "genes_kept", "groups"
+    ]
+    perf_df = df[[c for c in perf_cols if c in df.columns]].copy()
+    if "method" in perf_df.columns:
+        perf_df = perf_df.sort_values("method")
     
-    # Start background memory sampling thread
-    stop_event = threading.Event()
-    memory_samples = []
-    memory_thread = threading.Thread(
-        target=_sample_memory_continuously,
-        args=(stop_event, memory_samples, 0.1),
-        daemon=True
-    )
-    memory_thread.start()
-
-    try:
-        import pertpy as pt
-        import scanpy as sc  # Needed for AnnData IO
-    except ImportError as exc:  # pragma: no cover - optional dependency
-        stop_event.set()
-        memory_thread.join(timeout=1.0)
-        return None, None, str(exc), None, None, None
-
-    _ = sc  # Silence unused import warnings in environments without Scanpy
-
-    module = getattr(pt, "tools", None)
-    if module is None:
-        stop_event.set()
-        memory_thread.join(timeout=1.0)
-        return None, None, "pertpy.tools module unavailable", None, None, None
-
-    candidate_modules: list[Any] = []
-    de_module = getattr(module, "differential_expression", None)
-    if de_module is not None:
-        candidate_modules.append(de_module)
-    candidate_modules.append(module)
-    try:
-        candidate_modules.append(import_module("pertpy.tools._differential_gene_expression"))
-    except Exception:  # pragma: no cover - optional dependency handling
-        pass
-
-    runner: Optional[Callable[..., Any]] = None
-    for candidate in candidate_modules:
-        runner = _resolve_pertpy_runner(candidate, backend)
-        if runner is not None:
-            break
-        runner = _resolve_pertpy_class_runner(candidate, backend)
-        if runner is not None:
-            break
-
-    if runner is None:
-        stop_event.set()
-        memory_thread.join(timeout=1.0)
-        return None, None, f"Pertpy differential expression runner '{backend}' not found", None, None, None
-
-    try:
-        adata = _prepare_reference_anndata(
-            dataset_path,
-            min_genes=min_genes,
-            min_cells_per_gene=min_cells_per_gene,
-            min_cells_per_perturbation=min_cells_per_perturbation,
-            perturbation_column=perturbation_column,
-            control_label=control_label,
-        )
-    except ImportError as exc:  # pragma: no cover - optional dependency
-        stop_event.set()
-        memory_thread.join(timeout=1.0)
-        return None, None, str(exc), None, None, None
-
-    # Prepare kwargs with optional parallelization support
-    # Try multiple combinations to handle different Pertpy API versions
-    base_kwargs_list = [
-        {"groupby": perturbation_column, "control": control_label},
-        {"group_key": perturbation_column, "control": control_label},
-        {"groupby": perturbation_column, "reference": control_label},
+    # Generate Accuracy Table
+    accuracy_results = []
+    
+    # Generate Performance Comparison Table
+    perf_comp_results = []
+    
+    # Define comparisons
+    comparisons = [
+        # QC
+        ("crispyx_qc_filtered", "scanpy_qc_filtered", "qc"),
+        # DE GLM
+        ("crispyx_de_nb_glm", "edger_de_glm", "de"),
+        ("crispyx_de_nb_glm", "pertpy_de_pydeseq2", "de"),
+        # DE Tests
+        ("crispyx_de_t_test", "scanpy_de_t_test", "de"),
+        ("crispyx_de_wilcoxon", "scanpy_de_wilcoxon", "de"),
     ]
     
-    call_attempts = []
-    
-    # First, try with n_jobs if specified (for methods that support parallelization)
-    if n_jobs is not None and n_jobs > 0:
-        for base_kwargs in base_kwargs_list:
-            kwargs = base_kwargs.copy()
-            kwargs["n_cpus"] = n_jobs
-            call_attempts.append(kwargs)
-    
-    # Then try without n_jobs as fallback
-    for base_kwargs in base_kwargs_list:
-        call_attempts.append(base_kwargs.copy())
-    
-    last_type_error: Optional[Exception] = None
-    result = None
-    for kwargs in call_attempts:
-        try:
-            result = runner(adata, **kwargs)
-        except TypeError as exc:
-            last_type_error = exc
+    for stream_method, ref_method, comp_type in comparisons:
+        # Check if both exist and succeeded
+        stream_res = df[df["method"] == stream_method]
+        ref_res = df[df["method"] == ref_method]
+        
+        if stream_res.empty or ref_res.empty:
             continue
-        except Exception as exc:  # pragma: no cover - defensive
-            stop_event.set()
-            memory_thread.join(timeout=1.0)
-            return None, None, str(exc), None, None, None
-        else:
-            break
-    else:
-        # Stop memory sampling
-        stop_event.set()
-        memory_thread.join(timeout=1.0)
-        
-        runtime_seconds = time.perf_counter() - start_time
-        peak_memory_mb = _peak_memory_delta_mb(baseline_memory)
-        
-        avg_memory_mb = None
-        if memory_samples:
-            baseline_mb = baseline_memory / (1024.0 * 1024.0)
-            avg_memory_mb = max(0.0, np.mean(memory_samples) - baseline_mb)
-        
-        if last_type_error is not None:
-            return None, None, str(last_type_error), runtime_seconds, peak_memory_mb, avg_memory_mb
-        return None, None, "Pertpy differential expression runner failed to execute", runtime_seconds, peak_memory_mb, avg_memory_mb
-
-    df = _convert_reference_result_to_dataframe(result)
-    reference_path: Optional[Path] = None
-    if df is not None and not df.empty:
-        # Save to de/ subdirectory with module prefix
-        reference_path = output_dir / f"pertpy_de_{backend}.csv"
-        df.to_csv(reference_path, index=False)
-    
-    # Stop memory sampling and calculate metrics
-    stop_event.set()
-    memory_thread.join(timeout=1.0)
-    
-    # Calculate timing and memory
-    runtime_seconds = time.perf_counter() - start_time
-    peak_memory_mb = _peak_memory_delta_mb(baseline_memory)
-    
-    # Calculate average memory from samples
-    avg_memory_mb = None
-    if memory_samples:
-        baseline_mb = baseline_memory / (1024.0 * 1024.0)
-        avg_memory_mb = max(0.0, np.mean(memory_samples) - baseline_mb)
-    
-    return df, reference_path, None, runtime_seconds, peak_memory_mb, avg_memory_mb
-
-
-def run_scanpy_qc_comparison(
-    dataset_path: Path,
-    *,
-    perturbation_column: str,
-    control_label: str,
-    gene_name_column: str,
-    min_genes: int,
-    min_cells_per_perturbation: int,
-    min_cells_per_gene: int,
-    output_dir: Path,
-) -> ComparisonResult:
-    """Run the full Scanpy validation workflow for QC comparisons.
-    
-    Uses a cache to avoid reloading data if compare_with_scanpy has already been called
-    with the same parameters.
-    """
-    global _SCANPY_COMPARISON_CACHE
-    
-    # Create cache key from parameters
-    cache_key = (
-        str(dataset_path),
-        perturbation_column,
-        control_label,
-        gene_name_column,
-        min_genes,
-        min_cells_per_perturbation,
-        min_cells_per_gene,
-    )
-    
-    # Check if we already have the result
-    if cache_key in _SCANPY_COMPARISON_CACHE:
-        return _SCANPY_COMPARISON_CACHE[cache_key]
-
-    # Use preprocessing directory for QC comparison outputs
-    preprocessing_dir = output_dir / "preprocessing"
-    preprocessing_dir.mkdir(parents=True, exist_ok=True)
-
-    result = compare_with_scanpy(
-        dataset_path,
-        perturbation_column=perturbation_column,
-        control_label=control_label,
-        min_genes=min_genes,
-        min_cells_per_perturbation=min_cells_per_perturbation,
-        min_cells_per_gene=min_cells_per_gene,
-        gene_name_column=gene_name_column,
-        output_dir=preprocessing_dir,
-        data_name="qc",
-        skip_de=True,  # Skip DE tests in QC comparison to save time
-    )
-    
-    # Cache the result for reuse
-    _SCANPY_COMPARISON_CACHE[cache_key] = result
-    
-    return result
-
-
-def run_scanpy_de_comparison(
-    dataset_path: Path,
-    *,
-    perturbation_column: str,
-    control_label: str,
-    gene_name_column: str,
-    min_genes: int,
-    min_cells_per_perturbation: int,
-    min_cells_per_gene: int,
-    output_dir: Path,
-    test_type: str,
-) -> DifferentialComparisonSummary:
-    """Compare streaming differential expression against Scanpy.
-    
-    This function loads cached streaming results and executes the reference method.
-    Standardized pipeline: all comparison functions load cached streaming results
-    instead of executing streaming methods inline.
-    """
-    # Use de directory for differential expression comparison outputs
-    de_dir = output_dir / "de"
-    de_dir.mkdir(parents=True, exist_ok=True)
-
-    # Determine streaming method name and reference method
-    if test_type == "wilcoxon":
-        streaming_method_name = "crispyx_de_wilcoxon"
-        reference_method = "wilcoxon"
-    else:
-        streaming_method_name = "crispyx_de_t_test"
-        reference_method = "t-test"
-
-    # Load cached streaming results - explicit validation
-    cached_stream = _load_method_result(streaming_method_name, output_dir)
-    if not cached_stream or cached_stream.get("status") != "success":
-        raise RuntimeError(
-            f"Required cached method '{streaming_method_name}' not found or failed. "
-            f"Please run the streaming method first before running this comparison."
-        )
-    
-    # Extract streaming metrics from cache
-    stream_runtime = cached_stream.get("elapsed_seconds") or cached_stream.get("runtime_seconds")
-    stream_peak_memory = cached_stream.get("max_memory_mb") or cached_stream.get("peak_memory_mb")
-    stream_avg_memory = cached_stream.get("avg_memory_mb")
-
-    # Load streaming results from file
-    streaming_path_obj = de_dir / f"{streaming_method_name}.h5ad"
-    if not streaming_path_obj.exists():
-        raise RuntimeError(
-            f"Streaming results file not found: {streaming_path_obj}. "
-            f"Please ensure '{streaming_method_name}' completed successfully."
-        )
-    
-    try:
-        import anndata as ad
-        stream_adata = ad.read_h5ad(str(streaming_path_obj))
-        stream_result = _anndata_to_de_dict(stream_adata)
-        streaming_frame = _streaming_de_to_frame(stream_result)
-        streaming_path = str(streaming_path_obj)
-    except Exception as exc:
-        raise RuntimeError(
-            f"Failed to load streaming results from {streaming_path_obj}: {exc}"
-        )
-
-    # Execute reference method with memory tracking
-    baseline_memory_bytes = _get_peak_memory_bytes()
-    reference_df, reference_path, error, ref_runtime, ref_peak_memory, ref_avg_memory = _run_scanpy_de(
-        dataset_path,
-        perturbation_column=perturbation_column,
-        control_label=control_label,
-        min_genes=min_genes,
-        min_cells_per_gene=min_cells_per_gene,
-        min_cells_per_perturbation=min_cells_per_perturbation,
-        method=reference_method,
-        output_dir=de_dir,
-        baseline_memory_bytes=baseline_memory_bytes,
-    )
-
-    # Compute comparison metrics
-    metrics = {key: None for key in DE_METRIC_KEYS}
-    if reference_df is not None:
-        metrics = _compare_de_frames(streaming_frame, _standardise_de_dataframe(reference_df))
-
-    return DifferentialComparisonSummary(
-        test_type=test_type,
-        reference_tool=f"scanpy_{reference_method}",
-        metrics=metrics,
-        streaming_result_path=streaming_path,
-        reference_result_path=str(reference_path) if reference_path else None,
-        error=error,
-        stream_runtime_seconds=stream_runtime,
-        reference_runtime_seconds=ref_runtime,
-        stream_peak_memory_mb=stream_peak_memory,
-        stream_avg_memory_mb=stream_avg_memory,
-        reference_peak_memory_mb=ref_peak_memory,
-        reference_avg_memory_mb=ref_avg_memory,
-    )
-
-
-def run_edger_direct_comparison(
-    dataset_path: Path,
-    *,
-    perturbation_column: str,
-    control_label: str,
-    gene_name_column: str,
-    min_genes: int,
-    min_cells_per_perturbation: int,
-    min_cells_per_gene: int,
-    output_dir: Path,
-    n_jobs: int | None = None,
-) -> DifferentialComparisonSummary:
-    """Compare streaming GLM-based tests against edgeR (via direct rpy2).
-    
-    Standardized pipeline: loads cached streaming results (prefers nb_glm, falls back to t_test)
-    and executes reference method. No inline streaming execution.
-    
-    Parameters
-    ----------
-    n_jobs : int | None
-        Number of threads for BLAS operations in edgeR.
-    """
-
-    # Use de directory for differential expression comparison outputs
-    de_dir = output_dir / "de"
-    de_dir.mkdir(parents=True, exist_ok=True)
-    
-    # Use comparisons directory for detailed comparison CSVs
-    comparisons_dir = output_dir / "comparisons"
-    comparisons_dir.mkdir(parents=True, exist_ok=True)
-    
-    cache_dir = output_dir / ".benchmark_cache"
-    cache_dir.mkdir(parents=True, exist_ok=True)
-
-    # Check for cached comparison
-    cache_file = cache_dir / "edger_comparison.json"
-    comparison_csv = comparisons_dir / "edger_glm.csv"
-    
-    # Try to load nb_glm results first (preferred), fall back to t_test
-    nb_glm_path = de_dir / "crispyx_de_nb_glm.h5ad"
-    t_test_path = de_dir / "crispyx_de_t_test.h5ad"
-    
-    streaming_path = None
-    test_method = None
-    stream_result = None
-    
-    if nb_glm_path.exists():
-        try:
-            import anndata as ad
-            nb_glm_adata = ad.read_h5ad(str(nb_glm_path))
-            stream_result = _anndata_to_de_dict(nb_glm_adata)
-            streaming_path = str(nb_glm_path)
-            test_method = "nb_glm"
-        except Exception as exc:
-            # If nb_glm loading fails, try t_test
-            pass
-    
-    if stream_result is None and t_test_path.exists():
-        try:
-            import anndata as ad
-            t_test_adata = ad.read_h5ad(str(t_test_path))
-            stream_result = _anndata_to_de_dict(t_test_adata)
-            streaming_path = str(t_test_path)
-            test_method = "t_test"
-        except Exception as exc:
-            pass
-    
-    # Explicit validation - require cached streaming results
-    if stream_result is None:
-        raise RuntimeError(
-            f"Required cached streaming method not found. Expected either 'crispyx_de_nb_glm' "
-            f"or 'crispyx_de_t_test' results in {de_dir}/. Please run these methods first before "
-            f"running this comparison."
-        )
-    
-    streaming_frame = _streaming_de_to_frame(stream_result)
-
-    reference_df, reference_path, error, ref_runtime, ref_peak_memory, ref_avg_memory = _run_edger_direct(
-        dataset_path,
-        perturbation_column=perturbation_column,
-        control_label=control_label,
-        min_genes=min_genes,
-        min_cells_per_gene=min_cells_per_gene,
-        min_cells_per_perturbation=min_cells_per_perturbation,
-        output_dir=de_dir,
-        n_jobs=n_jobs,
-    )
-    
-    # Get streaming method timing from cache
-    stream_runtime = None
-    stream_peak_memory = None
-    stream_avg_memory = None
-    streaming_method_name = f"crispyx_de_{test_method}"
-    cached_stream = _load_method_result(streaming_method_name, output_dir)
-    if cached_stream:
-        # Handle both old and new field names
-        stream_runtime = cached_stream.get("runtime_seconds") or cached_stream.get("elapsed_seconds")
-        stream_peak_memory = cached_stream.get("peak_memory_mb") or cached_stream.get("max_memory_mb")
-        stream_avg_memory = cached_stream.get("avg_memory_mb")
-
-    metrics = {key: None for key in DE_METRIC_KEYS}
-    if reference_df is not None:
-        ref_standardized = _standardise_de_dataframe(reference_df)
-        metrics = _compare_de_frames(streaming_frame, ref_standardized)
-        
-        # Write standardized comparison CSV
-        if not streaming_frame.empty and not ref_standardized.empty:
-            # Merge on perturbation and gene
-            merged = streaming_frame.merge(
-                ref_standardized,
-                on=["perturbation", "gene"],
-                how="inner",
-                suffixes=("_crispyx", "_edger")
-            )
-            # Create standardized CSV with required columns
-            comparison_df = pd.DataFrame({
-                "gene": merged["gene"],
-                "perturbation": merged["perturbation"],
-                "crispyx_effect": merged["effect_size_crispyx"],
-                "reference_effect": merged["effect_size_edger"],
-                "crispyx_pvalue": merged["pvalue_crispyx"],
-                "reference_pvalue": merged["pvalue_edger"],
-                "pearson_corr": metrics.get("effect_pearson_corr"),
-                "spearman_corr": metrics.get("effect_spearman_corr"),
-                "top_k_overlap": metrics.get("effect_top_k_overlap"),
-                "auroc": metrics.get("pvalue_stream_auroc"),
-            })
-            comparison_df.to_csv(comparison_csv, index=False)
             
-            # Update cache
-            cache_data = {
-                "comparison_file": str(comparison_csv),
-                "timestamp": time.time(),
-                "nb_glm_file": str(nb_glm_path) if nb_glm_path.exists() else None,
-                "test_method": test_method,
-                "metrics": {k: float(v) if v is not None and not pd.isna(v) else None 
-                           for k, v in metrics.items()}
-            }
-            with cache_file.open('w') as f:
-                json.dump(cache_data, f, indent=2)
-
-    return DifferentialComparisonSummary(
-        test_type="glm",
-        reference_tool="edger_direct",
-        metrics=metrics,
-        streaming_result_path=streaming_path,
-        reference_result_path=str(reference_path) if reference_path else None,
-        error=error,
-        stream_runtime_seconds=stream_runtime,
-        reference_runtime_seconds=ref_runtime,
-        stream_peak_memory_mb=stream_peak_memory,
-        stream_avg_memory_mb=stream_avg_memory,
-        reference_peak_memory_mb=ref_peak_memory,
-        reference_avg_memory_mb=ref_avg_memory,
-    )
-
-
-def run_pertpy_de_comparison(
-    dataset_path: Path,
-    *,
-    perturbation_column: str,
-    control_label: str,
-    gene_name_column: str,
-    min_genes: int,
-    min_cells_per_perturbation: int,
-    min_cells_per_gene: int,
-    output_dir: Path,
-    backend: str,
-    n_jobs: int | None = None,
-) -> DifferentialComparisonSummary:
-    """Compare streaming GLM-based tests against a Pertpy backend.
-    
-    This function implements lazy-loading: if nb_glm_test results exist,
-    they will be used for comparison. Otherwise, falls back to t_test.
-    Results are cached as CSV files with standardized columns.
-    
-    Parameters
-    ----------
-    n_jobs : int | None
-        Number of parallel jobs for Pertpy methods that support parallelization.
-    """
-
-    # Start timing for the reference comparison (includes data loading overhead)
-    reference_start_time = time.perf_counter()
-    
-    # Use de directory for differential expression comparison outputs
-    de_dir = output_dir / "de"
-    de_dir.mkdir(parents=True, exist_ok=True)
-    
-    # Use comparisons directory for detailed comparison CSVs
-    comparisons_dir = output_dir / "comparisons"
-    comparisons_dir.mkdir(parents=True, exist_ok=True)
-    
-    cache_dir = output_dir / ".benchmark_cache"
-    cache_dir.mkdir(parents=True, exist_ok=True)
-
-    # Check for cached comparison
-    cache_file = cache_dir / f"pertpy_{backend}_comparison.json"
-    comparison_csv = comparisons_dir / f"pertpy_{backend}.csv"
-    
-    # Try to load nb_glm results first (preferred), fall back to t_test
-    nb_glm_path = de_dir / "crispyx_de_nb_glm.h5ad"
-    t_test_path = de_dir / "crispyx_de_t_test.h5ad"
-    
-    streaming_path = None
-    test_method = None
-    stream_result = None
-    
-    if nb_glm_path.exists():
-        try:
-            import anndata as ad
-            nb_glm_adata = ad.read_h5ad(str(nb_glm_path))
-            stream_result = _anndata_to_de_dict(nb_glm_adata)
-            streaming_path = str(nb_glm_path)
-            test_method = "nb_glm"
-        except Exception as exc:
-            # If nb_glm loading fails, try t_test
-            pass
-    
-    if stream_result is None and t_test_path.exists():
-        try:
-            import anndata as ad
-            t_test_adata = ad.read_h5ad(str(t_test_path))
-            stream_result = _anndata_to_de_dict(t_test_adata)
-            streaming_path = str(t_test_path)
-            test_method = "t_test"
-        except Exception as exc:
-            pass
-    
-    # Explicit validation - require cached streaming results
-    if stream_result is None:
-        raise RuntimeError(
-            f"Required cached streaming method not found. Expected either 'crispyx_de_nb_glm' "
-            f"or 'crispyx_de_t_test' results in {de_dir}/. Please run these methods first before "
-            f"running this comparison."
-        )
-    
-    streaming_frame = _streaming_de_to_frame(stream_result)
-
-    reference_df, reference_path, error, ref_runtime, ref_peak_memory, ref_avg_memory = _run_pertpy_de(
-        dataset_path,
-        perturbation_column=perturbation_column,
-        control_label=control_label,
-        min_genes=min_genes,
-        min_cells_per_gene=min_cells_per_gene,
-        min_cells_per_perturbation=min_cells_per_perturbation,
-        backend=backend,
-        output_dir=de_dir,
-        n_jobs=n_jobs,
-    )
-    
-    # Get streaming method timing from cache
-    stream_runtime = None
-    stream_peak_memory = None
-    stream_avg_memory = None
-    streaming_method_name = f"crispyx_de_{test_method}"
-    cached_stream = _load_method_result(streaming_method_name, output_dir)
-    if cached_stream:
-        # Handle both old and new field names
-        stream_runtime = cached_stream.get("runtime_seconds") or cached_stream.get("elapsed_seconds")
-        stream_peak_memory = cached_stream.get("peak_memory_mb") or cached_stream.get("max_memory_mb")
-        stream_avg_memory = cached_stream.get("avg_memory_mb")
-
-    metrics = {key: None for key in DE_METRIC_KEYS}
-    if reference_df is not None:
-        ref_standardized = _standardise_de_dataframe(reference_df)
-        metrics = _compare_de_frames(streaming_frame, ref_standardized)
-        
-        # Write standardized comparison CSV
-        if not streaming_frame.empty and not ref_standardized.empty:
-            # Merge on perturbation and gene
-            merged = streaming_frame.merge(
-                ref_standardized,
-                on=["perturbation", "gene"],
-                how="inner",
-                suffixes=("_crispyx", f"_{backend}")
-            )
-            # Create standardized CSV with required columns
-            comparison_df = pd.DataFrame({
-                "gene": merged["gene"],
-                "perturbation": merged["perturbation"],
-                "crispyx_effect": merged["effect_size_crispyx"],
-                "reference_effect": merged[f"effect_size_{backend}"],
-                "crispyx_pvalue": merged["pvalue_crispyx"],
-                "reference_pvalue": merged[f"pvalue_{backend}"],
-                "pearson_corr": metrics.get("effect_pearson_corr"),
-                "spearman_corr": metrics.get("effect_spearman_corr"),
-                "top_k_overlap": metrics.get("effect_top_k_overlap"),
-                "auroc": metrics.get("pvalue_stream_auroc"),
-            })
-            comparison_df.to_csv(comparison_csv, index=False)
+        if stream_res.iloc[0]["status"] != "success" or ref_res.iloc[0]["status"] != "success":
+            continue
             
-            # Update cache
-            cache_data = {
-                "comparison_file": str(comparison_csv),
-                "timestamp": time.time(),
-                "nb_glm_file": str(nb_glm_path) if nb_glm_path.exists() else None,
-                "test_method": test_method,
-                "metrics": {k: float(v) if v is not None and not pd.isna(v) else None 
-                           for k, v in metrics.items()}
-            }
-            with cache_file.open('w') as f:
-                json.dump(cache_data, f, indent=2)
-
-    # Calculate total reference time including data loading overhead
-    # This captures the ~10 minutes spent loading nb_glm h5ad file
-    total_reference_time = time.perf_counter() - reference_start_time
+        # Performance Comparison
+        s_row = stream_res.iloc[0]
+        r_row = ref_res.iloc[0]
+        
+        s_time = s_row.get("elapsed_seconds", np.nan)
+        r_time = r_row.get("elapsed_seconds", np.nan)
+        s_mem = s_row.get("peak_memory_mb", np.nan)
+        r_mem = r_row.get("peak_memory_mb", np.nan)
+        
+        comp = {
+            "comparison": f"{stream_method} vs {ref_method}",
+            "crispyx_time_s": s_time,
+            "other_time_s": r_time,
+            "time_diff_s": s_time - r_time if pd.notna(s_time) and pd.notna(r_time) else None,
+            "time_pct": (s_time / r_time * 100) if pd.notna(s_time) and pd.notna(r_time) and r_time > 0 else None,
+            "crispyx_mem_mb": s_mem,
+            "other_mem_mb": r_mem,
+            "mem_diff_mb": s_mem - r_mem if pd.notna(s_mem) and pd.notna(r_mem) else None,
+            "mem_pct": (s_mem / r_mem * 100) if pd.notna(s_mem) and pd.notna(r_mem) and r_mem > 0 else None,
+        }
+        perf_comp_results.append(comp)
+        
+        # Load result files
+        try:
+            stream_path_val = stream_res.iloc[0]["result_path"]
+            ref_path_val = ref_res.iloc[0]["result_path"]
+            
+            if pd.isna(stream_path_val) or pd.isna(ref_path_val):
+                print(f"Skipping comparison {stream_method} vs {ref_method}: missing result path")
+                continue
+                
+            stream_path = output_dir / str(stream_path_val)
+            ref_path = output_dir / str(ref_path_val)
+            
+            if comp_type == "qc":
+                # Compare cell/gene counts
+                acc = {
+                    "comparison": f"{stream_method} vs {ref_method}",
+                    "cells_diff": float(stream_res.iloc[0]["cells_kept"] - ref_res.iloc[0]["cells_kept"]),
+                    "genes_diff": float(stream_res.iloc[0]["genes_kept"] - ref_res.iloc[0]["genes_kept"]),
+                }
+                accuracy_results.append(acc)
+                
+            elif comp_type == "de":
+                # Load DE results
+                import anndata as ad
+                
+                # Load stream (h5ad)
+                stream_adata = ad.read_h5ad(str(stream_path))
+                stream_dict = _anndata_to_de_dict(stream_adata)
+                stream_df = _streaming_de_to_frame(stream_dict)
+                
+                # Load ref (csv)
+                ref_df = pd.read_csv(ref_path)
+                ref_df = _standardise_de_dataframe(ref_df)
+                
+                # Compute metrics
+                metrics = compute_de_comparison_metrics(stream_df, ref_df)
+                # Create new dict to avoid type errors
+                acc = {"comparison": f"{stream_method} vs {ref_method}"}
+                acc.update(metrics)
+                accuracy_results.append(acc)
+                
+        except Exception as e:
+            print(f"Error comparing {stream_method} vs {ref_method}: {e}")
+            
+    # Save tables
+    perf_df.to_csv(output_dir / "performance_summary.csv", index=False)
+    if accuracy_results:
+        acc_df = pd.DataFrame(accuracy_results)
+        acc_df.to_csv(output_dir / "accuracy_summary.csv", index=False)
+        
+    # Generate Markdown
+    md = "# Benchmark Results\n\n"
     
-    # Use the total time as reference runtime since it includes all overhead
-    # The ref_runtime from _run_pertpy_de only captures PyDESeq2 execution
-    actual_reference_runtime = total_reference_time if stream_runtime is not None else ref_runtime
-
-    return DifferentialComparisonSummary(
-        test_type="glm",
-        reference_tool=f"pertpy_{backend}",
-        metrics=metrics,
-        streaming_result_path=streaming_path,
-        reference_result_path=str(reference_path) if reference_path else None,
-        error=error,
-        stream_runtime_seconds=stream_runtime,
-        reference_runtime_seconds=actual_reference_runtime,
-        stream_peak_memory_mb=stream_peak_memory,
-        stream_avg_memory_mb=stream_avg_memory,
-        reference_peak_memory_mb=ref_peak_memory,
-        reference_avg_memory_mb=ref_avg_memory,
-    )
-
-def _compute_performance_diff(stream_val: Optional[float], ref_val: Optional[float]) -> tuple[Optional[float], Optional[float]]:
-    """Compute absolute and percentage difference between stream and reference values.
+    md += "## Performance\n\n"
+    md += _frame_to_markdown_table(perf_df)
+    md += "\n\n"
     
-    Returns
-    -------
-    tuple[Optional[float], Optional[float]]
-        (absolute_diff, percentage_diff) where percentage_diff is ((stream - ref) / ref) * 100
-        Negative percentage means stream is faster/uses less memory
-    """
-    if stream_val is None or ref_val is None:
-        return (None, None)
+    if perf_comp_results:
+        md += "## Performance Comparison\n\n"
+        md += _frame_to_markdown_table(pd.DataFrame(perf_comp_results))
+        md += "\n\n"
     
-    abs_diff = stream_val - ref_val
-    
-    if ref_val == 0:
-        pct_diff = None
-    else:
-        pct_diff = (abs_diff / ref_val) * 100
-    
-    return (abs_diff, pct_diff)
+    if accuracy_results:
+        md += "## Accuracy\n\n"
+        md += _frame_to_markdown_table(pd.DataFrame(accuracy_results))
+        md += "\n"
+        
+    with open(output_dir / "results.md", "w") as f:
+        f.write(md)
 
 
 def _summarise_quality_control(result: Any, context: Dict[str, Any]) -> Dict[str, Any]:
@@ -3165,91 +1925,48 @@ def _summarise_de_mapping(result: Any, context: Dict[str, Any]) -> Dict[str, Any
     return summary
 
 
-def _summarise_scanpy_comparison(result: ComparisonResult, context: Dict[str, Any]) -> Dict[str, Any]:
-    """Summarise quality control and preprocessing comparisons with Scanpy."""
+def _summarise_runner_result(result: Any, context: Dict[str, Any]) -> Dict[str, Any]:
+    """Summarise result from a standalone runner function."""
+    # Handle dictionary result (new format)
+    if isinstance(result, dict):
+        summary = result.copy()
+        if "result_path" in summary:
+            summary["result_path"] = _normalise_path(summary["result_path"], context)
+        return summary
 
-    stream_total = sum(result.streamlined_timings.values()) if result.streamlined_timings else None
-    reference_total = sum(result.reference_timings.values()) if result.reference_timings else None
-    
-    # Compute performance differences
-    runtime_diff, runtime_diff_pct = _compute_performance_diff(stream_total, reference_total)
-    memory_diff, memory_diff_pct = _compute_performance_diff(
-        result.streamlined_peak_memory_mb, result.reference_peak_memory_mb
-    )
-    
-    summary = {
-        "comparison_category": "quality_control_preprocessing",
-        "reference_tool": "scanpy",
-        "normalization_max_abs_diff": result.normalization_max_abs_diff,
-        "log1p_max_abs_diff": result.log1p_max_abs_diff,
-        "avg_log_effect_max_abs_diff": result.avg_log_effect_max_abs_diff,
-        "pseudobulk_effect_max_abs_diff": result.pseudobulk_effect_max_abs_diff,
-        "streamlined_cell_count": result.streamlined_cell_count,
-        "reference_cell_count": result.reference_cell_count,
-        "streamlined_gene_count": result.streamlined_gene_count,
-        "reference_gene_count": result.reference_gene_count,
-        "stream_peak_memory_mb": result.streamlined_peak_memory_mb,
-        "stream_avg_memory_mb": result.streamlined_avg_memory_mb,
-        "reference_peak_memory_mb": result.reference_peak_memory_mb,
-        "reference_avg_memory_mb": result.reference_avg_memory_mb,
-        "runtime_diff_seconds": runtime_diff,
-        "runtime_diff_pct": runtime_diff_pct,
-        "memory_diff_mb": memory_diff,
-        "memory_diff_pct": memory_diff_pct,
-        "stream_timing_breakdown": _format_timing_summary(result.streamlined_timings),
-        "reference_timing_breakdown": _format_timing_summary(result.reference_timings),
-    }
-    summary.update({f"wald_{key}": value for key, value in result.wald_metrics.items()})
-    summary.update({f"wilcoxon_{key}": value for key, value in result.wilcoxon_metrics.items()})
-    return summary
+    # Handle tuple result (old format - if any)
+    # Result is tuple: (dataframe, path, error, runtime, peak_mem, avg_mem)
+    if isinstance(result, tuple) and len(result) >= 6:
+        df, path, error, runtime, peak_mem, avg_mem = result[:6]
+        
+        summary = {}
+        if path:
+            summary["result_path"] = _normalise_path(path, context)
+            
+        if error:
+            summary["error"] = error
+            
+        # Pass through internal metrics
+        if runtime is not None:
+            summary["internal_runtime_seconds"] = runtime
+        if peak_mem is not None:
+            summary["internal_peak_memory_mb"] = peak_mem
+        if avg_mem is not None:
+            summary["internal_avg_memory_mb"] = avg_mem
+            
+        if df is not None and hasattr(df, "shape"):
+            summary["rows"] = df.shape[0]
+            summary["columns"] = df.shape[1]
+            
+            # Extract QC metrics if present in attrs
+            if hasattr(df, "attrs"):
+                for key in ["cells_kept", "genes_kept", "original_cells", "original_genes"]:
+                    if key in df.attrs:
+                        summary[key] = df.attrs[key]
+                        
+        return summary
 
-
-def _summarise_de_comparison(
-    result: DifferentialComparisonSummary, context: Dict[str, Any]
-) -> Dict[str, Any]:
-    """Summarise differential expression comparisons."""
-
-    summary = {
-        "comparison_category": "differential_expression",
-        "test_type": result.test_type,
-        "reference_tool": result.reference_tool,
-        "streaming_result_path": _normalise_path(result.streaming_result_path, context),
-        "reference_result_path": _normalise_path(result.reference_result_path, context),
-    }
-    summary.update(result.metrics)
-    
-    # Add timing and memory data if available
-    if result.stream_runtime_seconds is not None:
-        summary["stream_runtime_seconds"] = result.stream_runtime_seconds
-    if result.reference_runtime_seconds is not None:
-        summary["reference_runtime_seconds"] = result.reference_runtime_seconds
-    if result.stream_peak_memory_mb is not None:
-        summary["stream_peak_memory_mb"] = result.stream_peak_memory_mb
-    if result.stream_avg_memory_mb is not None:
-        summary["stream_avg_memory_mb"] = result.stream_avg_memory_mb
-    if result.reference_peak_memory_mb is not None:
-        summary["reference_peak_memory_mb"] = result.reference_peak_memory_mb
-    if result.reference_avg_memory_mb is not None:
-        summary["reference_avg_memory_mb"] = result.reference_avg_memory_mb
-    
-    # Compute performance differences if both values available
-    runtime_diff, runtime_diff_pct = _compute_performance_diff(
-        result.stream_runtime_seconds, result.reference_runtime_seconds
-    )
-    memory_diff, memory_diff_pct = _compute_performance_diff(
-        result.stream_peak_memory_mb, result.reference_peak_memory_mb
-    )
-    
-    if runtime_diff is not None:
-        summary["runtime_diff_seconds"] = runtime_diff
-        summary["runtime_diff_pct"] = runtime_diff_pct
-    if memory_diff is not None:
-        summary["memory_diff_mb"] = memory_diff
-        summary["memory_diff_pct"] = memory_diff_pct
-    
-    if result.error:
-        summary["error"] = result.error
-    return summary
+    return {"error": "Invalid result format"}
 
 
 def _worker(
@@ -3261,6 +1978,20 @@ def _worker(
     n_threads: int = 1,
 ) -> None:
     """Execute ``method`` with optional resource limits and report the outcome.
+    
+    Memory Baseline Strategy
+    ------------------------
+    Captures baseline memory before method execution to ensure fair comparison
+    with reference methods. Both peak and average memory are reported as deltas
+    from this baseline.
+    
+    For streaming methods:
+    - QC methods: Baseline captures environment + minimal data loading overhead
+    - DE methods (t-test, wilcoxon): Baseline includes QC-filtered normalized data in memory
+    - nb_glm: Baseline includes QC-filtered count data (not normalized)
+    
+    This matches reference method baselines which capture after _prepare_reference_anndata
+    loads filtered datasets.
     
     Parameters
     ----------
@@ -3275,6 +2006,10 @@ def _worker(
         resource.setrlimit(resource.RLIMIT_AS, (memory_limit, memory_limit))
     if time_limit and time_limit > 0:
         resource.setrlimit(resource.RLIMIT_CPU, (time_limit, time_limit))
+
+    # Capture baseline memory before method execution
+    # This ensures consistent baseline with reference methods
+    baseline_memory_bytes = _get_peak_memory_bytes()
 
     # Start background memory sampling thread
     stop_event = threading.Event()
@@ -3295,20 +2030,24 @@ def _worker(
         stop_event.set()
         memory_thread.join(timeout=1.0)
         
-        usage = resource.getrusage(resource.RUSAGE_SELF)
-        max_rss_kb = usage.ru_maxrss
+        # Calculate peak memory as delta from baseline
+        peak_memory_mb = _peak_memory_delta_mb(baseline_memory_bytes)
         
-        # Calculate average memory from samples
+        # Calculate average memory from samples (current RSS in bytes) as delta from baseline
         avg_memory_mb = None
         if memory_samples:
-            avg_memory_mb = np.mean(memory_samples)
+            # Filter out None values
+            valid_samples = [s for s in memory_samples if s is not None]
+            if valid_samples:
+                avg_rss_bytes = np.mean(valid_samples)
+                avg_memory_mb = max(0.0, (avg_rss_bytes - baseline_memory_bytes) / (1024.0 * 1024.0))
         
         summary = method.summary(result, context)
         queue.put(
             {
                 "status": "success",
                 "elapsed_seconds": elapsed,
-                "max_rss_kb": max_rss_kb,
+                "max_memory_mb": peak_memory_mb,
                 "avg_memory_mb": avg_memory_mb,
                 "summary": summary,
             }
@@ -3323,7 +2062,7 @@ def _worker(
             {
                 "status": "memory_limit",
                 "elapsed_seconds": elapsed,
-                "max_rss_kb": None,
+                "peak_memory_mb": None,
                 "avg_memory_mb": None,
                 "error": f"MemoryError: {exc}",
             }
@@ -3338,7 +2077,7 @@ def _worker(
             {
                 "status": "error",
                 "elapsed_seconds": elapsed,
-                "max_rss_kb": None,
+                "peak_memory_mb": None,
                 "avg_memory_mb": None,
                 "error": f"{exc}",
                 "traceback": traceback.format_exc(),
@@ -3362,6 +2101,9 @@ def _run_with_limits(
     if 'edger_direct' in method.name.lower():
         set_thread_env_vars(n_threads)
         
+        # Capture baseline memory before method execution
+        baseline_memory_bytes = _get_peak_memory_bytes()
+        
         # Start background memory sampling thread
         stop_event = threading.Event()
         memory_samples = []
@@ -3381,19 +2123,23 @@ def _run_with_limits(
             stop_event.set()
             memory_thread.join(timeout=1.0)
             
-            usage = resource.getrusage(resource.RUSAGE_SELF)
-            max_rss_kb = usage.ru_maxrss
+            # Calculate peak memory as delta from baseline
+            peak_memory_mb = _peak_memory_delta_mb(baseline_memory_bytes)
             
-            # Calculate average memory from samples
+            # Calculate average memory from samples (current RSS in bytes) as delta from baseline
             avg_memory_mb = None
             if memory_samples:
-                avg_memory_mb = np.mean(memory_samples)
+                # Filter out None values
+                valid_samples = [s for s in memory_samples if s is not None]
+                if valid_samples:
+                    avg_rss_bytes = np.mean(valid_samples)
+                    avg_memory_mb = max(0.0, (avg_rss_bytes - baseline_memory_bytes) / (1024.0 * 1024.0))
             
             summary = method.summary(result, context)
             return {
                 "status": "success",
                 "elapsed_seconds": elapsed,
-                "max_memory_mb": max_rss_kb / 1024,
+                "peak_memory_mb": peak_memory_mb,
                 "avg_memory_mb": avg_memory_mb,
                 "summary": summary,
             }
@@ -3406,7 +2152,10 @@ def _run_with_limits(
             
             avg_memory_mb = None
             if memory_samples:
-                avg_memory_mb = np.mean(memory_samples)
+                # Filter out None values and convert to MB
+                valid_samples = [s for s in memory_samples if s is not None]
+                if valid_samples:
+                    avg_memory_mb = np.mean(valid_samples) / (1024.0 * 1024.0)
             
             return {
                 "status": "error",
@@ -3445,7 +2194,7 @@ def _run_with_limits(
         return {
             "status": "timeout",
             "elapsed_seconds": parent_elapsed_time,
-            "max_memory_mb": None,
+            "peak_memory_mb": None,
             "avg_memory_mb": None,
             "summary": {},
             "error": f"Exceeded time limit of {time_limit} seconds",
@@ -3457,17 +2206,15 @@ def _run_with_limits(
         payload = {
             "status": "error",
             "elapsed_seconds": parent_elapsed_time,
-            "max_rss_kb": None,
+            "peak_memory_mb": None,
             "avg_memory_mb": None,
             "error": f"Process exited with code {process.exitcode}",
         }
 
     payload.setdefault("summary", {})
-    max_rss_kb = payload.pop("max_rss_kb", None)
-    if max_rss_kb is not None:
-        payload["max_memory_mb"] = max_rss_kb / 1024
-    else:
-        payload.setdefault("max_memory_mb", None)
+    
+    # Ensure peak_memory_mb is present (already computed as delta in _worker)
+    payload.setdefault("peak_memory_mb", None)
     
     # Ensure avg_memory_mb is present (may be None)
     payload.setdefault("avg_memory_mb", None)
@@ -3499,6 +2246,7 @@ def create_benchmark_suite(
     gene_name_column: str | None = "gene_symbols",
     qc_params: QCParams | None = None,
     n_cores: int | None = None,
+    chunk_size: int | None = None,
 ) -> Dict[str, BenchmarkMethod]:
     """Return the available benchmark methods for the provided dataset.
     
@@ -3518,6 +2266,8 @@ def create_benchmark_suite(
         QC parameters. If None, will be calculated adaptively.
     n_cores
         Number of cores to use for parallel DE methods. If None, auto-detects.
+    chunk_size
+        Optional fixed chunk size to use. Overrides qc_params.chunk_size if provided.
     """
     import anndata as ad
     
@@ -3527,19 +2277,19 @@ def create_benchmark_suite(
         adata_temp = ad.read_h5ad(dataset_path, backed='r')
         try:
             adaptive_thresholds = calculate_adaptive_qc_thresholds(
-                adata_temp, perturbation_column, mode='conservative'
+                adata_temp, perturbation_column, mode='conservative', chunk_size=chunk_size
             )
             min_genes = adaptive_thresholds['min_genes']
             min_cells_per_perturbation = adaptive_thresholds['min_cells_per_perturbation']
             min_cells_per_gene = adaptive_thresholds['min_cells_per_gene']
-            chunk_size = adaptive_thresholds['chunk_size']
+            final_chunk_size = adaptive_thresholds['chunk_size']
         finally:
             adata_temp.file.close()
     else:
         min_genes = qc_params.min_genes
         min_cells_per_perturbation = qc_params.min_cells_per_perturbation
         min_cells_per_gene = qc_params.min_cells_per_gene
-        chunk_size = qc_params.chunk_size
+        final_chunk_size = chunk_size if chunk_size is not None else qc_params.chunk_size
 
     backed = read_backed(dataset_path)
     try:
@@ -3565,6 +2315,16 @@ def create_benchmark_suite(
     de_dir = output_dir / "de"
     de_dir.mkdir(parents=True, exist_ok=True)
 
+    # Create preprocessed dataset for t-test benchmarks
+    preprocessed_path = preprocessing_dir / f"preprocessed_{dataset_path.name}"
+    if not preprocessed_path.exists():
+        import scanpy as sc
+        print(f"Generating preprocessed dataset for t-test benchmarks: {preprocessed_path}")
+        adata_pp = sc.read_h5ad(dataset_path)
+        sc.pp.normalize_total(adata_pp)
+        sc.pp.log1p(adata_pp)
+        adata_pp.write(preprocessed_path)
+
     methods = {
         "crispyx_qc_filtered": BenchmarkMethod(
             name="crispyx_qc_filtered",
@@ -3575,7 +2335,7 @@ def create_benchmark_suite(
                 "min_genes": min_genes,
                 "min_cells_per_perturbation": min_cells_per_perturbation,
                 "min_cells_per_gene": min_cells_per_gene,
-                "chunk_size": chunk_size,
+                "chunk_size": final_chunk_size,
                 **shared_kwargs,
                 "output_dir": preprocessing_dir,
                 "data_name": "qc_filtered",
@@ -3609,16 +2369,11 @@ def create_benchmark_suite(
         "crispyx_de_t_test": BenchmarkMethod(
             name="crispyx_de_t_test",
             description="t-test differential expression test",
-            function=_run_crispyx_t_test_with_qc,
+            function=t_test,
             kwargs={
-                "path": dataset_path,
-                "min_genes": min_genes,
-                "min_cells_per_perturbation": min_cells_per_perturbation,
-                "min_cells_per_gene": min_cells_per_gene,
-                "chunk_size": chunk_size,
+                "path": preprocessed_path,
                 **shared_kwargs,
                 "output_dir": de_dir,
-                "preprocessing_dir": preprocessing_dir,
                 "data_name": "de_t_test",
                 "n_jobs": n_cores,
             },
@@ -3653,92 +2408,74 @@ def create_benchmark_suite(
         "scanpy_qc_filtered": BenchmarkMethod(
             name="scanpy_qc_filtered",
             description="Quality control using Scanpy",
-            function=run_scanpy_qc_comparison,
+            function=run_scanpy_qc,
             kwargs={
                 "dataset_path": dataset_path,
                 "perturbation_column": shared_kwargs["perturbation_column"],
                 "control_label": shared_kwargs["control_label"],
-                "gene_name_column": shared_kwargs["gene_name_column"],
                 "min_genes": min_genes,
                 "min_cells_per_perturbation": min_cells_per_perturbation,
                 "min_cells_per_gene": min_cells_per_gene,
-                "output_dir": output_dir,
+                "output_dir": preprocessing_dir,
             },
-            summary=_summarise_scanpy_comparison,
+            summary=_summarise_runner_result,
         ),
         "scanpy_de_t_test": BenchmarkMethod(
             name="scanpy_de_t_test",
             description="Differential expression using Scanpy (t-test)",
-            function=run_scanpy_de_comparison,
+            function=run_scanpy_de,
             kwargs={
-                "dataset_path": dataset_path,
+                "dataset_path": preprocessed_path,
                 "perturbation_column": shared_kwargs["perturbation_column"],
                 "control_label": shared_kwargs["control_label"],
-                "gene_name_column": shared_kwargs["gene_name_column"],
-                "min_genes": min_genes,
-                "min_cells_per_perturbation": min_cells_per_perturbation,
-                "min_cells_per_gene": min_cells_per_gene,
-                "output_dir": output_dir,
-                "test_type": "t-test",
+                "method": "t-test",
+                "output_dir": de_dir,
+                "preprocess": False,
             },
-            summary=_summarise_de_comparison,
+            summary=_summarise_runner_result,
         ),
         "scanpy_de_wilcoxon": BenchmarkMethod(
             name="scanpy_de_wilcoxon",
             description="Differential expression using Scanpy (Wilcoxon)",
-            function=run_scanpy_de_comparison,
+            function=run_scanpy_de,
             kwargs={
                 "dataset_path": dataset_path,
                 "perturbation_column": shared_kwargs["perturbation_column"],
                 "control_label": shared_kwargs["control_label"],
-                "gene_name_column": shared_kwargs["gene_name_column"],
-                "min_genes": min_genes,
-                "min_cells_per_perturbation": min_cells_per_perturbation,
-                "min_cells_per_gene": min_cells_per_gene,
-                "output_dir": output_dir,
-                "test_type": "wilcoxon",
+                "method": "wilcoxon",
+                "output_dir": de_dir,
             },
-            summary=_summarise_de_comparison,
+            summary=_summarise_runner_result,
         ),
         "edger_de_glm": BenchmarkMethod(
             name="edger_de_glm",
             description="Differential expression using edgeR (GLM)",
-            function=run_edger_direct_comparison,
+            function=run_edger_de,
             kwargs={
                 "dataset_path": dataset_path,
                 "perturbation_column": shared_kwargs["perturbation_column"],
                 "control_label": shared_kwargs["control_label"],
-                "gene_name_column": shared_kwargs["gene_name_column"],
-                "min_genes": min_genes,
-                "min_cells_per_perturbation": min_cells_per_perturbation,
-                "min_cells_per_gene": min_cells_per_gene,
-                "output_dir": output_dir,
+                "output_dir": de_dir,
                 "n_jobs": n_cores,
             },
-            summary=_summarise_de_comparison,
+            summary=_summarise_runner_result,
         ),
         "pertpy_de_pydeseq2": BenchmarkMethod(
             name="pertpy_de_pydeseq2",
-            description="Differential expression using PyDESeq2 via Pertpy (GLM)",
-            function=run_pertpy_de_comparison,
+            description="Differential expression using Pertpy (PyDESeq2)",
+            function=run_pertpy_de,
             kwargs={
                 "dataset_path": dataset_path,
                 "perturbation_column": shared_kwargs["perturbation_column"],
                 "control_label": shared_kwargs["control_label"],
-                "gene_name_column": shared_kwargs["gene_name_column"],
-                "min_genes": min_genes,
-                "min_cells_per_perturbation": min_cells_per_perturbation,
-                "min_cells_per_gene": min_cells_per_gene,
-                "output_dir": output_dir,
                 "backend": "pydeseq2",
+                "output_dir": de_dir,
                 "n_jobs": n_cores,
             },
-            summary=_summarise_de_comparison,
+            summary=_summarise_runner_result,
         ),
-        # Note: pertpy_statsmodels_comparison is excluded because statsmodels via Pertpy
-        # does not support parallelization and is extremely slow on large datasets.
-        # The pydeseq2 comparison provides similar GLM-based validation.
     }
+
     return methods
 
 
@@ -3783,6 +2520,12 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=4.0,
         help="Maximum memory per method in gigabytes (0 disables the limit)",
+    )
+    parser.add_argument(
+        "--chunk-size",
+        type=int,
+        default=None,
+        help="Chunk size for streaming operations (overrides config and adaptive calculation)",
     )
     
     # Environment configuration arguments
@@ -4067,11 +2810,6 @@ def _run_single_benchmark(
         (results_dataframe, metadata_dict)
     """
     
-    # Clear caches at the start of each benchmark run to free memory
-    global _SCANPY_COMPARISON_CACHE, _REFERENCE_ANNDATA_CACHE
-    _SCANPY_COMPARISON_CACHE.clear()
-    _REFERENCE_ANNDATA_CACHE.clear()
-    
     # Standardize dataset (uses cache if available)
     if not config.quiet:
         print(f"\nStandardizing dataset: {config.dataset_path.name}")
@@ -4103,7 +2841,7 @@ def _run_single_benchmark(
         adata_temp = ad.read_h5ad(standardized_path, backed='r')
         try:
             qc_params_used = calculate_adaptive_qc_thresholds(
-                adata_temp, "perturbation", mode=config.adaptive_qc_mode
+                adata_temp, "perturbation", mode=config.adaptive_qc_mode, chunk_size=config.chunk_size
             )
             
             if not config.quiet:
@@ -4118,7 +2856,7 @@ def _run_single_benchmark(
             "min_genes": config.qc_params.min_genes,
             "min_cells_per_perturbation": config.qc_params.min_cells_per_perturbation,
             "min_cells_per_gene": config.qc_params.min_cells_per_gene,
-            "chunk_size": config.qc_params.chunk_size,
+            "chunk_size": config.chunk_size if config.chunk_size is not None else config.qc_params.chunk_size,
         }
     
     # Check cache validity and invalidate if needed
@@ -4153,6 +2891,7 @@ def _run_single_benchmark(
         gene_name_column=config.gene_name_column,
         qc_params=config.qc_params,  # Will use adaptive if None
         n_cores=config.n_cores,
+        chunk_size=config.chunk_size,
     )
     
     methods_to_run = config.methods_to_run
@@ -4341,6 +3080,10 @@ def main() -> None:
             # Also update n_cores in config if specified via CLI
             if args.n_cores and config.n_cores is None:
                 config.n_cores = args.n_cores
+            
+            # Update chunk_size if specified via CLI
+            if hasattr(args, 'chunk_size') and args.chunk_size is not None:
+                config.chunk_size = args.chunk_size
     else:
         # Traditional CLI mode - create config from arguments
         dataset_path = args.data_path
@@ -4378,6 +3121,7 @@ def main() -> None:
             quiet=args.quiet,
             n_cores=args.n_cores if hasattr(args, 'n_cores') else None,
             environment_config=env_config,
+            chunk_size=args.chunk_size if hasattr(args, 'chunk_size') else None,
         )]
     
     # Run benchmarks for each configuration
@@ -4406,6 +3150,12 @@ def main() -> None:
         df.to_csv(csv_path, index=False)
         md_path.write_text(_dataframe_to_markdown(df, summary))
         summary_json_path.write_text(json.dumps(summary, indent=2, sort_keys=True))
+        
+        # Run evaluation
+        evaluate_benchmarks(config.output_dir)
+        
+        # Evaluate benchmarks (generate comparison tables)
+        evaluate_benchmarks(config.output_dir)
 
         if not config.quiet:
             print(f"\nBenchmark complete for {config.dataset_name}")

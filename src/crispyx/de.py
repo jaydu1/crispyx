@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import logging
 import os
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Iterable, Literal, Mapping
@@ -11,6 +12,7 @@ from typing import Dict, Iterable, Literal, Mapping
 import anndata as ad
 import numpy as np
 import pandas as pd
+import scipy.sparse as sp
 from scipy.stats import norm, rankdata
 
 from .data import (
@@ -23,6 +25,8 @@ from .data import (
     resolve_output_path,
 )
 from .glm import NBGLMFitter, build_design_matrix
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -304,19 +308,69 @@ def t_test(
         group_index = {label: idx for idx, label in enumerate(groups)}
         label_codes = pd.Categorical(labels, categories=groups).codes
 
+        # Check if data is already log-transformed
+        is_logged = False
+        # Read a small chunk to check data type and range
+        for _, chunk in iter_matrix_chunks(backed, axis=0, chunk_size=100, convert_to_dense=True):
+            if np.issubdtype(chunk.dtype, np.integer):
+                logger.warning("Input data appears to be raw counts (integers). t-test expects log-transformed data, but will perform normalization and log1p transformation automatically.")
+            elif np.issubdtype(chunk.dtype, np.floating):
+                # Check if max value is small (heuristic for log-transformed)
+                # 20 is a safe upper bound for log1p(counts) usually (e^20 is huge)
+                if chunk.max() < 20: 
+                    # Check if it looks like integers (e.g. 1.0, 2.0)
+                    if np.all(np.mod(chunk[chunk > 0], 1) == 0):
+                        logger.warning("Input data is floats but appears to be integer counts. Will perform normalization and log1p.")
+                    else:
+                        is_logged = True
+                        logger.info("Input data appears to be log-transformed. Skipping normalization and log1p.")
+                else:
+                    logger.warning("Input data is floats with large values. Treating as raw counts.")
+            break # Only check the first chunk
+
         n_groups_total = len(groups)
+        # Use float64 for accumulation to maintain numerical precision
         sums = np.zeros((n_groups_total, n_genes), dtype=np.float64)
-        sumsq = np.zeros_like(sums)
+        sumsq = np.zeros((n_groups_total, n_genes), dtype=np.float64)
         counts = np.zeros(n_groups_total, dtype=np.int64)
-        expr_counts = np.zeros((n_groups_total, n_genes), dtype=np.int64)
-        for slc, block in iter_matrix_chunks(backed, axis=0, chunk_size=chunk_size):
+        expr_counts = np.zeros((n_groups_total, n_genes), dtype=np.int32)
+        for slc, block in iter_matrix_chunks(backed, axis=0, chunk_size=chunk_size, convert_to_dense=False):
             slice_codes = label_codes[slc]
-            normalised_block, _ = normalize_total_block(block)
-            raw_block = np.asarray(block)
-            log_block = np.log1p(normalised_block)
+            
+            # Optimize memory: sparse-aware expression counting
+            if sp.issparse(block):
+                # Convert to CSR for efficient row iteration, then get binary indicator per gene
+                csr = sp.csr_matrix(block)
+                # For each unique group code in this slice, accumulate expression counts
+                for code in np.unique(slice_codes):
+                    row_mask = slice_codes == code
+                    group_block = csr[row_mask, :]
+                    # Count non-zeros per column (gene) - getnnz returns count per column
+                    expr_counts[code] += np.asarray(group_block.getnnz(axis=0), dtype=np.int32)
+            else:
+                mask = block > 0
+                np.add.at(expr_counts, slice_codes, mask)
+                del mask
+
+            if is_logged:
+                if sp.issparse(block):
+                    log_block = block.toarray()
+                else:
+                    log_block = block
+                # Ensure float32 for consistency
+                if log_block.dtype != np.float32:
+                    log_block = log_block.astype(np.float32)
+            else:
+                # Optimize memory: in-place log1p
+                normalised_block, _ = normalize_total_block(block, dtype=np.float32)
+                np.log1p(normalised_block, out=normalised_block)
+                log_block = normalised_block
+            
             np.add.at(sums, slice_codes, log_block)
-            np.add.at(sumsq, slice_codes, np.square(log_block))
-            np.add.at(expr_counts, slice_codes, raw_block > 0)
+            # Compute squared values in-place to avoid temporary array allocation
+            np.square(log_block, out=log_block)
+            np.add.at(sumsq, slice_codes, log_block)
+            del log_block  # Explicitly free the chunk memory
             counts += np.bincount(slice_codes, minlength=n_groups_total)
     finally:
         backed.file.close()
@@ -331,14 +385,6 @@ def t_test(
     if control_n > 1:
         control_var = (sumsq[control_idx] - (sums[control_idx] ** 2) / control_n) / (control_n - 1)
     control_var = np.clip(control_var, a_min=0, a_max=None)
-
-    effect_matrix = []
-    statistic_matrix = []
-    pvalue_matrix = []
-    lfc_matrix = []
-    pts_matrix = []
-    pts_rest_matrix = []
-    order_matrix = []
 
     # Calculate control pts (proportion of cells expressing each gene)
     control_pts = np.divide(
@@ -357,78 +403,92 @@ def t_test(
         worker_count = min(n_groups, abs(n_jobs))
     worker_count = max(worker_count, 1)
 
+    # Pre-allocate result arrays to avoid memory spikes from list collection and vstack
+    # Use float32 for effect/lfc/pts to match scanpy's approach; keep float64 for p-values and statistics
+    shape = (n_groups, n_genes)
+    effect_arr = np.zeros(shape, dtype=np.float32)
+    stat_arr = np.zeros(shape, dtype=np.float64)
+    p_arr = np.ones(shape, dtype=np.float64)
+    lfc_arr = np.zeros(shape, dtype=np.float32)
+    pts_arr = np.zeros(shape, dtype=np.float32)
+    # Store control_pts as 1D array; broadcast when creating RankGenesGroupsResult
+    pts_rest_1d = control_pts.astype(np.float32)
+    order_arr = np.zeros(shape, dtype=np.int64)
+
     def compute_perturbation(label: str) -> tuple[str, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """Compute statistics for a single perturbation."""
         idx = group_index[label]
         n_cells = counts[idx]
         if n_cells == 0:
             raise ValueError(f"Perturbation '{label}' contains no cells")
+        # Use in-place operations to minimize temporary arrays
         mean = sums[idx] / n_cells
-        var = np.zeros_like(mean)
+        # Compute variance in-place
+        var = sumsq[idx].copy()
         if n_cells > 1:
-            var = (sumsq[idx] - (sums[idx] ** 2) / n_cells) / (n_cells - 1)
-        var = np.clip(var, a_min=0, a_max=None)
-        effect = mean - control_mean
-        log_fc = effect  # For t-test, effect size is log fold change
-        se = np.sqrt(control_var / control_n + var / n_cells)
+            np.subtract(var, np.square(sums[idx]) / n_cells, out=var)
+            np.divide(var, n_cells - 1, out=var)
+        else:
+            var.fill(0)
+        np.clip(var, a_min=0, a_max=None, out=var)
+        
+        # effect = mean - control_mean (reuse mean array)
+        effect = mean
+        np.subtract(effect, control_mean, out=effect)
+        
+        # Compute standard error in-place using var array
+        se = var  # Reuse var array for se
+        np.divide(se, n_cells, out=se)
+        np.add(se, control_var / control_n, out=se)
+        np.sqrt(se, out=se)
+        
         total_expr = expr_counts[idx] + expr_counts[control_idx]
         valid = (se > 0) & (total_expr >= min_cells_expressed)
-        z = np.zeros_like(effect)
-        pvalue = np.ones_like(effect)
+        
+        z = np.zeros(n_genes, dtype=np.float64)
+        pvalue = np.ones(n_genes, dtype=np.float64)
         z[valid] = effect[valid] / se[valid]
         pvalue[valid] = 2 * norm.sf(np.abs(z[valid]))
 
         # Calculate pts (proportion of cells expressing each gene)
-        pts = np.divide(
-            expr_counts[idx],
-            n_cells,
-            out=np.zeros(n_genes, dtype=float),
-            where=n_cells > 0,
-        )
+        pts = np.zeros(n_genes, dtype=np.float32)
+        np.divide(expr_counts[idx], n_cells, out=pts, where=n_cells > 0, casting='unsafe')
         
         # Create ranking order (descending by absolute z-score)
         order = np.argsort(-np.abs(z))
         
-        return label, effect, z, pvalue, log_fc, pts, order
+        # Return effect as float32 for memory efficiency
+        return label, effect.astype(np.float32), z, pvalue, effect.astype(np.float32), pts, order
 
     # Compute in parallel or sequentially based on worker count
-    if n_groups == 0:
-        computed = []
-    elif n_groups == 1 or worker_count == 1:
-        computed = [compute_perturbation(label) for label in candidates]
-    else:
-        with ThreadPoolExecutor(max_workers=worker_count) as executor:
-            futures = [executor.submit(compute_perturbation, label) for label in candidates]
-            computed = [future.result() for future in futures]
-
-    for label, effect, z, pvalue, log_fc, pts, order in computed:
-        effect_matrix.append(effect)
-        statistic_matrix.append(z)
-        pvalue_matrix.append(pvalue)
-        lfc_matrix.append(log_fc)
-        pts_matrix.append(pts)
-        pts_rest_matrix.append(control_pts)
-        order_matrix.append(order)
-
-    gene_symbols = pd.Index(gene_symbols).astype(str)
-
-    if effect_matrix:
-        effect_arr = np.vstack(effect_matrix)
-        stat_arr = np.vstack(statistic_matrix)
-        p_arr = np.vstack(pvalue_matrix)
-        lfc_arr = np.vstack(lfc_matrix)
-        pts_arr = np.vstack(pts_matrix)
-        pts_rest_arr = np.vstack(pts_rest_matrix)
-        order_arr = np.vstack(order_matrix)
-    else:
-        shape = (0, gene_symbols.size)
-        effect_arr = np.zeros(shape)
-        stat_arr = np.zeros(shape)
-        p_arr = np.zeros(shape)
-        lfc_arr = np.zeros(shape)
-        pts_arr = np.zeros(shape)
-        pts_rest_arr = np.zeros(shape)
-        order_arr = np.zeros(shape, dtype=np.int64)
+    if n_groups > 0:
+        # Map candidates to their index in the result arrays
+        candidate_indices = {label: i for i, label in enumerate(candidates)}
+        
+        if n_groups == 1 or worker_count == 1:
+            for label in candidates:
+                _, effect, z, pvalue, log_fc, pts, order = compute_perturbation(label)
+                i = candidate_indices[label]
+                effect_arr[i] = effect
+                stat_arr[i] = z
+                p_arr[i] = pvalue
+                lfc_arr[i] = log_fc
+                pts_arr[i] = pts
+                order_arr[i] = order
+        else:
+            with ThreadPoolExecutor(max_workers=worker_count) as executor:
+                futures = {executor.submit(compute_perturbation, label): label for label in candidates}
+                for future in as_completed(futures):
+                    label_res, effect, z, pvalue, log_fc, pts, order = future.result()
+                    i = candidate_indices[label_res]
+                    effect_arr[i] = effect
+                    stat_arr[i] = z
+                    p_arr[i] = pvalue
+                    lfc_arr[i] = log_fc
+                    pts_arr[i] = pts
+                    order_arr[i] = order
+                    # Help GC
+                    del effect, z, pvalue, log_fc, pts, order
 
     # Apply p-value correction
     pvalue_adj_arr = _adjust_pvalue_matrix(p_arr, method="benjamini-hochberg")
@@ -447,6 +507,9 @@ def t_test(
     
     output_path = resolve_output_path(path, suffix="t_test", output_dir=output_dir, data_name=data_name)
     
+    # Broadcast pts_rest from 1D to 2D at final result construction (avoids storing full copy)
+    pts_rest_arr = np.broadcast_to(pts_rest_1d, shape).copy()
+    
     result = RankGenesGroupsResult(
         genes=gene_symbols,
         groups=candidates,
@@ -455,7 +518,7 @@ def t_test(
         pvalues_adj=pvalue_adj_arr,
         logfoldchanges=lfc_arr,
         effect_size=effect_arr,
-        u_statistics=np.zeros_like(effect_arr),  # Not used in t-test
+        u_statistics=np.zeros(shape, dtype=np.float32),  # Not used in t-test
         pts=pts_arr,
         pts_rest=pts_rest_arr,
         order=order_arr,

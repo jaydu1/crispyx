@@ -413,6 +413,7 @@ def normalize_total_block(
     *,
     library_size: np.ndarray | None = None,
     target_sum: float = 1e4,
+    dtype: np.dtype | type = np.float64,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Return a library-size normalised dense view of ``block``.
 
@@ -426,23 +427,25 @@ def normalize_total_block(
     target_sum:
         Target total counts per cell after normalisation, matching the default
         used by :func:`scanpy.pp.normalize_total`.
+    dtype:
+        Data type for the output dense array. Defaults to float64.
 
     Returns
     -------
     tuple
         A tuple ``(normalised, library_size)`` where ``normalised`` is a dense
-        ``float64`` array containing the normalised counts and ``library_size``
+        array containing the normalised counts and ``library_size``
         contains the per-cell library sizes that were used.
     """
 
-    dense = _to_dense(block).astype(np.float64, copy=True)
+    dense = _to_dense(block).astype(dtype, copy=True)
     if dense.ndim != 2:
         raise ValueError("block must be two-dimensional")
 
     if library_size is None:
         library_size = dense.sum(axis=1)
     else:
-        library_size = np.asarray(library_size, dtype=np.float64)
+        library_size = np.asarray(library_size, dtype=dtype)
         if library_size.shape[0] != dense.shape[0]:
             raise ValueError(
                 "library_size length does not match the number of cells in block"
@@ -451,7 +454,7 @@ def normalize_total_block(
     scale = np.divide(
         float(target_sum),
         library_size,
-        out=np.zeros_like(library_size, dtype=np.float64),
+        out=np.zeros_like(library_size, dtype=dtype),
         where=library_size > 0,
     )
     dense *= scale[:, None]
@@ -662,6 +665,7 @@ def calculate_adaptive_qc_thresholds(
     perturbation_column: str,
     mode: str = "conservative",
     sample_size: int = 10000,
+    chunk_size: int | None = None,
 ) -> dict:
     """Calculate adaptive QC thresholds based on data distribution.
     
@@ -679,6 +683,8 @@ def calculate_adaptive_qc_thresholds(
         'aggressive' (5th percentile, retains ~95%).
     sample_size
         Maximum number of cells to sample for gene expression analysis.
+    chunk_size
+        Optional fixed chunk size to use. If None, calculated adaptively.
     
     Returns
     -------
@@ -718,7 +724,8 @@ def calculate_adaptive_qc_thresholds(
     cells_per_gene = np.zeros(adata.n_vars, dtype=np.int64)
     genes_per_cell = np.zeros(n_sample if sample_idx is not None else adata.n_obs, dtype=np.int64)
     
-    chunk_size = calculate_optimal_chunk_size(adata.n_obs, adata.n_vars)
+    if chunk_size is None:
+        chunk_size = calculate_optimal_chunk_size(adata.n_obs, adata.n_vars)
     cell_idx = 0
     
     for chunk_start in range(0, adata.n_obs, chunk_size):
@@ -762,8 +769,9 @@ def calculate_adaptive_qc_thresholds(
     median_genes = int(np.median(genes_per_cell))
     min_genes = max(5, min(50, median_genes // 10))  # 10% of median
     
-    # Calculate optimal chunk size
-    chunk_size = calculate_optimal_chunk_size(adata.n_obs, adata.n_vars)
+    # Calculate optimal chunk size if not provided
+    if chunk_size is None:
+        chunk_size = calculate_optimal_chunk_size(adata.n_obs, adata.n_vars)
     
     thresholds = {
         "min_genes": min_genes,
