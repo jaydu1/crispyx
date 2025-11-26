@@ -33,3 +33,8 @@ Outputs
 The script accepts additional options to benchmark a subset of methods or to
 redirect outputs to a different directory. Refer to ``benchmarking/README.md``
 for further details.
+
+Latest Adamson_subset benchmark
+-------------------------------
+
+For the most recent Adamson_subset run (2025-11-26), see :doc:`Adamson_subset_results`.

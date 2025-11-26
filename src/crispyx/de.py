@@ -256,14 +256,18 @@ def t_test(
     `uns['rank_genes_groups']` containing logfoldchanges, scores (z-statistics),
     p-values, adjusted p-values, and proportion of expressing cells.
     
-    The RankGenesGroupsResult implements the Mapping interface, so it can be used 
+    The RankGenesGroupsResult implements the Mapping interface, so it can be used
     like a dict: `result[perturbation_label]` returns a DifferentialExpressionResult
     for that perturbation.
+
+    Input data **must already be normalized and log-transformed** (for example
+    using `scanpy.pp.normalize_total` followed by `scanpy.pp.log1p`). Raw counts
+    are no longer automatically normalized; count-like inputs will raise an error.
     
     Parameters
     ----------
     path
-        Path to an h5ad file containing expression data.
+        Path to an h5ad file containing log-transformed expression data.
     perturbation_column
         Column in `adata.obs` indicating perturbation labels.
     control_label
@@ -277,7 +281,8 @@ def t_test(
     cell_chunk_size
         Number of cells to process per chunk (memory vs. speed tradeoff). This
         controls streaming along the cell axis and is distinct from any future
-        perturbation_chunk_size option that would batch perturbations.
+        perturbation_chunk_size option that would batch perturbations. Data must
+        already be normalized/log-transformed before chunking.
     output_dir
         Directory for output h5ad file. Defaults to input file's directory.
     data_name
@@ -310,25 +315,25 @@ def t_test(
         group_index = {label: idx for idx, label in enumerate(groups)}
         label_codes = pd.Categorical(labels, categories=groups).codes
 
-        # Check if data is already log-transformed
-        is_logged = False
-        # Read a small chunk to check data type and range
+        # Validate that input data is already normalized/log-transformed
         for _, chunk in iter_matrix_chunks(backed, axis=0, chunk_size=100, convert_to_dense=True):
             if np.issubdtype(chunk.dtype, np.integer):
-                logger.warning("Input data appears to be raw counts (integers). t-test expects log-transformed data, but will perform normalization and log1p transformation automatically.")
-            elif np.issubdtype(chunk.dtype, np.floating):
-                # Check if max value is small (heuristic for log-transformed)
-                # 20 is a safe upper bound for log1p(counts) usually (e^20 is huge)
-                if chunk.max() < 20: 
-                    # Check if it looks like integers (e.g. 1.0, 2.0)
-                    if np.all(np.mod(chunk[chunk > 0], 1) == 0):
-                        logger.warning("Input data is floats but appears to be integer counts. Will perform normalization and log1p.")
-                    else:
-                        is_logged = True
-                        logger.info("Input data appears to be log-transformed. Skipping normalization and log1p.")
-                else:
-                    logger.warning("Input data is floats with large values. Treating as raw counts.")
-            break # Only check the first chunk
+                raise ValueError(
+                    "t_test requires pre-normalized, log-transformed expression data. "
+                    "Integer inputs appear to be raw counts. Please run preprocessing "
+                    "such as scanpy.pp.normalize_total followed by scanpy.pp.log1p before calling t_test."
+                )
+            if np.issubdtype(chunk.dtype, np.floating):
+                # Treat float data that is effectively count-like as raw counts
+                non_zero = chunk[chunk > 0]
+                is_count_like = non_zero.size > 0 and np.all(np.isclose(non_zero, np.round(non_zero)))
+                if is_count_like:
+                    raise ValueError(
+                        "t_test requires pre-normalized, log-transformed expression data. "
+                        "Detected count-like floating point values; please apply normalization "
+                        "and log-transformation upstream."
+                    )
+            break  # Only check the first chunk
 
         n_groups_total = len(groups)
         # Use float64 for accumulation to maintain numerical precision
@@ -356,19 +361,13 @@ def t_test(
                 np.add.at(expr_counts, slice_codes, mask)
                 del mask
 
-            if is_logged:
-                if sp.issparse(block):
-                    log_block = block.toarray()
-                else:
-                    log_block = block
-                # Ensure float32 for consistency
-                if log_block.dtype != np.float32:
-                    log_block = log_block.astype(np.float32)
+            if sp.issparse(block):
+                log_block = block.toarray()
             else:
-                # Optimize memory: in-place log1p
-                normalised_block, _ = normalize_total_block(block, dtype=np.float32)
-                np.log1p(normalised_block, out=normalised_block)
-                log_block = normalised_block
+                log_block = block
+            # Ensure float32 for consistency
+            if log_block.dtype != np.float32:
+                log_block = log_block.astype(np.float32)
             
             np.add.at(sums, slice_codes, log_block)
             # Compute squared values in-place to avoid temporary array allocation
