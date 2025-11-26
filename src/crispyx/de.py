@@ -316,7 +316,7 @@ def t_test(
         The h5ad file path is available at `result.result_path`.
     """
 
-    normalize_and_log = False
+
     backed = read_backed(path)
     try:
         gene_symbols = ensure_gene_symbol_column(backed, gene_name_column)
@@ -325,29 +325,31 @@ def t_test(
                 f"Perturbation column '{perturbation_column}' was not found in adata.obs. Available columns: {list(backed.obs.columns)}"
             )
         labels = backed.obs[perturbation_column].astype(str).to_numpy()
-        control_label = resolve_control_label(labels, control_label)
+        control_label = resolve_control_label(list(labels), control_label)
         n_genes = backed.n_vars
         candidates = _resolve_candidates(labels, control_label, perturbations)
         groups = [control_label] + candidates
         group_index = {label: idx for idx, label in enumerate(groups)}
         label_codes = pd.Categorical(labels, categories=groups).codes
 
-        # Validate that input data is already normalized/log-transformed
-        for _, chunk in iter_matrix_chunks(backed, axis=0, chunk_size=100, convert_to_dense=True):
+        # Only allow sparse matrices; raise error if dense
+        for _, chunk in iter_matrix_chunks(backed, axis=0, chunk_size=100, convert_to_dense=False):
+            if not sp.issparse(chunk):
+                raise ValueError(
+                    "t_test only supports sparse input matrices. Please provide a scipy sparse matrix (e.g., CSR/CSC)."
+                )
+            # Optionally warn if data looks like counts
             if np.issubdtype(chunk.dtype, np.integer):
-                normalize_and_log = True
                 logger.warning(
-                    "Detected integer count data in t_test; automatically applying normalize_total + log1p. "
+                    "Detected integer count data in t_test; input should be normalized/log-transformed. "
                     "For reproducibility, please preprocess explicitly upstream."
                 )
             elif np.issubdtype(chunk.dtype, np.floating):
-                # Treat float data that is effectively count-like as raw counts
-                non_zero = chunk[chunk > 0]
+                non_zero = chunk.data[chunk.data > 0]
                 is_count_like = non_zero.size > 0 and np.all(np.isclose(non_zero, np.round(non_zero)))
                 if is_count_like:
-                    normalize_and_log = True
                     logger.warning(
-                        "Detected count-like floating point values; proceeding with normalize_total + log1p. "
+                        "Detected count-like floating point values in t_test; input should be normalized/log-transformed. "
                         "Please ensure preprocessing is applied upstream for consistent results."
                     )
             break  # Only check the first chunk
@@ -362,37 +364,16 @@ def t_test(
             backed, axis=0, chunk_size=cell_chunk_size, convert_to_dense=False
         ):
             slice_codes = label_codes[slc]
-
-            expr_block = block
-            if normalize_and_log:
-                expr_block, _ = normalize_total_block(block, target_sum=1e4, dtype=np.float32)
-                np.log1p(expr_block, out=expr_block)
-
-            # Optimize memory: sparse-aware expression counting
-            if sp.issparse(expr_block):
-                # Convert to CSR for efficient row iteration, then get binary indicator per gene
-                csr = sp.csr_matrix(expr_block)
-                for code in np.unique(slice_codes):
-                    row_mask = slice_codes == code
-                    group_block = csr[row_mask, :]
-                    expr_counts[code] += np.asarray(group_block.getnnz(axis=0), dtype=np.int32)
-            else:
-                mask = expr_block > 0
-                np.add.at(expr_counts, slice_codes, mask)
-                del mask
-
-            if sp.issparse(expr_block):
-                log_block = expr_block.toarray()
-            else:
-                log_block = expr_block
-            if log_block.dtype != np.float32:
-                log_block = log_block.astype(np.float32)
-
-            np.add.at(sums, slice_codes, log_block)
-            np.square(log_block, out=log_block)
-            np.add.at(sumsq, slice_codes, log_block)
-            del log_block
-            counts += np.bincount(slice_codes, minlength=n_groups_total)
+            csr = sp.csr_matrix(block)
+            for code in np.unique(slice_codes):
+                row_mask = slice_codes == code
+                group_block = csr[row_mask, :]
+                # Expression count: number of nonzero per gene
+                expr_counts[code] += np.asarray(group_block.getnnz(axis=0), dtype=np.int32)
+                # Sum and sumsq using sparse ops
+                sums[code] += group_block.sum(axis=0).A1.astype(np.float64)
+                sumsq[code] += group_block.power(2).sum(axis=0).A1.astype(np.float64)
+                counts[code] += row_mask.sum()
     finally:
         backed.file.close()
 
@@ -669,7 +650,7 @@ def nb_glm_test(
             )
         obs_df = backed.obs[[perturbation_column] + covariates].copy()
         labels = obs_df[perturbation_column].astype(str).to_numpy()
-        control_label = resolve_control_label(labels, control_label)
+        control_label = resolve_control_label(list(labels), control_label)
         n_genes = backed.n_vars
         candidates = _resolve_candidates(labels, control_label, perturbations)
         control_mask = labels == control_label
