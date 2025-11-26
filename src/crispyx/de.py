@@ -244,7 +244,7 @@ def t_test(
     gene_name_column: str | None = None,
     perturbations: Iterable[str] | None = None,
     min_cells_expressed: int = 0,
-    chunk_size: int = 2048,
+    cell_chunk_size: int = 2048,
     output_dir: str | Path | None = None,
     data_name: str | None = None,
     n_jobs: int | None = None,
@@ -274,8 +274,10 @@ def t_test(
         Specific perturbations to test. If None, tests all non-control groups.
     min_cells_expressed
         Minimum total cells (control + perturbation) expressing a gene for testing.
-    chunk_size
-        Number of cells to process per chunk (memory vs. speed tradeoff).
+    cell_chunk_size
+        Number of cells to process per chunk (memory vs. speed tradeoff). This
+        controls streaming along the cell axis and is distinct from any future
+        perturbation_chunk_size option that would batch perturbations.
     output_dir
         Directory for output h5ad file. Defaults to input file's directory.
     data_name
@@ -334,7 +336,9 @@ def t_test(
         sumsq = np.zeros((n_groups_total, n_genes), dtype=np.float64)
         counts = np.zeros(n_groups_total, dtype=np.int64)
         expr_counts = np.zeros((n_groups_total, n_genes), dtype=np.int32)
-        for slc, block in iter_matrix_chunks(backed, axis=0, chunk_size=chunk_size, convert_to_dense=False):
+        for slc, block in iter_matrix_chunks(
+            backed, axis=0, chunk_size=cell_chunk_size, convert_to_dense=False
+        ):
             slice_codes = label_codes[slc]
             
             # Optimize memory: sparse-aware expression counting
