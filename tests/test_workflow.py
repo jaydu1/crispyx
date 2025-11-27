@@ -27,7 +27,6 @@ from crispyx import (
     t_test,
     wilcoxon_test,
 )
-from crispyx.data import normalize_total_block
 
 
 def create_test_dataset(tmp_path):
@@ -60,6 +59,16 @@ def create_sparse_test_dataset(tmp_path):
     sparse_path = tmp_path / "test_sparse.h5ad"
     sparse.write(sparse_path)
     return sparse_path, sparse
+
+
+def _log_normalise_sparse(adata: ad.AnnData) -> ad.AnnData:
+    """Return a log-normalised sparse copy of ``adata``."""
+
+    normalised = adata.copy()
+    sc.pp.normalize_total(normalised)
+    sc.pp.log1p(normalised)
+    normalised.X = sp.csr_matrix(normalised.X)
+    return normalised
 
 
 def _normalize_total(matrix: np.ndarray, *, target_sum: float = 1e4) -> np.ndarray:
@@ -163,6 +172,9 @@ def test_downstream_effect_outputs(tmp_path):
         output_dir=tmp_path,
         data_name="avg_effects",
     )
+    wilcoxon_input = _log_normalise_sparse(qc_result.filtered.to_memory())
+    wilcoxon_input_path = tmp_path / "qc_filtered_log_norm.h5ad"
+    wilcoxon_input.write(wilcoxon_input_path)
     pseudo = compute_pseudobulk_expression(
         qc_result.filtered,
         perturbation_column="perturbation",
@@ -180,7 +192,7 @@ def test_downstream_effect_outputs(tmp_path):
         data_name="t_test",
     )
     wilcoxon = wilcoxon_test(
-        qc_result.filtered,
+        wilcoxon_input_path,
         perturbation_column="perturbation",
         control_label="ctrl",
         gene_name_column="gene_symbols",
@@ -204,8 +216,7 @@ def test_downstream_effect_outputs(tmp_path):
     filtered = qc_result.filtered.to_memory()
     ctrl_mask = (filtered.obs["perturbation"] == "ctrl").to_numpy()
     ko1_mask = (filtered.obs["perturbation"] == "KO1").to_numpy()
-    normalised, _ = normalize_total_block(filtered.X)
-    log_block = np.log1p(normalised)
+    log_block = np.asarray(wilcoxon_input.X.toarray())
     ctrl = log_block[ctrl_mask, 0]
     ko1 = log_block[ko1_mask, 0]
     expected = ko1.mean() - ctrl.mean()
@@ -340,8 +351,12 @@ def test_scanpy_style_namespaces_match_direct(tmp_path):
     np.testing.assert_allclose(wald_wrapped_full["scores"], direct_stat)
     np.testing.assert_allclose(wald_wrapped_full["pvals"], direct_p)
 
+    wilcoxon_input = _log_normalise_sparse(qc_wrapped_mem)
+    wilcoxon_path = tmp_path / "qc_filtered_wilcoxon_norm.h5ad"
+    wilcoxon_input.write(wilcoxon_path)
+
     wilcoxon_wrapped = cx.tl.rank_genes_groups(
-        qc_wrapped,
+        wilcoxon_path,
         perturbation_column="perturbation",
         method="wilcoxon",
         control_label="ctrl",
@@ -351,7 +366,7 @@ def test_scanpy_style_namespaces_match_direct(tmp_path):
         min_cells_expressed=0,
     )
     wilcoxon_direct = wilcoxon_test(
-        qc_direct.filtered,
+        wilcoxon_path,
         perturbation_column="perturbation",
         control_label="ctrl",
         gene_name_column="gene_symbols",

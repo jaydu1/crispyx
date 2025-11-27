@@ -2319,10 +2319,13 @@ def create_benchmark_suite(
     preprocessed_path = preprocessing_dir / f"preprocessed_{dataset_path.name}"
     if not preprocessed_path.exists():
         import scanpy as sc
+        import scipy.sparse as sp
         print(f"Generating preprocessed dataset for t-test benchmarks: {preprocessed_path}")
         adata_pp = sc.read_h5ad(dataset_path)
         sc.pp.normalize_total(adata_pp)
         sc.pp.log1p(adata_pp)
+        if not sp.issparse(adata_pp.X):
+            adata_pp.X = sp.csr_matrix(adata_pp.X)
         adata_pp.write(preprocessed_path)
 
     methods = {
@@ -2384,7 +2387,7 @@ def create_benchmark_suite(
             description="Wilcoxon rank-sum differential expression",
             function=wilcoxon_test,
             kwargs={
-                "path": dataset_path,
+                "path": preprocessed_path,
                 **shared_kwargs,
                 "output_dir": de_dir,
                 "data_name": "de_wilcoxon",

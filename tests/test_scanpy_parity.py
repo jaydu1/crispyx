@@ -322,6 +322,9 @@ def test_differential_expression_matches_scanpy(subset_dataset, tmp_path):
     scanpy_filtered = filtered.copy()
     sc.pp.normalize_total(scanpy_filtered, target_sum=1e4)
     sc.pp.log1p(scanpy_filtered)
+    scanpy_filtered.X = sp.csr_matrix(scanpy_filtered.X)
+    wilcoxon_path = tmp_path / "scanpy_parity_wilcoxon_norm.h5ad"
+    scanpy_filtered.write(wilcoxon_path)
     sc.tl.rank_genes_groups(
         scanpy_filtered,
         groupby=PERTURBATION_COLUMN,
@@ -334,7 +337,7 @@ def test_differential_expression_matches_scanpy(subset_dataset, tmp_path):
     scanpy_rg = scanpy_filtered.uns["rank_genes_groups"]
 
     wilcoxon_results = wilcoxon_test(
-        qc_result.filtered_path,
+        wilcoxon_path,
         perturbation_column=PERTURBATION_COLUMN,
         control_label=control_label,
         gene_name_column="gene_symbols",
