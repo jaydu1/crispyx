@@ -1999,13 +1999,56 @@ def _worker(
         Number of threads to use for BLAS/OpenMP operations. Defaults to 1.
     """
 
+    def _apply_resource_limit(limit_value: int | None, limit_type: int, label: str) -> None:
+        """Apply ``resource.setrlimit`` defensively.
+
+        Some platforms (notably macOS) raise ``ValueError`` when attempting to
+        reduce both the soft and hard limits in a single call, reporting that
+        the current limit exceeds the maximum. To avoid crashing the worker
+        process, we first lower the soft limit while keeping the existing hard
+        cap, then attempt to lower the hard limit. If the OS still rejects the
+        change we fall back to best-effort limits and continue execution.
+        """
+
+        if not limit_value or limit_value <= 0:
+            return
+
+        desired = int(limit_value)
+
+        try:
+            current_soft, current_hard = resource.getrlimit(limit_type)
+
+            # First, clamp the soft limit to the current hard ceiling to avoid
+            # ``ValueError: current limit exceeds maximum limit``.
+            soft_limit = min(
+                desired,
+                current_hard if current_hard != resource.RLIM_INFINITY else desired,
+            )
+            if current_soft != soft_limit:
+                resource.setrlimit(limit_type, (soft_limit, current_hard))
+
+            # If possible, also lower the hard limit so we get consistent
+            # enforcement even if the OS ignores the soft cap.
+            if current_hard == resource.RLIM_INFINITY or desired < current_hard:
+                try:
+                    resource.setrlimit(limit_type, (soft_limit, soft_limit))
+                except ValueError:
+                    print(
+                        f"Warning: unable to reduce {label} hard limit; "
+                        "soft limit applied only.",
+                        file=sys.stderr,
+                    )
+        except (ValueError, OSError) as exc:
+            print(
+                f"Warning: could not apply {label} limit ({exc}); proceeding without it.",
+                file=sys.stderr,
+            )
+
     # Set thread limits for BLAS/OpenMP to control parallelism
     set_thread_env_vars(n_threads)
-    
-    if memory_limit and memory_limit > 0:
-        resource.setrlimit(resource.RLIMIT_AS, (memory_limit, memory_limit))
-    if time_limit and time_limit > 0:
-        resource.setrlimit(resource.RLIMIT_CPU, (time_limit, time_limit))
+
+    _apply_resource_limit(memory_limit, resource.RLIMIT_AS, "virtual memory")
+    _apply_resource_limit(time_limit, resource.RLIMIT_CPU, "CPU time")
 
     # Capture baseline memory before method execution
     # This ensures consistent baseline with reference methods
@@ -2166,8 +2209,9 @@ def _run_with_limits(
                 "traceback": traceback.format_exc(),
             }
     
-    # Use spawn context for R/rpy2 compatibility (avoids fork() issues with R threading)
-    needs_spawn = 'pertpy' in method.name.lower()
+    # Use spawn context for R/rpy2 compatibility and to avoid OpenMP fork issues
+    # triggered by some scanpy workflows.
+    needs_spawn = 'pertpy' in method.name.lower() or 'scanpy' in method.name.lower()
     mp_context = mp.get_context('spawn') if needs_spawn else mp
     
     # Track wall-clock time at parent process level for accuracy
@@ -2899,7 +2943,26 @@ def _run_single_benchmark(
     
     methods_to_run = config.methods_to_run
     if methods_to_run:
-        selected_names = methods_to_run
+        selected_names: list[str] = []
+        for name in methods_to_run:
+            if name in available_methods:
+                selected_names.append(name)
+                continue
+
+            # Allow shorthand prefixes (e.g., "scanpy" -> all scanpy_* methods)
+            prefix_matches = [
+                method_name
+                for method_name in available_methods
+                if method_name.startswith(f"{name}_")
+            ]
+
+            if prefix_matches:
+                selected_names.extend(prefix_matches)
+                continue
+
+            raise ValueError(
+                f"Unknown method '{name}'. Available methods: {sorted(available_methods)}"
+            )
     else:
         ordered_methods = sorted(available_methods.values(), key=_method_sort_key)
         selected_names = [method.name for method in ordered_methods]
@@ -3083,10 +3146,14 @@ def main() -> None:
             # Also update n_cores in config if specified via CLI
             if args.n_cores and config.n_cores is None:
                 config.n_cores = args.n_cores
-            
+
             # Update chunk_size if specified via CLI
             if hasattr(args, 'chunk_size') and args.chunk_size is not None:
                 config.chunk_size = args.chunk_size
+
+            # Allow CLI to override the methods list when using a config file
+            if args.methods is not None:
+                config.methods_to_run = args.methods
     else:
         # Traditional CLI mode - create config from arguments
         dataset_path = args.data_path
