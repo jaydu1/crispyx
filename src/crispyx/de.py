@@ -890,14 +890,14 @@ def wilcoxon_test(
         worker_count = max(worker_count, 1)
 
         dtype_checked = False
-
-        def _warn_if_count_like(chunk: sp.spmatrix) -> None:
+        def _warn_if_count_like(chunk: sp.spmatrix) -> bool:
             if np.issubdtype(chunk.dtype, np.integer):
                 logger.warning(
                     "Detected integer count data in wilcoxon_test; input should be normalized/log-transformed. "
                     "For reproducibility, please preprocess explicitly upstream."
                 )
-            elif np.issubdtype(chunk.dtype, np.floating):
+                return True
+            if np.issubdtype(chunk.dtype, np.floating):
                 non_zero = chunk.data[chunk.data > 0]
                 is_count_like = non_zero.size > 0 and np.all(np.isclose(non_zero, np.round(non_zero)))
                 if is_count_like:
@@ -905,6 +905,8 @@ def wilcoxon_test(
                         "Detected count-like floating point values in wilcoxon_test; input should be normalized/log-transformed. "
                         "Please ensure preprocessing is applied upstream for consistent results."
                     )
+                return bool(is_count_like)
+            return False
 
         for slc, block in iter_matrix_chunks(
             backed, axis=1, chunk_size=chunk_size, convert_to_dense=False
@@ -917,13 +919,14 @@ def wilcoxon_test(
                 _warn_if_count_like(block)
                 dtype_checked = True
 
-            log_block = np.asarray(block.toarray(), dtype=np.float32)
-            control_values = log_block[control_mask, :]
-            control_expr = np.asarray(np.count_nonzero(control_values, axis=0))
+            csr_block = sp.csr_matrix(block, dtype=np.float64)
+
+            control_values = csr_block[control_mask, :]
+            control_expr = np.asarray(control_values.getnnz(axis=0)).ravel()
             control_mean = (
-                control_values.mean(axis=0, dtype=np.float64)
-                if control_values.size
-                else np.zeros(control_values.shape[1], dtype=np.float64)
+                np.asarray(control_values.mean(axis=0)).ravel()
+                if control_values.nnz
+                else np.zeros(csr_block.shape[1], dtype=np.float64)
             )
             control_pts = np.divide(
                 control_expr,
@@ -937,11 +940,11 @@ def wilcoxon_test(
                 idx: int, label: str
             ) -> tuple[int, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
                 mask = pert_masks[label]
-                group_values = log_block[mask, :]
-                group_expr = np.asarray(np.count_nonzero(group_values, axis=0))
+                group_values = csr_block[mask, :]
+                group_expr = np.asarray(group_values.getnnz(axis=0)).ravel()
                 group_mean = (
-                    group_values.mean(axis=0, dtype=np.float64)
-                    if group_values.size
+                    np.asarray(group_values.mean(axis=0)).ravel()
+                    if group_values.nnz
                     else np.zeros_like(control_mean)
                 )
                 total_expr = control_expr + group_expr
@@ -957,8 +960,8 @@ def wilcoxon_test(
 
                 if np.any(valid):
                     valid_cols = np.where(valid)[0]
-                    selected_control = control_values[:, valid_cols]
-                    selected_group = group_values[:, valid_cols]
+                    selected_control = control_values[:, valid_cols].toarray()
+                    selected_group = group_values[:, valid_cols].toarray()
                     combined = np.vstack((selected_group, selected_control))
                     ranks = rankdata(combined, axis=0)
                     if tie_correct:
