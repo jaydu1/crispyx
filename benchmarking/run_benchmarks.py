@@ -186,13 +186,17 @@ def _get_current_rss_bytes() -> Optional[float]:
             return None
     
     elif sys.platform == 'darwin':
-        # macOS: No direct current RSS API without psutil
-        # Fall back to peak RSS (ru_maxrss)
-        if not _CURRENT_RSS_WARNING_LOGGED:
-            print("Warning: macOS does not support current RSS without psutil. "
-                  "Average memory will equal peak memory. Install psutil for accurate tracking.")
-            _CURRENT_RSS_WARNING_LOGGED = True
-        return _get_peak_memory_bytes()
+        # macOS: Try psutil if available for current RSS, else fall back to peak RSS
+        try:
+            import psutil
+            process = psutil.Process()
+            return float(process.memory_info().rss)
+        except ImportError:
+            if not _CURRENT_RSS_WARNING_LOGGED:
+                print("Warning: macOS does not support current RSS without psutil. "
+                      "Average memory will equal peak memory. Install psutil for accurate tracking.")
+                _CURRENT_RSS_WARNING_LOGGED = True
+            return _get_peak_memory_bytes()
     
     elif sys.platform == 'win32':
         # Windows: Try psutil if available
