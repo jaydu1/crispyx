@@ -864,26 +864,6 @@ def wilcoxon_test(
         for label, mask in pert_masks.items():
             if not np.any(mask):
                 raise ValueError(f"Perturbation '{label}' contains no cells")
-
-        for _, chunk in iter_matrix_chunks(backed, axis=0, chunk_size=100, convert_to_dense=False):
-            if not sp.issparse(chunk):
-                raise ValueError(
-                    "wilcoxon_test only supports sparse input matrices. Please provide a scipy sparse matrix (e.g., CSR/CSC)."
-                )
-            if np.issubdtype(chunk.dtype, np.integer):
-                logger.warning(
-                    "Detected integer count data in wilcoxon_test; input should be normalized/log-transformed. "
-                    "For reproducibility, please preprocess explicitly upstream."
-                )
-            elif np.issubdtype(chunk.dtype, np.floating):
-                non_zero = chunk.data[chunk.data > 0]
-                is_count_like = non_zero.size > 0 and np.all(np.isclose(non_zero, np.round(non_zero)))
-                if is_count_like:
-                    logger.warning(
-                        "Detected count-like floating point values in wilcoxon_test; input should be normalized/log-transformed. "
-                        "Please ensure preprocessing is applied upstream for consistent results."
-                    )
-            break
     finally:
         backed.file.close()
 
@@ -909,8 +889,35 @@ def wilcoxon_test(
             worker_count = min(n_groups, abs(n_jobs))
         worker_count = max(worker_count, 1)
 
-        for slc, block in iter_matrix_chunks(backed, axis=1, chunk_size=chunk_size):
-            log_block = np.asarray(block, dtype=np.float32)
+        dtype_checked = False
+
+        def _warn_if_count_like(chunk: sp.spmatrix) -> None:
+            if np.issubdtype(chunk.dtype, np.integer):
+                logger.warning(
+                    "Detected integer count data in wilcoxon_test; input should be normalized/log-transformed. "
+                    "For reproducibility, please preprocess explicitly upstream."
+                )
+            elif np.issubdtype(chunk.dtype, np.floating):
+                non_zero = chunk.data[chunk.data > 0]
+                is_count_like = non_zero.size > 0 and np.all(np.isclose(non_zero, np.round(non_zero)))
+                if is_count_like:
+                    logger.warning(
+                        "Detected count-like floating point values in wilcoxon_test; input should be normalized/log-transformed. "
+                        "Please ensure preprocessing is applied upstream for consistent results."
+                    )
+
+        for slc, block in iter_matrix_chunks(
+            backed, axis=1, chunk_size=chunk_size, convert_to_dense=False
+        ):
+            if not dtype_checked:
+                if not sp.issparse(block):
+                    raise ValueError(
+                        "wilcoxon_test only supports sparse input matrices. Please provide a scipy sparse matrix (e.g., CSR/CSC)."
+                    )
+                _warn_if_count_like(block)
+                dtype_checked = True
+
+            log_block = np.asarray(block.toarray(), dtype=np.float32)
             control_values = log_block[control_mask, :]
             control_expr = np.asarray(np.count_nonzero(control_values, axis=0))
             control_mean = (

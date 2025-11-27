@@ -22,7 +22,7 @@ import scanpy as sc
 import h5py
 from scipy.stats import norm, rankdata
 
-from crispyx.data import ensure_gene_symbol_column, normalize_total_block
+from crispyx.data import ensure_gene_symbol_column
 from crispyx.de import _tie_correction, t_test, wilcoxon_test
 from crispyx.pseudobulk import (
     compute_average_log_expression,
@@ -57,6 +57,17 @@ def small_adata(tmp_path):
     path = tmp_path / "small.h5ad"
     adata.write(path)
     return path, adata
+
+
+def _log_normalise_sparse(adata: ad.AnnData, path: Path) -> ad.AnnData:
+    """Return a log-normalised sparse copy written to ``path``."""
+
+    normalised = adata.copy()
+    sc.pp.normalize_total(normalised, target_sum=1e4)
+    sc.pp.log1p(normalised)
+    normalised.X = sp.csr_matrix(normalised.X)
+    normalised.write(path)
+    return normalised
 
 
 def _assert_t_test_matches_scanpy(path, adata, tmp_path):
@@ -203,8 +214,10 @@ def test_t_test_accepts_integer_counts(small_adata, tmp_path):
 
 def test_wilcoxon_test_matches_scanpy(small_adata, tmp_path):
     path, adata = small_adata
+    norm_path = tmp_path / "small_log_norm.h5ad"
+    norm_adata = _log_normalise_sparse(adata, norm_path)
     results = wilcoxon_test(
-        path,
+        norm_path,
         perturbation_column="perturbation",
         control_label="ctrl",
         gene_name_column="gene_symbols",
@@ -215,15 +228,13 @@ def test_wilcoxon_test_matches_scanpy(small_adata, tmp_path):
     output_path = tmp_path / "crispyx_wilcoxon.h5ad"
     assert output_path.exists()
 
-    raw = np.asarray(adata.X)
-    norm_data, _ = normalize_total_block(raw)
-    log_data = np.log1p(norm_data)
-    ctrl_mask = adata.obs["perturbation"] == "ctrl"
+    log_data = np.asarray(norm_adata.X.toarray())
+    ctrl_mask = norm_adata.obs["perturbation"] == "ctrl"
     control_values = log_data[ctrl_mask]
     control_n = float(control_values.shape[0])
 
     for label, result in results.items():
-        mask = adata.obs["perturbation"] == label
+        mask = norm_adata.obs["perturbation"] == label
         pert_values = log_data[mask]
         pert_n = float(pert_values.shape[0])
 
@@ -322,10 +333,12 @@ def test_t_test_with_n_jobs(small_adata, tmp_path):
 def test_wilcoxon_test_with_n_jobs(small_adata, tmp_path):
     """Test that wilcoxon_test works with n_jobs parameter."""
     path, adata = small_adata
-    
+    norm_path = tmp_path / "small_log_norm_wilcoxon.h5ad"
+    _log_normalise_sparse(adata, norm_path)
+
     # Run with n_jobs=2
     results_parallel = wilcoxon_test(
-        path,
+        norm_path,
         perturbation_column="perturbation",
         control_label="ctrl",
         gene_name_column="gene_symbols",
@@ -337,7 +350,7 @@ def test_wilcoxon_test_with_n_jobs(small_adata, tmp_path):
     
     # Run without parallelization
     results_serial = wilcoxon_test(
-        path,
+        norm_path,
         perturbation_column="perturbation",
         control_label="ctrl",
         gene_name_column="gene_symbols",
