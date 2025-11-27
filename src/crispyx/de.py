@@ -868,195 +868,213 @@ def wilcoxon_test(
         backed.file.close()
 
     n_groups = len(candidates)
-    effect_matrix = np.zeros((n_groups, n_genes), dtype=float)
-    u_matrix = np.zeros_like(effect_matrix)
-    pvalue_matrix = np.ones_like(effect_matrix)
-    z_matrix = np.zeros_like(effect_matrix)
-    lfc_matrix = np.zeros_like(effect_matrix)
-    pts_matrix = np.zeros_like(effect_matrix)
-    pts_rest_matrix = np.zeros_like(effect_matrix)
-    order_matrix = np.zeros((n_groups, n_genes), dtype=np.int64)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmpdir_path = Path(tmpdir)
 
-    backed = read_backed(path)
-    try:
-        labels = backed.obs[perturbation_column].astype(str).to_numpy()
-        control_mask = labels == control_label
-        pert_masks = {label: labels == label for label in candidates}
-        max_available_workers = os.cpu_count() or 1
-        if n_jobs is None or n_jobs == 0:
-            worker_count = min(n_groups, max_available_workers)
-        else:
-            worker_count = min(n_groups, abs(n_jobs))
-        worker_count = max(worker_count, 1)
-
-        dtype_checked = False
-        def _warn_if_count_like(chunk: sp.spmatrix) -> bool:
-            if np.issubdtype(chunk.dtype, np.integer):
-                logger.warning(
-                    "Detected integer count data in wilcoxon_test; input should be normalized/log-transformed. "
-                    "For reproducibility, please preprocess explicitly upstream."
-                )
-                return True
-            if np.issubdtype(chunk.dtype, np.floating):
-                non_zero = chunk.data[chunk.data > 0]
-                is_count_like = non_zero.size > 0 and np.all(np.isclose(non_zero, np.round(non_zero)))
-                if is_count_like:
-                    logger.warning(
-                        "Detected count-like floating point values in wilcoxon_test; input should be normalized/log-transformed. "
-                        "Please ensure preprocessing is applied upstream for consistent results."
-                    )
-                return bool(is_count_like)
-            return False
-
-        for slc, block in iter_matrix_chunks(
-            backed, axis=1, chunk_size=chunk_size, convert_to_dense=False
-        ):
-            if not dtype_checked:
-                if not sp.issparse(block):
-                    raise ValueError(
-                        "wilcoxon_test only supports sparse input matrices. Please provide a scipy sparse matrix (e.g., CSR/CSC)."
-                    )
-                _warn_if_count_like(block)
-                dtype_checked = True
-
-            csr_block = sp.csr_matrix(block, dtype=np.float64)
-
-            control_values = csr_block[control_mask, :]
-            control_expr = np.asarray(control_values.getnnz(axis=0)).ravel()
-            control_mean = (
-                np.asarray(control_values.mean(axis=0)).ravel()
-                if control_values.nnz
-                else np.zeros(csr_block.shape[1], dtype=np.float64)
-            )
-            control_pts = np.divide(
-                control_expr,
-                control_n,
-                out=np.zeros_like(control_expr, dtype=float),
-                where=control_n > 0,
-            )
-            chunk_gene_indices = np.arange(slc.start, slc.stop)
-
-            def compute_group(
-                idx: int, label: str
-            ) -> tuple[int, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-                mask = pert_masks[label]
-                group_values = csr_block[mask, :]
-                group_expr = np.asarray(group_values.getnnz(axis=0)).ravel()
-                group_mean = (
-                    np.asarray(group_values.mean(axis=0)).ravel()
-                    if group_values.nnz
-                    else np.zeros_like(control_mean)
-                )
-                total_expr = control_expr + group_expr
-                low_expr = (control_expr < min_cells_expressed) & (
-                    group_expr < min_cells_expressed
-                )
-                valid = (total_expr >= min_cells_expressed) & ~low_expr
-
-                full_u = np.zeros(control_values.shape[1], dtype=float)
-                full_z = np.zeros_like(full_u)
-                full_p = np.ones_like(full_u)
-                full_effect = np.zeros_like(full_u)
-
-                if np.any(valid):
-                    valid_cols = np.where(valid)[0]
-                    selected_control = control_values[:, valid_cols].toarray()
-                    selected_group = group_values[:, valid_cols].toarray()
-                    combined = np.vstack((selected_group, selected_control))
-                    ranks = rankdata(combined, axis=0)
-                    if tie_correct:
-                        tie = _tie_correction(ranks)
-                    else:
-                        tie = np.ones(ranks.shape[1], dtype=np.float64)
-                    n_active = float(group_values.shape[0])
-                    m_active = float(control_values.shape[0])
-                    rank_sum = ranks[: selected_group.shape[0]].sum(axis=0)
-                    expected = n_active * (n_active + m_active + 1.0) / 2.0
-                    std = np.sqrt(tie * n_active * m_active * (n_active + m_active + 1.0) / 12.0)
-                    u_stat = rank_sum - n_active * (n_active + 1.0) / 2.0
-                    valid_std = std > 0
-                    z = np.zeros_like(rank_sum)
-                    with np.errstate(divide="ignore", invalid="ignore"):
-                        z[valid_std] = (rank_sum[valid_std] - expected) / std[valid_std]
-                    z[~np.isfinite(z)] = 0.0
-                    pvals = np.ones_like(rank_sum)
-                    pvals[valid_std] = 2.0 * norm.sf(np.abs(z[valid_std]))
-                    effect = np.zeros_like(rank_sum)
-                    if n_active > 0 and m_active > 0:
-                        effect = u_stat / (n_active * m_active) - 0.5
-                    full_u[valid_cols] = u_stat
-                    full_z[valid_cols] = z
-                    full_p[valid_cols] = pvals
-                    full_effect[valid_cols] = effect
-
-                pts = np.divide(
-                    group_expr,
-                    float(group_values.shape[0]),
-                    out=np.zeros_like(group_expr, dtype=float),
-                    where=group_values.shape[0] > 0,
-                )
-                pts = np.where(valid, pts, 0.0)
-                pts_rest = np.where(valid, control_pts, 0.0)
-                log_fc = group_mean - control_mean
-                log_fc = np.where(valid, log_fc, 0.0)
-                return idx, full_u, full_z, full_p, full_effect, log_fc, pts, pts_rest
-
-            tasks = [(idx, label) for idx, label in enumerate(candidates)]
-            if n_groups == 0:
-                continue
-            if n_groups == 1 or worker_count == 1:
-                computed = [compute_group(idx, label) for idx, label in tasks]
+        def _create_memmap(name: str, dtype: np.dtype, *, fill: float | int = 0):
+            path = tmpdir_path / f"{name}.dat"
+            mmap = np.memmap(path, dtype=dtype, mode="w+", shape=(n_groups, n_genes))
+            if fill != 0:
+                mmap[:] = fill
             else:
-                with ThreadPoolExecutor(max_workers=worker_count) as executor:
-                    futures = [executor.submit(compute_group, idx, label) for idx, label in tasks]
-                    computed = [future.result() for future in futures]
-            for idx, u_stat, z, pvals, effect, log_fc, pts, pts_rest in computed:
-                gene_indices = chunk_gene_indices
-                u_matrix[idx, gene_indices] = u_stat
-                pvalue_matrix[idx, gene_indices] = pvals
-                effect_matrix[idx, gene_indices] = effect
-                z_matrix[idx, gene_indices] = z
-                lfc_matrix[idx, gene_indices] = log_fc
-                pts_matrix[idx, gene_indices] = pts
-                pts_rest_matrix[idx, gene_indices] = pts_rest
-    finally:
-        backed.file.close()
+                mmap.fill(0)
+            return mmap
 
-    gene_symbols = pd.Index(gene_symbols).astype(str)
-    gene_array = gene_symbols.to_numpy()
-    order_matrix = np.argsort(-z_matrix, axis=1, kind="mergesort")
-    pvalue_adj_matrix = _adjust_pvalue_matrix(pvalue_matrix, corr_method)
+        effect_matrix = _create_memmap("effect", np.float64)
+        u_matrix = _create_memmap("u_stat", np.float64)
+        pvalue_matrix = _create_memmap("pvalue", np.float64, fill=1.0)
+        z_matrix = _create_memmap("z_score", np.float64)
+        lfc_matrix = _create_memmap("logfoldchange", np.float64)
+        pts_matrix = _create_memmap("pts", np.float32)
+        pts_rest_matrix = _create_memmap("pts_rest", np.float32)
+        order_matrix = np.memmap(
+            tmpdir_path / "order.dat", dtype=np.int64, mode="w+", shape=(n_groups, n_genes)
+        )
 
-    result = RankGenesGroupsResult(
-        genes=gene_symbols,
-        groups=candidates,
-        statistics=z_matrix,
-        pvalues=pvalue_matrix,
-        pvalues_adj=pvalue_adj_matrix,
-        logfoldchanges=lfc_matrix,
-        effect_size=effect_matrix,
-        u_statistics=u_matrix,
-        pts=pts_matrix,
-        pts_rest=pts_rest_matrix,
-        order=order_matrix,
-        groupby=perturbation_column,
-        method="wilcoxon",
-        control_label=control_label,
-        tie_correct=tie_correct,
-        pvalue_correction=corr_method,
-    )
+        backed = read_backed(path)
+        try:
+            labels = backed.obs[perturbation_column].astype(str).to_numpy()
+            control_mask = labels == control_label
+            pert_masks = {label: labels == label for label in candidates}
+            max_available_workers = os.cpu_count() or 1
+            if n_jobs is None or n_jobs == 0:
+                worker_count = min(n_groups, max_available_workers)
+            else:
+                worker_count = min(n_groups, abs(n_jobs))
+            worker_count = max(worker_count, 1)
 
-    obs_index = pd.Index(candidates, name="perturbation").astype(str)
-    adata = ad.AnnData(np.zeros((len(candidates), 0)), obs=pd.DataFrame(index=obs_index))
-    adata.uns["rank_genes_groups"] = result.to_rank_genes_groups_dict()
-    adata.uns["genes"] = gene_array
-    adata.uns["method"] = "wilcoxon"
-    adata.uns["control_label"] = control_label
-    adata.uns["tie_correct"] = tie_correct
-    adata.uns["pvalue_correction"] = corr_method
-    output_path = resolve_output_path(path, suffix="wilcoxon", output_dir=output_dir, data_name=data_name)
-    adata.write(output_path)
-    result.result = AnnData(output_path)
+            dtype_checked = False
 
-    return result
+            def _warn_if_count_like(chunk: sp.spmatrix) -> bool:
+                if np.issubdtype(chunk.dtype, np.integer):
+                    logger.warning(
+                        "Detected integer count data in wilcoxon_test; input should be normalized/log-transformed. "
+                        "For reproducibility, please preprocess explicitly upstream."
+                    )
+                    return True
+                if np.issubdtype(chunk.dtype, np.floating):
+                    non_zero = chunk.data[chunk.data > 0]
+                    is_count_like = non_zero.size > 0 and np.all(np.isclose(non_zero, np.round(non_zero)))
+                    if is_count_like:
+                        logger.warning(
+                            "Detected count-like floating point values in wilcoxon_test; input should be normalized/log-transformed. "
+                            "Please ensure preprocessing is applied upstream for consistent results."
+                        )
+                    return bool(is_count_like)
+                return False
+
+            for slc, block in iter_matrix_chunks(
+                backed, axis=1, chunk_size=chunk_size, convert_to_dense=False
+            ):
+                if not dtype_checked:
+                    if not sp.issparse(block):
+                        raise ValueError(
+                            "wilcoxon_test only supports sparse input matrices. Please provide a scipy sparse matrix (e.g., CSR/CSC)."
+                        )
+                    _warn_if_count_like(block)
+                    dtype_checked = True
+
+                csr_block = sp.csr_matrix(block, dtype=np.float64)
+
+                control_values = csr_block[control_mask, :]
+                control_expr = np.asarray(control_values.getnnz(axis=0)).ravel()
+                control_mean = (
+                    np.asarray(control_values.mean(axis=0)).ravel()
+                    if control_values.nnz
+                    else np.zeros(csr_block.shape[1], dtype=np.float64)
+                )
+                control_pts = np.divide(
+                    control_expr,
+                    control_n,
+                    out=np.zeros_like(control_expr, dtype=float),
+                    where=control_n > 0,
+                )
+                chunk_gene_indices = np.arange(slc.start, slc.stop)
+
+                def compute_group(
+                    idx: int, label: str
+                ) -> tuple[int, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+                    mask = pert_masks[label]
+                    group_values = csr_block[mask, :]
+                    group_expr = np.asarray(group_values.getnnz(axis=0)).ravel()
+                    group_mean = (
+                        np.asarray(group_values.mean(axis=0)).ravel()
+                        if group_values.nnz
+                        else np.zeros_like(control_mean)
+                    )
+                    total_expr = control_expr + group_expr
+                    low_expr = (control_expr < min_cells_expressed) & (
+                        group_expr < min_cells_expressed
+                    )
+                    valid = (total_expr >= min_cells_expressed) & ~low_expr
+
+                    full_u = np.zeros(control_values.shape[1], dtype=float)
+                    full_z = np.zeros_like(full_u)
+                    full_p = np.ones_like(full_u)
+                    full_effect = np.zeros_like(full_u)
+
+                    if np.any(valid):
+                        valid_cols = np.where(valid)[0]
+                        selected_control = control_values[:, valid_cols].toarray()
+                        selected_group = group_values[:, valid_cols].toarray()
+                        combined = np.vstack((selected_group, selected_control))
+                        ranks = rankdata(combined, axis=0)
+                        if tie_correct:
+                            tie = _tie_correction(ranks)
+                        else:
+                            tie = np.ones(ranks.shape[1], dtype=np.float64)
+                        n_active = float(group_values.shape[0])
+                        m_active = float(control_values.shape[0])
+                        rank_sum = ranks[: selected_group.shape[0]].sum(axis=0)
+                        expected = n_active * (n_active + m_active + 1.0) / 2.0
+                        std = np.sqrt(tie * n_active * m_active * (n_active + m_active + 1.0) / 12.0)
+                        u_stat = rank_sum - n_active * (n_active + 1.0) / 2.0
+                        valid_std = std > 0
+                        z = np.zeros_like(rank_sum)
+                        with np.errstate(divide="ignore", invalid="ignore"):
+                            z[valid_std] = (rank_sum[valid_std] - expected) / std[valid_std]
+                        z[~np.isfinite(z)] = 0.0
+                        pvals = np.ones_like(rank_sum)
+                        pvals[valid_std] = 2.0 * norm.sf(np.abs(z[valid_std]))
+                        effect = np.zeros_like(rank_sum)
+                        if n_active > 0 and m_active > 0:
+                            effect = u_stat / (n_active * m_active) - 0.5
+                        full_u[valid_cols] = u_stat
+                        full_z[valid_cols] = z
+                        full_p[valid_cols] = pvals
+                        full_effect[valid_cols] = effect
+
+                    pts = np.divide(
+                        group_expr,
+                        float(group_values.shape[0]),
+                        out=np.zeros_like(group_expr, dtype=float),
+                        where=group_values.shape[0] > 0,
+                    )
+                    pts = np.where(valid, pts, 0.0)
+                    pts_rest = np.where(valid, control_pts, 0.0)
+                    log_fc = group_mean - control_mean
+                    log_fc = np.where(valid, log_fc, 0.0)
+                    return idx, full_u, full_z, full_p, full_effect, log_fc, pts, pts_rest
+
+                tasks = [(idx, label) for idx, label in enumerate(candidates)]
+                if n_groups == 0:
+                    continue
+                if n_groups == 1 or worker_count == 1:
+                    computed = [compute_group(idx, label) for idx, label in tasks]
+                else:
+                    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+                        futures = [executor.submit(compute_group, idx, label) for idx, label in tasks]
+                        computed = [future.result() for future in futures]
+                for idx, u_stat, z, pvals, effect, log_fc, pts, pts_rest in computed:
+                    gene_indices = chunk_gene_indices
+                    u_matrix[idx, gene_indices] = u_stat
+                    pvalue_matrix[idx, gene_indices] = pvals
+                    effect_matrix[idx, gene_indices] = effect
+                    z_matrix[idx, gene_indices] = z
+                    lfc_matrix[idx, gene_indices] = log_fc
+                    pts_matrix[idx, gene_indices] = pts
+                    pts_rest_matrix[idx, gene_indices] = pts_rest
+        finally:
+            backed.file.close()
+
+        gene_symbols = pd.Index(gene_symbols).astype(str)
+        gene_array = gene_symbols.to_numpy()
+        pvalue_adj_matrix = _create_memmap("pvalue_adj", np.float64)
+        _adjust_pvalue_matrix(pvalue_matrix, corr_method, out=pvalue_adj_matrix)
+
+        for idx in range(n_groups):
+            order_matrix[idx] = np.argsort(-z_matrix[idx], kind="mergesort")
+
+        result = RankGenesGroupsResult(
+            genes=gene_symbols,
+            groups=candidates,
+            statistics=np.array(z_matrix),
+            pvalues=np.array(pvalue_matrix),
+            pvalues_adj=np.array(pvalue_adj_matrix),
+            logfoldchanges=np.array(lfc_matrix),
+            effect_size=np.array(effect_matrix),
+            u_statistics=np.array(u_matrix),
+            pts=np.array(pts_matrix, dtype=np.float32),
+            pts_rest=np.array(pts_rest_matrix, dtype=np.float32),
+            order=np.array(order_matrix),
+            groupby=perturbation_column,
+            method="wilcoxon",
+            control_label=control_label,
+            tie_correct=tie_correct,
+            pvalue_correction=corr_method,
+        )
+
+        obs_index = pd.Index(candidates, name="perturbation").astype(str)
+        adata = ad.AnnData(np.zeros((len(candidates), 0)), obs=pd.DataFrame(index=obs_index))
+        adata.uns["rank_genes_groups"] = result.to_rank_genes_groups_dict()
+        adata.uns["genes"] = gene_array
+        adata.uns["method"] = "wilcoxon"
+        adata.uns["control_label"] = control_label
+        adata.uns["tie_correct"] = tie_correct
+        adata.uns["pvalue_correction"] = corr_method
+        output_path = resolve_output_path(path, suffix="wilcoxon", output_dir=output_dir, data_name=data_name)
+        adata.write(output_path)
+        result.result = AnnData(output_path)
+
+        return result
 
