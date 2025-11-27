@@ -623,11 +623,15 @@ def run_pertpy_de(
     
     try:
         result = runner(adata, **kwargs)
-    except TypeError:
+    except TypeError as e:
+        print(f"[PyDESeq2] TypeError: {e}")
         # Fallback for different API
         kwargs = {"group_key": perturbation_column, "control": control_label}
         if n_jobs: kwargs["n_cpus"] = n_jobs
         result = runner(adata, **kwargs)
+    except Exception as e:
+        print(f"[PyDESeq2] Exception: {e}")
+        raise
         
     df = _convert_reference_result_to_dataframe(result)
     
