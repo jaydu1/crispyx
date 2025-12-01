@@ -10,6 +10,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Iterable, Literal, Mapping
 
+from numpy.typing import ArrayLike
+
 import anndata as ad
 import numpy as np
 import pandas as pd
@@ -25,7 +27,13 @@ from .data import (
     resolve_control_label,
     resolve_output_path,
 )
-from .glm import NBGLMFitter, build_design_matrix
+from .glm import (
+    NBGLMFitter,
+    build_design_matrix,
+    fit_dispersion_trend,
+    shrink_dispersions,
+    shrink_log_foldchange,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -247,6 +255,77 @@ def _adjust_pvalue_matrix(
         new_row[valid] = result
         adjusted[row_idx] = new_row
     return adjusted
+
+
+def _validate_size_factors(size_factors: ArrayLike, n_cells: int) -> np.ndarray:
+    size_factors_arr = np.asarray(size_factors, dtype=np.float64).reshape(-1)
+    if size_factors_arr.shape[0] != n_cells:
+        raise ValueError(
+            f"Provided size_factors have length {size_factors_arr.shape[0]} but expected {n_cells}"
+        )
+    mask = np.isfinite(size_factors_arr) & (size_factors_arr > 0)
+    if not np.any(mask):
+        raise ValueError("Provided size_factors contain no positive finite values")
+    size_factors_arr[~mask] = np.nanmedian(size_factors_arr[mask])
+    scale = np.exp(np.mean(np.log(np.clip(size_factors_arr, 1e-12, None))))
+    return size_factors_arr / scale
+
+
+def _median_of_ratios_size_factors(path: str | Path, *, chunk_size: int = 256) -> np.ndarray:
+    backed = read_backed(path)
+    n_cells = backed.n_obs
+    n_genes = backed.n_vars
+    log_sum = np.zeros(n_genes, dtype=np.float64)
+    log_count = np.zeros(n_genes, dtype=np.int64)
+    try:
+        for _, block in iter_matrix_chunks(
+            backed, axis=0, chunk_size=chunk_size, convert_to_dense=False
+        ):
+            csr = sp.csr_matrix(block)
+            csc = csr.tocsc()
+            counts_per_gene = np.diff(csc.indptr)
+            if not counts_per_gene.any():
+                continue
+            gene_indices = np.repeat(np.arange(n_genes, dtype=np.int64), counts_per_gene)
+            data = np.log(np.clip(csc.data, 1e-12, None))
+            np.add.at(log_sum, gene_indices, data)
+            np.add.at(log_count, gene_indices, 1)
+    finally:
+        backed.file.close()
+    geo_means = np.zeros(n_genes, dtype=np.float64)
+    valid_geo = log_count > 0
+    geo_means[valid_geo] = np.exp(log_sum[valid_geo] / log_count[valid_geo])
+
+    size_factors = np.full(n_cells, np.nan, dtype=np.float64)
+    backed = read_backed(path)
+    try:
+        for slc, block in iter_matrix_chunks(
+            backed, axis=0, chunk_size=chunk_size, convert_to_dense=False
+        ):
+            csr = sp.csr_matrix(block)
+            for row_idx in range(csr.shape[0]):
+                start = csr.indptr[row_idx]
+                end = csr.indptr[row_idx + 1]
+                gene_idx = csr.indices[start:end]
+                data = csr.data[start:end]
+                mask = geo_means[gene_idx] > 0
+                if not np.any(mask):
+                    continue
+                ratios = data[mask] / geo_means[gene_idx[mask]]
+                ratios = ratios[np.isfinite(ratios) & (ratios > 0)]
+                if ratios.size == 0:
+                    continue
+                size_factors[slc.start + row_idx] = np.median(ratios)
+    finally:
+        backed.file.close()
+
+    valid_sf = np.isfinite(size_factors) & (size_factors > 0)
+    if not np.any(valid_sf):
+        return np.ones(n_cells, dtype=np.float64)
+    fallback = np.nanmedian(size_factors[valid_sf])
+    size_factors[~valid_sf] = fallback
+    scale = np.exp(np.mean(np.log(np.clip(size_factors, 1e-12, None))))
+    return size_factors / scale
 
 
 def t_test(
@@ -574,6 +653,10 @@ def nb_glm_test(
     min_cells_expressed: int = 0,
     min_total_count: float = 1.0,
     chunk_size: int = 256,
+    size_factors: ArrayLike | None = None,
+    cook_filter: bool = False,
+    shrink_dispersion: bool = True,
+    shrink_logfc: bool = True,
     corr_method: Literal["benjamini-hochberg", "bonferroni"] = "benjamini-hochberg",
     output_dir: str | Path | None = None,
     data_name: str | None = None,
@@ -619,6 +702,16 @@ def nb_glm_test(
         Minimum total count across all cells for a gene to be tested.
     chunk_size
         Number of genes to process per chunk (memory vs. speed tradeoff).
+    size_factors
+        Optional array of per-cell size factors. If None, computes DESeq2-style
+        median-of-ratios size factors.
+    cook_filter
+        Whether to apply Cook's distance outlier filtering when available.
+    shrink_dispersion
+        If True, fit a mean-dispersion trend and shrink gene-wise dispersions
+        toward the trend using an empirical Bayes prior.
+    shrink_logfc
+        If True, apply empirical Bayes shrinkage to log-fold changes.
     corr_method
         Method for p-value correction: "benjamini-hochberg" or "bonferroni".
     output_dir
@@ -662,26 +755,27 @@ def nb_glm_test(
     finally:
         backed.file.close()
 
-    library_sizes = np.zeros(obs_df.shape[0], dtype=np.float64)
-    backed = read_backed(path)
-    try:
-        for slc, block in iter_matrix_chunks(backed, axis=0, chunk_size=chunk_size):
-            dense = np.asarray(block, dtype=np.float64)
-            library_sizes[slc] = dense.sum(axis=1)
-    finally:
-        backed.file.close()
+    n_cells_total = obs_df.shape[0]
+    if size_factors is None:
+        size_factors = _median_of_ratios_size_factors(path, chunk_size=chunk_size)
+    else:
+        size_factors = _validate_size_factors(size_factors, n_cells_total)
 
-    offset = np.log(np.clip(library_sizes, 1e-8, None))
+    offset = np.log(np.clip(size_factors, 1e-8, None))
 
     n_groups = len(candidates)
-    effect_matrix = np.zeros((n_groups, n_genes), dtype=np.float64)
-    statistic_matrix = np.zeros_like(effect_matrix)
-    pvalue_matrix = np.ones_like(effect_matrix)
-    logfc_matrix = np.zeros_like(effect_matrix)
-    se_matrix = np.full_like(effect_matrix, np.inf)
-    pts_matrix = np.zeros_like(effect_matrix)
-    pts_rest_matrix = np.zeros_like(effect_matrix)
-    dispersion_matrix = np.zeros_like(effect_matrix)
+    effect_matrix = np.full((n_groups, n_genes), np.nan, dtype=np.float64)
+    statistic_matrix = np.full_like(effect_matrix, np.nan)
+    pvalue_matrix = np.full_like(effect_matrix, np.nan)
+    logfc_matrix = np.full_like(effect_matrix, np.nan)
+    logfc_raw_matrix = np.full_like(effect_matrix, np.nan)
+    se_matrix = np.full_like(effect_matrix, np.nan)
+    pts_matrix = np.zeros((n_groups, n_genes), dtype=np.float64)
+    pts_rest_matrix = np.zeros_like(pts_matrix)
+    dispersion_matrix = np.full_like(effect_matrix, np.nan)
+    dispersion_raw_matrix = np.full_like(effect_matrix, np.nan)
+    dispersion_trend_matrix = np.full_like(effect_matrix, np.nan)
+    mean_matrix = np.zeros_like(effect_matrix)
     iter_matrix = np.zeros_like(effect_matrix)
     convergence_matrix = np.zeros_like(effect_matrix, dtype=bool)
 
@@ -693,6 +787,7 @@ def nb_glm_test(
         subset_mask = control_mask | group_mask
         subset_obs = obs_df.iloc[subset_mask]
         indicator = group_mask[subset_mask].astype(np.float64)
+        subset_size_factors = np.asarray(size_factors)[subset_mask]
         design, design_columns = build_design_matrix(
             subset_obs,
             covariate_columns=covariates,
@@ -708,16 +803,22 @@ def nb_glm_test(
             tol=tol,
             poisson_init_iter=poisson_init_iter,
             min_total_count=min_total_count,
+            compute_cooks=cook_filter,
         )
         control_subset_mask = control_mask[subset_mask]
         group_subset_mask = group_mask[subset_mask]
         group_n = int(group_subset_mask.sum())
+        subset_n = int(subset_mask.sum())
 
         backed = read_backed(path)
         try:
             for slc, block in iter_matrix_chunks(backed, axis=1, chunk_size=chunk_size):
                 raw_block = np.asarray(block, dtype=np.float64)
                 subset_block = raw_block[subset_mask, :]
+                normalized_block = sp.csr_matrix(subset_block).multiply(
+                    1.0 / subset_size_factors[:, None]
+                )
+                mean_expr = normalized_block.sum(axis=0).A1 / max(subset_n, 1)
                 control_block = subset_block[control_subset_mask, :]
                 group_block = subset_block[group_subset_mask, :]
                 control_expr = np.asarray(np.count_nonzero(control_block, axis=0))
@@ -739,6 +840,7 @@ def nb_glm_test(
                 )
                 pts_matrix[group_idx, chunk_indices] = np.where(valid_mask, pts, 0.0)
                 pts_rest_matrix[group_idx, chunk_indices] = np.where(valid_mask, pts_rest, 0.0)
+                mean_matrix[group_idx, chunk_indices] = mean_expr
 
                 if not np.any(valid_mask):
                     continue
@@ -753,14 +855,17 @@ def nb_glm_test(
                     result = next(result_iter)
                     convergence_matrix[group_idx, gene_idx] = result.converged
                     iter_matrix[group_idx, gene_idx] = result.n_iter
-                    dispersion_matrix[group_idx, gene_idx] = result.dispersion
+                    dispersion_raw_matrix[group_idx, gene_idx] = result.dispersion
                     coef = float(result.coef[perturbation_column_index])
                     se = float(result.se[perturbation_column_index])
                     if not result.converged or not np.isfinite(coef) or not np.isfinite(se) or se <= 0:
                         continue
+                    if cook_filter and result.max_cooks is not None:
+                        cook_cutoff = 4.0 / max(subset_n - design.shape[1], 1)
+                        if result.max_cooks > cook_cutoff:
+                            continue
                     statistic = coef / se
                     pvalue = float(2.0 * norm.sf(abs(statistic)))
-                    effect_matrix[group_idx, gene_idx] = coef
                     statistic_matrix[group_idx, gene_idx] = statistic
                     pvalue_matrix[group_idx, gene_idx] = pvalue
                     logfc_matrix[group_idx, gene_idx] = coef
@@ -768,8 +873,37 @@ def nb_glm_test(
         finally:
             backed.file.close()
 
+        if shrink_dispersion:
+            trend = fit_dispersion_trend(
+                mean_matrix[group_idx], dispersion_raw_matrix[group_idx]
+            )
+            dispersion_trend_matrix[group_idx] = trend
+            dispersion_matrix[group_idx] = shrink_dispersions(
+                dispersion_raw_matrix[group_idx], trend
+            )
+        else:
+            dispersion_trend_matrix[group_idx] = dispersion_raw_matrix[group_idx]
+            dispersion_matrix[group_idx] = dispersion_raw_matrix[group_idx]
+
+        logfc_raw_matrix[group_idx] = logfc_matrix[group_idx]
+        if shrink_logfc:
+            prior_var = None
+            finite_se = se_matrix[group_idx][np.isfinite(se_matrix[group_idx])]
+            if finite_se.size:
+                prior_var = float(np.nanmedian(finite_se ** 2))
+            shrunk_lfc = shrink_log_foldchange(
+                logfc_matrix[group_idx], se_matrix[group_idx], prior_var
+            )
+            logfc_matrix[group_idx] = shrunk_lfc
+            effect_matrix[group_idx] = shrunk_lfc
+        else:
+            effect_matrix[group_idx] = logfc_matrix[group_idx]
+
     gene_symbols = pd.Index(gene_symbols).astype(str)
-    order_matrix = np.argsort(-np.abs(statistic_matrix), axis=1, kind="mergesort")
+    statistic_for_order = np.where(
+        np.isfinite(statistic_matrix), np.abs(statistic_matrix), -np.inf
+    )
+    order_matrix = np.argsort(-statistic_for_order, axis=1, kind="mergesort")
     pvalue_adj_matrix = _adjust_pvalue_matrix(pvalue_matrix, corr_method)
 
     obs_index = pd.Index(candidates, name="perturbation").astype(str)
@@ -781,8 +915,11 @@ def nb_glm_test(
     adata.layers["pvalue"] = pvalue_matrix
     adata.layers["pvalue_adj"] = pvalue_adj_matrix
     adata.layers["logfoldchange"] = logfc_matrix
+    adata.layers["logfoldchange_raw"] = logfc_raw_matrix
     adata.layers["standard_error"] = se_matrix
     adata.layers["dispersion"] = dispersion_matrix
+    adata.layers["dispersion_raw"] = dispersion_raw_matrix
+    adata.layers["dispersion_trend"] = dispersion_trend_matrix
     adata.layers["converged"] = convergence_matrix.astype(np.float32)
     adata.layers["iterations"] = iter_matrix.astype(np.float32)
     adata.layers["pts"] = pts_matrix
@@ -790,6 +927,7 @@ def nb_glm_test(
     adata.uns["method"] = "nb_glm"
     adata.uns["control_label"] = control_label
     adata.uns["covariates"] = covariates
+    adata.uns["size_factors"] = size_factors
 
     output_path = resolve_output_path(
         path,
