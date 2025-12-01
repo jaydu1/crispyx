@@ -20,6 +20,7 @@ class NBGLMResult:
     converged: bool
     n_iter: int
     deviance: float
+    max_cooks: float | None = None
 
 
 class NBGLMFitter:
@@ -69,6 +70,7 @@ class NBGLMFitter:
         ridge_penalty: float = 1e-8,
         min_mu: float = 1e-8,
         min_total_count: float = 1.0,
+        compute_cooks: bool = False,
     ) -> None:
         self.design = np.asarray(design, dtype=np.float64)
         if self.design.ndim != 2:
@@ -88,6 +90,7 @@ class NBGLMFitter:
         self.ridge_penalty = ridge_penalty
         self.min_mu = min_mu
         self.min_total_count = min_total_count
+        self.compute_cooks = compute_cooks
 
     def fit_gene(self, counts: ArrayLike) -> NBGLMResult:
         y = np.asarray(counts, dtype=np.float64)
@@ -103,6 +106,7 @@ class NBGLMFitter:
                 converged=False,
                 n_iter=0,
                 deviance=float("nan"),
+                max_cooks=None,
             )
         beta = np.zeros(self.n_features, dtype=np.float64)
         if self.poisson_init_iter:
@@ -110,6 +114,9 @@ class NBGLMFitter:
         alpha = self.dispersion if self.dispersion is not None else 0.0
         converged = False
         deviance = np.nan
+        cov_beta = np.eye(self.n_features, dtype=np.float64)
+        mu = np.maximum(np.full_like(y, y.mean()), self.min_mu)
+        weights = np.ones_like(mu)
         for iteration in range(1, self.max_iter + 1):
             eta = self.offset + self.design @ beta
             mu = np.exp(np.clip(eta, a_min=np.log(self.min_mu), a_max=None))
@@ -136,6 +143,14 @@ class NBGLMFitter:
             # If we exit the loop without breaking we did not converge.
             cov_beta = self._hessian_inverse(weights)
         se = np.sqrt(np.maximum(np.diag(cov_beta), self.min_mu))
+        max_cooks = None
+        if self.compute_cooks:
+            hat_diag = self._hat_diagonal(weights, cov_beta)
+            variance = mu + alpha * (mu**2)
+            pearson_resid = (y - mu) / np.sqrt(np.maximum(variance, self.min_mu))
+            denom = np.maximum((1.0 - hat_diag) ** 2, self.min_mu)
+            cooks = (pearson_resid**2 / max(self.n_features, 1)) * (hat_diag / denom)
+            max_cooks = float(np.nanmax(cooks)) if cooks.size else None
         return NBGLMResult(
             coef=beta,
             se=se,
@@ -143,6 +158,7 @@ class NBGLMFitter:
             converged=converged,
             n_iter=iteration if converged else self.max_iter,
             deviance=deviance,
+            max_cooks=max_cooks,
         )
 
     def fit_matrix(self, matrix: ArrayLike) -> list[NBGLMResult]:
@@ -183,8 +199,14 @@ class NBGLMFitter:
             beta = cho_solve((c, lower), xtwz, check_finite=False)
             inv_hessian = cho_solve((c, lower), np.eye(self.n_features), check_finite=False)
         except np.linalg.LinAlgError:
-            beta = np.linalg.solve(xtwx, xtwz)
-            inv_hessian = np.linalg.inv(xtwx)
+            try:
+                beta = np.linalg.solve(xtwx, xtwz)
+            except np.linalg.LinAlgError:
+                beta = np.linalg.pinv(xtwx) @ xtwz
+            try:
+                inv_hessian = np.linalg.inv(xtwx)
+            except np.linalg.LinAlgError:
+                inv_hessian = np.linalg.pinv(xtwx)
         return beta, inv_hessian
 
     def _hessian_inverse(self, weights: np.ndarray) -> np.ndarray:
@@ -199,6 +221,13 @@ class NBGLMFitter:
         except np.linalg.LinAlgError:
             inv_hessian = np.linalg.pinv(xtwx)
         return inv_hessian
+
+    def _hat_diagonal(self, weights: np.ndarray, inv_hessian: np.ndarray) -> np.ndarray:
+        w_sqrt = np.sqrt(np.clip(weights, self.min_mu, None))
+        x_weighted = self.design * w_sqrt[:, None]
+        projection = x_weighted @ inv_hessian
+        hat = np.sum(x_weighted * projection, axis=1)
+        return np.clip(hat, 0.0, 1.0)
 
     @staticmethod
     def _compute_deviance(y: np.ndarray, mu: np.ndarray, alpha: float) -> float:
@@ -288,3 +317,69 @@ def build_design_matrix(
             column_names.append(str(column))
     design = np.hstack(matrices) if matrices else np.empty((len(obs_frame), 0), dtype=np.float64)
     return design, column_names
+
+
+def fit_dispersion_trend(
+    means: ArrayLike, dispersions: ArrayLike, *, min_mean: float = 1e-8
+) -> np.ndarray:
+    """Fit a smooth log-quadratic trend of dispersion versus mean expression."""
+
+    means_arr = np.asarray(means, dtype=np.float64)
+    disp_arr = np.asarray(dispersions, dtype=np.float64)
+    valid = (
+        np.isfinite(means_arr)
+        & np.isfinite(disp_arr)
+        & (means_arr > min_mean)
+        & (disp_arr > 0)
+    )
+    if valid.sum() < 3:
+        baseline = np.nanmedian(disp_arr[valid]) if np.any(valid) else np.nan
+        return np.full_like(means_arr, baseline, dtype=np.float64)
+    x = np.log(np.clip(means_arr[valid], min_mean, None))
+    y = np.log(np.clip(disp_arr[valid], min_mean, None))
+    coeffs = np.polyfit(x, y, deg=2)
+    trend = np.exp(np.polyval(coeffs, np.log(np.clip(means_arr, min_mean, None))))
+    return trend
+
+
+def shrink_dispersions(raw: ArrayLike, trend: ArrayLike, prior_weight: float | None = None) -> np.ndarray:
+    """Empirically shrink dispersions toward a fitted mean-dispersion trend."""
+
+    raw_arr = np.asarray(raw, dtype=np.float64)
+    trend_arr = np.asarray(trend, dtype=np.float64)
+    shrunk = np.array(raw_arr, copy=True)
+    mask = (
+        np.isfinite(raw_arr)
+        & np.isfinite(trend_arr)
+        & (raw_arr > 0)
+        & (trend_arr > 0)
+    )
+    if not np.any(mask):
+        return shrunk
+    log_raw = np.log(raw_arr[mask])
+    log_trend = np.log(trend_arr[mask])
+    if prior_weight is None:
+        prior_var = np.nanmedian((log_raw - log_trend) ** 2)
+        prior_weight = 1.0 / np.maximum(prior_var, 1e-8)
+    log_post = (log_raw + prior_weight * log_trend) / (1.0 + prior_weight)
+    shrunk[mask] = np.exp(log_post)
+    return shrunk
+
+
+def shrink_log_foldchange(
+    coef: ArrayLike, se: ArrayLike, prior_var: float | None = None
+) -> np.ndarray:
+    """Apply simple empirical Bayes shrinkage to log-fold changes."""
+
+    coef_arr = np.asarray(coef, dtype=np.float64)
+    se_arr = np.asarray(se, dtype=np.float64)
+    shrunk = np.array(coef_arr, copy=True)
+    mask = np.isfinite(coef_arr) & np.isfinite(se_arr) & (se_arr > 0)
+    if not np.any(mask):
+        return shrunk
+    if prior_var is None:
+        prior_var = np.nanmedian(se_arr[mask] ** 2)
+    prior_var = float(np.maximum(prior_var, 1e-12))
+    shrink_factor = prior_var / (prior_var + se_arr[mask] ** 2)
+    shrunk[mask] = coef_arr[mask] * shrink_factor
+    return shrunk
