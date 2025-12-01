@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Sequence
 
 import numpy as np
+import scipy.sparse as sp
 from numpy.typing import ArrayLike
 from scipy.linalg import cho_factor, cho_solve
 
@@ -161,13 +162,32 @@ class NBGLMFitter:
             max_cooks=max_cooks,
         )
 
-    def fit_matrix(self, matrix: ArrayLike) -> list[NBGLMResult]:
-        y = np.asarray(matrix)
+    def fit_matrix(self, matrix: ArrayLike, *, batch_size: int | None = None) -> list[NBGLMResult]:
+        if sp.issparse(matrix):
+            sparse_matrix = sp.csc_matrix(matrix, dtype=np.float64)
+            n_genes = sparse_matrix.shape[1]
+            batch = batch_size or n_genes
+            if sparse_matrix.shape[0] != self.n_samples:
+                raise ValueError("matrix must have shape (n_samples, n_genes)")
+            results: list[NBGLMResult] = []
+            for start in range(0, n_genes, batch):
+                end = min(start + batch, n_genes)
+                dense_block = np.asarray(sparse_matrix[:, start:end].toarray())
+                for col in range(dense_block.shape[1]):
+                    results.append(self.fit_gene(dense_block[:, col]))
+            return results
+
+        y = np.asarray(matrix, dtype=np.float64)
         if y.ndim != 2 or y.shape[0] != self.n_samples:
             raise ValueError("matrix must have shape (n_samples, n_genes)")
+
+        batch = batch_size or y.shape[1]
         results: list[NBGLMResult] = []
-        for col in range(y.shape[1]):
-            results.append(self.fit_gene(y[:, col]))
+        for start in range(0, y.shape[1], batch):
+            end = min(start + batch, y.shape[1])
+            block = y[:, start:end]
+            for col in range(block.shape[1]):
+                results.append(self.fit_gene(block[:, col]))
         return results
 
     def _poisson_warm_start(self, y: np.ndarray, beta: np.ndarray) -> np.ndarray:

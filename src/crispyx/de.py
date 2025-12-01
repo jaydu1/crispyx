@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import resource
 import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
@@ -653,6 +654,7 @@ def nb_glm_test(
     min_cells_expressed: int = 0,
     min_total_count: float = 1.0,
     chunk_size: int = 256,
+    irls_batch_size: int | None = 128,
     size_factors: ArrayLike | None = None,
     cook_filter: bool = False,
     shrink_dispersion: bool = True,
@@ -701,7 +703,12 @@ def nb_glm_test(
     min_total_count
         Minimum total count across all cells for a gene to be tested.
     chunk_size
-        Number of genes to process per chunk (memory vs. speed tradeoff).
+        Number of genes to process per chunk (memory vs. speed tradeoff). Smaller
+        values stream more, reducing peak memory at the cost of additional I/O.
+    irls_batch_size
+        Maximum number of genes to densify per IRLS step. Keep this small to
+        limit per-iteration memory when working with large sparse matrices. Set
+        to ``None`` to process each chunk without additional batching.
     size_factors
         Optional array of per-cell size factors. If None, computes DESeq2-style
         median-of-ratios size factors.
@@ -764,147 +771,202 @@ def nb_glm_test(
     offset = np.log(np.clip(size_factors, 1e-8, None))
 
     n_groups = len(candidates)
-    effect_matrix = np.full((n_groups, n_genes), np.nan, dtype=np.float64)
-    statistic_matrix = np.full_like(effect_matrix, np.nan)
-    pvalue_matrix = np.full_like(effect_matrix, np.nan)
-    logfc_matrix = np.full_like(effect_matrix, np.nan)
-    logfc_raw_matrix = np.full_like(effect_matrix, np.nan)
-    se_matrix = np.full_like(effect_matrix, np.nan)
-    pts_matrix = np.zeros((n_groups, n_genes), dtype=np.float64)
-    pts_rest_matrix = np.zeros_like(pts_matrix)
-    dispersion_matrix = np.full_like(effect_matrix, np.nan)
-    dispersion_raw_matrix = np.full_like(effect_matrix, np.nan)
-    dispersion_trend_matrix = np.full_like(effect_matrix, np.nan)
-    mean_matrix = np.zeros_like(effect_matrix)
-    iter_matrix = np.zeros_like(effect_matrix)
-    convergence_matrix = np.zeros_like(effect_matrix, dtype=bool)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_path = Path(tmpdir)
 
-    # Note: n_jobs parameter accepted but not yet implemented for nb_glm_test
-    # due to file handle management complexity with per-perturbation chunking
-    # TODO: Implement parallelization using process-based approach with separate file handles
-    for group_idx, label in enumerate(candidates):
-        group_mask = labels == label
-        subset_mask = control_mask | group_mask
-        subset_obs = obs_df.iloc[subset_mask]
-        indicator = group_mask[subset_mask].astype(np.float64)
-        subset_size_factors = np.asarray(size_factors)[subset_mask]
-        design, design_columns = build_design_matrix(
-            subset_obs,
-            covariate_columns=covariates,
-            perturbation_indicator=indicator,
-            intercept=True,
-        )
-        perturbation_column_index = design_columns.index("perturbation")
-        fitter = NBGLMFitter(
-            design,
-            offset=offset[subset_mask],
-            dispersion=dispersion,
-            max_iter=max_iter,
-            tol=tol,
-            poisson_init_iter=poisson_init_iter,
-            min_total_count=min_total_count,
-            compute_cooks=cook_filter,
-        )
-        control_subset_mask = control_mask[subset_mask]
-        group_subset_mask = group_mask[subset_mask]
-        group_n = int(group_subset_mask.sum())
-        subset_n = int(subset_mask.sum())
+        def _create_memmap(
+            name: str, dtype: np.dtype, *, fill: float | int | bool | None = np.nan
+        ) -> np.memmap:
+            mmap = np.memmap(
+                tmp_path / f"{name}.dat",
+                mode="w+",
+                dtype=dtype,
+                shape=(n_groups, n_genes),
+            )
+            if fill is None:
+                return mmap
+            if isinstance(fill, float) and np.isnan(fill):
+                mmap.fill(np.nan)
+            else:
+                mmap.fill(fill)
+            return mmap
 
-        backed = read_backed(path)
-        try:
-            for slc, block in iter_matrix_chunks(backed, axis=1, chunk_size=chunk_size):
-                raw_block = np.asarray(block, dtype=np.float64)
-                subset_block = raw_block[subset_mask, :]
-                normalized_block = sp.csr_matrix(subset_block).multiply(
-                    1.0 / subset_size_factors[:, None]
-                )
-                mean_expr = normalized_block.sum(axis=0).A1 / max(subset_n, 1)
-                control_block = subset_block[control_subset_mask, :]
-                group_block = subset_block[group_subset_mask, :]
-                control_expr = np.asarray(np.count_nonzero(control_block, axis=0))
-                group_expr = np.asarray(np.count_nonzero(group_block, axis=0))
-                total_expr = control_expr + group_expr
-                valid_mask = total_expr >= min_cells_expressed
-                chunk_indices = np.arange(slc.start, slc.stop)
-                pts = np.divide(
-                    group_expr,
-                    group_n,
-                    out=np.zeros_like(group_expr, dtype=float),
-                    where=group_n > 0,
-                )
-                pts_rest = np.divide(
-                    control_expr,
-                    control_n,
-                    out=np.zeros_like(control_expr, dtype=float),
-                    where=control_n > 0,
-                )
-                pts_matrix[group_idx, chunk_indices] = np.where(valid_mask, pts, 0.0)
-                pts_rest_matrix[group_idx, chunk_indices] = np.where(valid_mask, pts_rest, 0.0)
-                mean_matrix[group_idx, chunk_indices] = mean_expr
+        effect_memmap = _create_memmap("effect", np.float64)
+        statistic_memmap = _create_memmap("statistic", np.float64)
+        pvalue_memmap = _create_memmap("pvalue", np.float64)
+        logfc_memmap = _create_memmap("logfoldchange", np.float64)
+        logfc_raw_memmap = _create_memmap("logfoldchange_raw", np.float64)
+        se_memmap = _create_memmap("standard_error", np.float64)
+        pts_memmap = _create_memmap("pts", np.float32, fill=0.0)
+        pts_rest_memmap = _create_memmap("pts_rest", np.float32, fill=0.0)
+        dispersion_memmap = _create_memmap("dispersion", np.float64)
+        dispersion_raw_memmap = _create_memmap("dispersion_raw", np.float64)
+        dispersion_trend_memmap = _create_memmap("dispersion_trend", np.float64)
+        mean_memmap = _create_memmap("mean", np.float64, fill=0.0)
+        iter_memmap = _create_memmap("iterations", np.int32, fill=0)
+        convergence_memmap = _create_memmap("converged", np.bool_, fill=False)
 
-                if not np.any(valid_mask):
-                    continue
+        # Note: n_jobs parameter accepted but not yet implemented for nb_glm_test
+        # due to file handle management complexity with per-perturbation chunking
+        # TODO: Implement parallelization using process-based approach with separate file handles
+        for group_idx, label in enumerate(candidates):
+            group_mask = labels == label
+            subset_mask = control_mask | group_mask
+            subset_obs = obs_df.iloc[subset_mask]
+            indicator = group_mask[subset_mask].astype(np.float64)
+            subset_size_factors = np.asarray(size_factors)[subset_mask]
+            design, design_columns = build_design_matrix(
+                subset_obs,
+                covariate_columns=covariates,
+                perturbation_indicator=indicator,
+                intercept=True,
+            )
+            perturbation_column_index = design_columns.index("perturbation")
+            fitter = NBGLMFitter(
+                design,
+                offset=offset[subset_mask],
+                dispersion=dispersion,
+                max_iter=max_iter,
+                tol=tol,
+                poisson_init_iter=poisson_init_iter,
+                min_total_count=min_total_count,
+                compute_cooks=cook_filter,
+            )
+            control_subset_mask = control_mask[subset_mask]
+            group_subset_mask = group_mask[subset_mask]
+            group_n = int(group_subset_mask.sum())
+            subset_n = int(subset_mask.sum())
 
-                fit_block = subset_block[:, valid_mask]
-                gene_results = fitter.fit_matrix(fit_block)
-                result_iter = iter(gene_results)
+            backed = read_backed(path)
+            try:
+                for slc, block in iter_matrix_chunks(
+                    backed, axis=1, chunk_size=chunk_size, convert_to_dense=False
+                ):
+                    csr_block = sp.csr_matrix(block, dtype=np.float64)
+                    subset_block = csr_block[subset_mask, :]
+                    normalized_block = subset_block.multiply(
+                        1.0 / subset_size_factors[:, None]
+                    )
+                    mean_expr = np.asarray(normalized_block.sum(axis=0)).ravel()
+                    if subset_n:
+                        mean_expr = mean_expr / subset_n
+                    control_block = subset_block[control_subset_mask, :]
+                    group_block = subset_block[group_subset_mask, :]
+                    control_expr = np.asarray(control_block.getnnz(axis=0)).ravel()
+                    group_expr = np.asarray(group_block.getnnz(axis=0)).ravel()
+                    total_expr = control_expr + group_expr
+                    valid_mask = total_expr >= min_cells_expressed
+                    chunk_indices = np.arange(slc.start, slc.stop)
+                    pts = np.divide(
+                        group_expr,
+                        group_n,
+                        out=np.zeros_like(group_expr, dtype=float),
+                        where=group_n > 0,
+                    )
+                    pts_rest = np.divide(
+                        control_expr,
+                        control_n,
+                        out=np.zeros_like(control_expr, dtype=float),
+                        where=control_n > 0,
+                    )
+                    pts_memmap[group_idx, chunk_indices] = np.where(
+                        valid_mask, pts, 0.0
+                    )
+                    pts_rest_memmap[group_idx, chunk_indices] = np.where(
+                        valid_mask, pts_rest, 0.0
+                    )
+                    mean_memmap[group_idx, chunk_indices] = mean_expr
 
-                for local_idx, gene_idx in enumerate(chunk_indices):
-                    if not valid_mask[local_idx]:
+                    if not np.any(valid_mask):
                         continue
-                    result = next(result_iter)
-                    convergence_matrix[group_idx, gene_idx] = result.converged
-                    iter_matrix[group_idx, gene_idx] = result.n_iter
-                    dispersion_raw_matrix[group_idx, gene_idx] = result.dispersion
-                    coef = float(result.coef[perturbation_column_index])
-                    se = float(result.se[perturbation_column_index])
-                    if not result.converged or not np.isfinite(coef) or not np.isfinite(se) or se <= 0:
-                        continue
-                    if cook_filter and result.max_cooks is not None:
-                        cook_cutoff = 4.0 / max(subset_n - design.shape[1], 1)
-                        if result.max_cooks > cook_cutoff:
+
+                    fit_block = subset_block[:, valid_mask]
+                    gene_results = fitter.fit_matrix(
+                        fit_block, batch_size=irls_batch_size
+                    )
+                    valid_indices = np.nonzero(valid_mask)[0]
+
+                    for local_idx, result in zip(valid_indices, gene_results):
+                        gene_idx = chunk_indices[local_idx]
+                        convergence_memmap[group_idx, gene_idx] = bool(
+                            result.converged
+                        )
+                        iter_memmap[group_idx, gene_idx] = int(result.n_iter)
+                        dispersion_raw_memmap[group_idx, gene_idx] = result.dispersion
+                        coef = float(result.coef[perturbation_column_index])
+                        se = float(result.se[perturbation_column_index])
+                        if (
+                            not result.converged
+                            or not np.isfinite(coef)
+                            or not np.isfinite(se)
+                            or se <= 0
+                        ):
                             continue
-                    statistic = coef / se
-                    pvalue = float(2.0 * norm.sf(abs(statistic)))
-                    statistic_matrix[group_idx, gene_idx] = statistic
-                    pvalue_matrix[group_idx, gene_idx] = pvalue
-                    logfc_matrix[group_idx, gene_idx] = coef
-                    se_matrix[group_idx, gene_idx] = se
-        finally:
-            backed.file.close()
+                        if cook_filter and result.max_cooks is not None:
+                            cook_cutoff = 4.0 / max(subset_n - design.shape[1], 1)
+                            if result.max_cooks > cook_cutoff:
+                                continue
+                        statistic = coef / se
+                        pvalue = float(2.0 * norm.sf(abs(statistic)))
+                        statistic_memmap[group_idx, gene_idx] = statistic
+                        pvalue_memmap[group_idx, gene_idx] = pvalue
+                        logfc_memmap[group_idx, gene_idx] = coef
+                        se_memmap[group_idx, gene_idx] = se
+            finally:
+                backed.file.close()
 
-        if shrink_dispersion:
-            trend = fit_dispersion_trend(
-                mean_matrix[group_idx], dispersion_raw_matrix[group_idx]
-            )
-            dispersion_trend_matrix[group_idx] = trend
-            dispersion_matrix[group_idx] = shrink_dispersions(
-                dispersion_raw_matrix[group_idx], trend
-            )
-        else:
-            dispersion_trend_matrix[group_idx] = dispersion_raw_matrix[group_idx]
-            dispersion_matrix[group_idx] = dispersion_raw_matrix[group_idx]
+            if shrink_dispersion:
+                trend = fit_dispersion_trend(
+                    mean_memmap[group_idx], dispersion_raw_memmap[group_idx]
+                )
+                dispersion_trend_memmap[group_idx] = trend
+                dispersion_memmap[group_idx] = shrink_dispersions(
+                    dispersion_raw_memmap[group_idx], trend
+                )
+            else:
+                dispersion_trend_memmap[group_idx] = dispersion_raw_memmap[group_idx]
+                dispersion_memmap[group_idx] = dispersion_raw_memmap[group_idx]
 
-        logfc_raw_matrix[group_idx] = logfc_matrix[group_idx]
-        if shrink_logfc:
-            prior_var = None
-            finite_se = se_matrix[group_idx][np.isfinite(se_matrix[group_idx])]
-            if finite_se.size:
-                prior_var = float(np.nanmedian(finite_se ** 2))
-            shrunk_lfc = shrink_log_foldchange(
-                logfc_matrix[group_idx], se_matrix[group_idx], prior_var
-            )
-            logfc_matrix[group_idx] = shrunk_lfc
-            effect_matrix[group_idx] = shrunk_lfc
-        else:
-            effect_matrix[group_idx] = logfc_matrix[group_idx]
+            logfc_raw_memmap[group_idx] = logfc_memmap[group_idx]
+            if shrink_logfc:
+                prior_var = None
+                finite_se = se_memmap[group_idx][np.isfinite(se_memmap[group_idx])]
+                if finite_se.size:
+                    prior_var = float(np.nanmedian(finite_se ** 2))
+                shrunk_lfc = shrink_log_foldchange(
+                    logfc_memmap[group_idx], se_memmap[group_idx], prior_var
+                )
+                logfc_memmap[group_idx] = shrunk_lfc
+                effect_memmap[group_idx] = shrunk_lfc
+            else:
+                effect_memmap[group_idx] = logfc_memmap[group_idx]
 
-    gene_symbols = pd.Index(gene_symbols).astype(str)
-    statistic_for_order = np.where(
-        np.isfinite(statistic_matrix), np.abs(statistic_matrix), -np.inf
-    )
-    order_matrix = np.argsort(-statistic_for_order, axis=1, kind="mergesort")
-    pvalue_adj_matrix = _adjust_pvalue_matrix(pvalue_matrix, corr_method)
+        pvalue_adj_memmap = np.memmap(
+            tmp_path / "pvalue_adj.dat", mode="w+", dtype=np.float64, shape=(n_groups, n_genes)
+        )
+        _adjust_pvalue_matrix(pvalue_memmap, corr_method, out=pvalue_adj_memmap)
+
+        gene_symbols = pd.Index(gene_symbols).astype(str)
+        statistic_for_order = np.where(
+            np.isfinite(statistic_memmap), np.abs(statistic_memmap), -np.inf
+        )
+        order_matrix = np.argsort(-statistic_for_order, axis=1, kind="mergesort")
+
+        effect_matrix = np.array(effect_memmap)
+        statistic_matrix = np.array(statistic_memmap)
+        pvalue_matrix = np.array(pvalue_memmap)
+        pvalue_adj_matrix = np.array(pvalue_adj_memmap)
+        logfc_matrix = np.array(logfc_memmap)
+        logfc_raw_matrix = np.array(logfc_raw_memmap)
+        se_matrix = np.array(se_memmap)
+        dispersion_matrix = np.array(dispersion_memmap)
+        dispersion_raw_matrix = np.array(dispersion_raw_memmap)
+        dispersion_trend_matrix = np.array(dispersion_trend_memmap)
+        mean_matrix = np.array(mean_memmap)
+        iter_matrix = np.array(iter_memmap)
+        convergence_matrix = np.array(convergence_memmap)
+        pts_matrix = np.array(pts_memmap, dtype=np.float32)
+        pts_rest_matrix = np.array(pts_rest_memmap, dtype=np.float32)
 
     obs_index = pd.Index(candidates, name="perturbation").astype(str)
     obs = pd.DataFrame({perturbation_column: obs_index.to_list()}, index=obs_index)
@@ -955,6 +1017,14 @@ def nb_glm_test(
         tie_correct=False,
         pvalue_correction=corr_method,
         result=AnnData(output_path),
+    )
+    peak_rss_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    peak_rss_mb = peak_rss_kb / 1024.0
+    logger.info(
+        "nb_glm_test peak RSS: %.2f MB (chunk_size=%d, irls_batch_size=%s)",
+        peak_rss_mb,
+        chunk_size,
+        "auto" if irls_batch_size is None else irls_batch_size,
     )
     return result
 
