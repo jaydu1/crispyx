@@ -32,7 +32,7 @@ test = [
 benchmark = [
     "pyyaml>=6.0",
     "tqdm>=4.65",
-    "psutil; sys_platform == 'darwin'",
+    "psutil>=5.9",
 ]
 
 [tool.pytest.ini_options]

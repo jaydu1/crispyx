@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import multiprocessing as mp
+import os
 import resource
 import sys
 import threading
@@ -223,6 +224,79 @@ def _get_current_rss_bytes() -> Optional[float]:
     return None
 
 
+def _sample_subprocess_memory(
+    pid: int,
+    stop_event: threading.Event,
+    memory_samples: list,
+    sample_interval: float = 0.1
+) -> None:
+    """Background thread function to sample subprocess memory from parent process.
+    
+    Uses psutil to track memory of a subprocess, which works correctly for
+    spawned processes where getrusage resets the peak RSS counter.
+    Falls back to /proc/{pid}/statm on Linux if psutil is unavailable.
+    
+    Parameters
+    ----------
+    pid : int
+        Process ID of the subprocess to monitor
+    stop_event : threading.Event
+        Event to signal when to stop sampling
+    memory_samples : list
+        List to store memory samples in bytes (float)
+    sample_interval : float
+        Time interval between samples in seconds (default: 0.1)
+    """
+    proc = None
+    use_proc_fallback = False
+    
+    try:
+        import psutil
+        proc = psutil.Process(pid)
+    except ImportError:
+        # psutil not available, try /proc fallback on Linux
+        if sys.platform.startswith('linux'):
+            use_proc_fallback = True
+            print(
+                "Warning: psutil not installed. Using /proc fallback for memory tracking. "
+                "Install psutil for more accurate memory measurements: pip install psutil",
+                file=sys.stderr
+            )
+        else:
+            print(
+                "Warning: psutil not installed and no fallback available for this platform. "
+                "Memory tracking will be unavailable. Install psutil: pip install psutil",
+                file=sys.stderr
+            )
+            return
+    except Exception as e:
+        # psutil.NoSuchProcess or other errors
+        return
+    
+    while not stop_event.is_set():
+        try:
+            if use_proc_fallback:
+                # Read RSS from /proc/{pid}/statm (second field is RSS in pages)
+                statm_path = f'/proc/{pid}/statm'
+                try:
+                    with open(statm_path, 'r') as f:
+                        fields = f.read().split()
+                        if len(fields) >= 2:
+                            rss_pages = int(fields[1])
+                            page_size = os.sysconf('SC_PAGE_SIZE')
+                            memory_samples.append(float(rss_pages * page_size))
+                except (FileNotFoundError, ProcessLookupError):
+                    # Process terminated
+                    break
+            else:
+                mem_info = proc.memory_info()
+                memory_samples.append(float(mem_info.rss))
+        except Exception:
+            # Process terminated or access denied
+            break
+        time.sleep(sample_interval)
+
+
 def _sample_memory_continuously(
     stop_event: threading.Event,
     memory_samples: list,
@@ -404,10 +478,23 @@ def run_scanpy_qc(
     output_dir: Path,
 ) -> Dict[str, Any]:
     """Run Scanpy QC pipeline and save filtered dataset."""
+    import gc
+    import time
+    
+    # Capture function start time (before imports)
+    t_func_start = time.perf_counter()
+    
     import scanpy as sc
     import scipy.sparse as sp
     
+    # Phase 1: Load data
+    t_load_start = time.perf_counter()
     adata = sc.read_h5ad(str(dataset_path))
+    t_load_end = time.perf_counter()
+    gc.collect()
+    
+    # Phase 2: Process
+    t_process_start = time.perf_counter()
     
     # Ensure CSR
     if sp.issparse(adata.X) and not sp.isspmatrix_csr(adata.X):
@@ -427,15 +514,24 @@ def run_scanpy_qc(
     # Filter genes
     if min_cells_per_gene > 0:
         sc.pp.filter_genes(adata, min_cells=min_cells_per_gene)
+    
+    t_process_end = time.perf_counter()
+    gc.collect()
         
-    # Save result
+    # Phase 3: Save result
+    t_save_start = time.perf_counter()
     output_path = output_dir / "scanpy_qc_filtered.h5ad"
     adata.write_h5ad(output_path)
+    t_save_end = time.perf_counter()
     
     return {
         "result_path": str(output_path),
         "cells_kept": adata.n_obs,
         "genes_kept": adata.n_vars,
+        "import_seconds": t_load_start - t_func_start,
+        "load_seconds": t_load_end - t_load_start,
+        "process_seconds": t_process_end - t_process_start,
+        "save_seconds": t_save_end - t_save_start,
     }
 
 def run_scanpy_de(
@@ -448,9 +544,22 @@ def run_scanpy_de(
     preprocess: bool = True,
 ) -> Dict[str, Any]:
     """Run Scanpy DE on filtered dataset."""
+    import gc
+    import time
+    
+    # Capture function start time (before imports)
+    t_func_start = time.perf_counter()
+    
     import scanpy as sc
     
+    # Phase 1: Load data
+    t_load_start = time.perf_counter()
     adata = sc.read_h5ad(str(dataset_path))
+    t_load_end = time.perf_counter()
+    gc.collect()
+    
+    # Phase 2: Process
+    t_process_start = time.perf_counter()
     
     # Preprocessing
     if preprocess:
@@ -464,6 +573,7 @@ def run_scanpy_de(
         method=method,
         reference=control_label,
         n_genes=adata.n_vars,
+        tie_correct=True,  # Match crispyx's default tie correction
     )
     
     df = sc.get.rank_genes_groups_df(adata, None)
@@ -471,13 +581,23 @@ def run_scanpy_de(
     # Rename 'group' to perturbation_column if present
     if "group" in df.columns:
         df = df.rename(columns={"group": perturbation_column})
+    
+    t_process_end = time.perf_counter()
+    gc.collect()
         
+    # Phase 3: Save result
+    t_save_start = time.perf_counter()
     output_path = output_dir / f"scanpy_de_{method.replace('-', '_')}.csv"
     df.to_csv(output_path, index=False)
+    t_save_end = time.perf_counter()
     
     return {
         "result_path": str(output_path),
         "groups": len(df[perturbation_column].unique()) if not df.empty else 0,
+        "import_seconds": t_load_start - t_func_start,
+        "load_seconds": t_load_end - t_load_start,
+        "process_seconds": t_process_end - t_process_start,
+        "save_seconds": t_save_end - t_save_start,
     }
 
 def run_edger_de(
@@ -489,7 +609,13 @@ def run_edger_de(
     n_jobs: int | None = None,
 ) -> Dict[str, Any]:
     """Run edgeR DE on filtered dataset."""
+    import gc
     import os
+    import time
+    
+    # Capture function start time (before imports)
+    t_func_start = time.perf_counter()
+    
     from benchmarking.env_config import get_global_env_config
     
     # Configure R
@@ -504,7 +630,14 @@ def run_edger_de(
     from rpy2.robjects import numpy2ri
     from rpy2.robjects.conversion import localconverter
     
+    # Phase 1: Load data
+    t_load_start = time.perf_counter()
     adata = sc.read_h5ad(str(dataset_path))
+    t_load_end = time.perf_counter()
+    gc.collect()
+    
+    # Phase 2: Process
+    t_process_start = time.perf_counter()
     
     groups = adata.obs[perturbation_column].astype(str).values
     unique_groups = [g for g in np.unique(groups) if g != control_label]
@@ -574,12 +707,22 @@ def run_edger_de(
             }))
             
     final_results = pd.concat(all_results, ignore_index=True)
+    t_process_end = time.perf_counter()
+    gc.collect()
+    
+    # Phase 3: Save result
+    t_save_start = time.perf_counter()
     output_path = output_dir / "edger_de_glm.csv"
     final_results.to_csv(output_path, index=False)
+    t_save_end = time.perf_counter()
     
     return {
         "result_path": str(output_path),
         "groups": len(unique_groups),
+        "import_seconds": t_load_start - t_func_start,
+        "load_seconds": t_load_end - t_load_start,
+        "process_seconds": t_process_end - t_process_start,
+        "save_seconds": t_save_end - t_save_start,
     }
 
 def run_pertpy_de(
@@ -592,10 +735,25 @@ def run_pertpy_de(
     n_jobs: int | None = None,
 ) -> Dict[str, Any]:
     """Run Pertpy DE on filtered dataset."""
+    import gc
+    import io
+    import time
+    
+    # Capture function start time (before imports)
+    t_func_start = time.perf_counter()
+    
+    from contextlib import redirect_stdout, redirect_stderr
     import pertpy as pt
     import scanpy as sc
     
+    # Phase 1: Load data
+    t_load_start = time.perf_counter()
     adata = sc.read_h5ad(str(dataset_path))
+    t_load_end = time.perf_counter()
+    gc.collect()
+    
+    # Phase 2: Process (with suppressed output)
+    t_process_start = time.perf_counter()
     
     # Resolve runner
     module = getattr(pt, "tools", None)
@@ -617,35 +775,50 @@ def run_pertpy_de(
     if not runner:
         raise ValueError(f"Pertpy runner {backend} not found")
         
-    # Run
+    # Run with suppressed stdout/stderr to hide PyDESeq2 verbose output
     kwargs = {"groupby": perturbation_column, "control": control_label}
     if n_jobs: kwargs["n_cpus"] = n_jobs
     
-    try:
-        result = runner(adata, **kwargs)
-    except TypeError as e:
-        print(f"[PyDESeq2] TypeError: {e}")
-        # Fallback for different API
-        kwargs = {"group_key": perturbation_column, "control": control_label}
-        if n_jobs: kwargs["n_cpus"] = n_jobs
-        result = runner(adata, **kwargs)
-    except Exception as e:
-        print(f"[PyDESeq2] Exception: {e}")
-        raise
-        
+    # Suppress PyDESeq2 verbose output
+    with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+        try:
+            result = runner(adata, **kwargs)
+        except TypeError:
+            # Fallback for different API
+            kwargs = {"group_key": perturbation_column, "control": control_label}
+            if n_jobs: kwargs["n_cpus"] = n_jobs
+            result = runner(adata, **kwargs)
+    
+    t_de_end = time.perf_counter()
+    
+    # Convert result to DataFrame (can be slow for some backends)
+    t_convert_start = time.perf_counter()
     df = _convert_reference_result_to_dataframe(result)
+    t_convert_end = time.perf_counter()
     
     # Rename 'contrast' to perturbation_column if present (PyDESeq2)
     if df is not None and "contrast" in df.columns and perturbation_column not in df.columns:
         df = df.rename(columns={"contrast": perturbation_column})
+    
+    t_process_end = time.perf_counter()
+    gc.collect()
         
+    # Phase 3: Save result
+    t_save_start = time.perf_counter()
     output_path = output_dir / f"pertpy_de_{backend}.csv"
     if df is not None:
         df.to_csv(output_path, index=False)
+    t_save_end = time.perf_counter()
     
     return {
         "result_path": str(output_path),
         "groups": len(df[perturbation_column].unique()) if df is not None and "perturbation" in df.columns else 0,
+        "import_seconds": t_load_start - t_func_start,
+        "load_seconds": t_load_end - t_load_start,
+        "process_seconds": t_process_end - t_process_start,
+        "de_seconds": t_de_end - t_process_start,
+        "convert_seconds": t_convert_end - t_convert_start,
+        "save_seconds": t_save_end - t_save_start,
     }
 
 # End of scanpy validation utilities
@@ -811,8 +984,12 @@ class DifferentialComparisonSummary:
     reference_runtime_seconds: Optional[float] = None
     stream_peak_memory_mb: Optional[float] = None
     stream_avg_memory_mb: Optional[float] = None
+    stream_peak_memory_absolute_mb: Optional[float] = None
+    stream_avg_memory_absolute_mb: Optional[float] = None
     reference_peak_memory_mb: Optional[float] = None
     reference_avg_memory_mb: Optional[float] = None
+    reference_peak_memory_absolute_mb: Optional[float] = None
+    reference_avg_memory_absolute_mb: Optional[float] = None
 
     @property
     def effect_max_abs_diff(self) -> Optional[float]:
@@ -1722,9 +1899,14 @@ def evaluate_benchmarks(output_dir: Path) -> None:
     if "max_memory_mb" in df.columns and "peak_memory_mb" not in df.columns:
         df = df.rename(columns={"max_memory_mb": "peak_memory_mb"})
     
-    # Generate Performance Table
+    # Generate Performance Table with timing breakdown
+    # spawn_overhead_seconds captures subprocess startup time
+    # de_seconds and convert_seconds are specific to pertpy methods
     perf_cols = [
-        "method", "status", "elapsed_seconds", "peak_memory_mb", "avg_memory_mb",
+        "method", "status", "elapsed_seconds", "spawn_overhead_seconds",
+        "import_seconds", "load_seconds", "process_seconds", 
+        "de_seconds", "convert_seconds", "save_seconds",
+        "peak_memory_mb", "avg_memory_mb",
         "cells_kept", "genes_kept", "groups"
     ]
     perf_df = df[[c for c in perf_cols if c in df.columns]].copy()
@@ -2058,11 +2240,7 @@ def _worker(
     _apply_resource_limit(memory_limit, resource.RLIMIT_AS, "virtual memory")
     _apply_resource_limit(time_limit, resource.RLIMIT_CPU, "CPU time")
 
-    # Capture baseline memory before method execution
-    # This ensures consistent baseline with reference methods
-    baseline_memory_bytes = _get_peak_memory_bytes()
-
-    # Start background memory sampling thread
+    # Start background memory sampling thread for average memory calculation
     stop_event = threading.Event()
     memory_samples = []
     memory_thread = threading.Thread(
@@ -2081,24 +2259,23 @@ def _worker(
         stop_event.set()
         memory_thread.join(timeout=1.0)
         
-        # Calculate peak memory as delta from baseline
-        peak_memory_mb = _peak_memory_delta_mb(baseline_memory_bytes)
+        # Use absolute peak memory (total RSS, not delta)
+        peak_memory_mb = _get_peak_memory_bytes() / (1024.0 * 1024.0)
         
-        # Calculate average memory from samples (current RSS in bytes) as delta from baseline
+        # Calculate average memory from samples (absolute values)
         avg_memory_mb = None
         if memory_samples:
             # Filter out None values
             valid_samples = [s for s in memory_samples if s is not None]
             if valid_samples:
-                avg_rss_bytes = np.mean(valid_samples)
-                avg_memory_mb = max(0.0, (avg_rss_bytes - baseline_memory_bytes) / (1024.0 * 1024.0))
+                avg_memory_mb = np.mean(valid_samples) / (1024.0 * 1024.0)
         
         summary = method.summary(result, context)
         queue.put(
             {
                 "status": "success",
                 "elapsed_seconds": elapsed,
-                "max_memory_mb": peak_memory_mb,
+                "peak_memory_mb": peak_memory_mb,
                 "avg_memory_mb": avg_memory_mb,
                 "summary": summary,
             }
@@ -2134,6 +2311,19 @@ def _worker(
                 "traceback": traceback.format_exc(),
             }
         )
+    
+    # Force immediate exit to avoid hanging on orphaned ThreadPoolExecutor threads.
+    # Some libraries (e.g., PyDESeq2 via pydeseq2/anndata) create ThreadPoolExecutors
+    # that don't shut down cleanly. Python's normal exit waits for all non-daemon
+    # threads, causing 600+ second delays. os._exit() bypasses this.
+    # 
+    # We need a small delay to allow the multiprocessing Queue's background thread
+    # to send the result data to the parent process before we force-exit.
+    import time as _time
+    _time.sleep(0.5)  # Allow queue to flush
+    
+    import os as _os
+    _os._exit(0)
 
 
 def _run_with_limits(
@@ -2152,10 +2342,7 @@ def _run_with_limits(
     if 'edger_direct' in method.name.lower():
         set_thread_env_vars(n_threads)
         
-        # Capture baseline memory before method execution
-        baseline_memory_bytes = _get_peak_memory_bytes()
-        
-        # Start background memory sampling thread
+        # Start background memory sampling thread for average memory calculation
         stop_event = threading.Event()
         memory_samples = []
         memory_thread = threading.Thread(
@@ -2174,17 +2361,16 @@ def _run_with_limits(
             stop_event.set()
             memory_thread.join(timeout=1.0)
             
-            # Calculate peak memory as delta from baseline
-            peak_memory_mb = _peak_memory_delta_mb(baseline_memory_bytes)
+            # Use absolute peak memory (total RSS)
+            peak_memory_mb = _get_peak_memory_bytes() / (1024.0 * 1024.0)
             
-            # Calculate average memory from samples (current RSS in bytes) as delta from baseline
+            # Calculate average memory from samples (absolute values)
             avg_memory_mb = None
             if memory_samples:
                 # Filter out None values
                 valid_samples = [s for s in memory_samples if s is not None]
                 if valid_samples:
-                    avg_rss_bytes = np.mean(valid_samples)
-                    avg_memory_mb = max(0.0, (avg_rss_bytes - baseline_memory_bytes) / (1024.0 * 1024.0))
+                    avg_memory_mb = np.mean(valid_samples) / (1024.0 * 1024.0)
             
             summary = method.summary(result, context)
             return {
@@ -2211,7 +2397,7 @@ def _run_with_limits(
             return {
                 "status": "error",
                 "elapsed_seconds": elapsed,
-                "max_memory_mb": None,
+                "peak_memory_mb": None,
                 "avg_memory_mb": avg_memory_mb,
                 "error": str(exc),
                 "traceback": traceback.format_exc(),
@@ -2232,10 +2418,29 @@ def _run_with_limits(
         name=f"benchmark-{method.name}",
     )
     process.start()
+    
+    # For spawned processes, track memory from parent using psutil
+    # This avoids the issue where spawn resets peak RSS counter
+    parent_memory_samples = []
+    parent_stop_event = threading.Event()
+    parent_memory_thread = None
+    if needs_spawn and process.pid:
+        parent_memory_thread = threading.Thread(
+            target=_sample_subprocess_memory,
+            args=(process.pid, parent_stop_event, parent_memory_samples, 0.1),
+            daemon=True
+        )
+        parent_memory_thread.start()
+    
     join_timeout = None
     if time_limit and time_limit > 0:
         join_timeout = time_limit + 5
     process.join(timeout=join_timeout)
+    
+    # Stop parent-process memory sampling
+    parent_stop_event.set()
+    if parent_memory_thread:
+        parent_memory_thread.join(timeout=1.0)
     
     # Calculate actual wall-clock elapsed time from parent process
     parent_elapsed_time = time.perf_counter() - parent_start_time
@@ -2265,14 +2470,29 @@ def _run_with_limits(
 
     payload.setdefault("summary", {})
     
-    # Ensure peak_memory_mb is present (already computed as delta in _worker)
-    payload.setdefault("peak_memory_mb", None)
+    # For spawned processes, ALWAYS use parent-tracked memory (absolute values)
+    # because subprocess getrusage peak RSS resets on spawn, making subprocess
+    # delta-based values unreliable. Parent-tracked values are absolute (total RSS).
+    if needs_spawn and parent_memory_samples:
+        parent_peak_mb = max(parent_memory_samples) / (1024.0 * 1024.0)
+        parent_avg_mb = np.mean(parent_memory_samples) / (1024.0 * 1024.0)
+        
+        # Always use parent-tracked values for spawned processes
+        payload["peak_memory_mb"] = parent_peak_mb
+        payload["avg_memory_mb"] = parent_avg_mb
     
-    # Ensure avg_memory_mb is present (may be None)
+    # Ensure memory fields are present
+    payload.setdefault("peak_memory_mb", None)
     payload.setdefault("avg_memory_mb", None)
     
-    # Override elapsed_seconds with parent process timing for accuracy
-    # (subprocess timing can be incorrect for methods that spawn external processes)
+    # For spawned processes, calculate spawn overhead (subprocess startup time)
+    # This is the time between parent starting the process and subprocess beginning work
+    if needs_spawn:
+        subprocess_elapsed = payload.get("elapsed_seconds", 0) or 0
+        spawn_overhead = parent_elapsed_time - subprocess_elapsed
+        payload["spawn_overhead_seconds"] = max(0, spawn_overhead)
+    
+    # Override elapsed_seconds with parent process timing for total wall time
     payload["elapsed_seconds"] = parent_elapsed_time
     
     return payload
@@ -3045,7 +3265,7 @@ def _run_single_benchmark(
                     "description": method.description,
                     "status": "skipped_existing",
                     "elapsed_seconds": None,
-                    "max_memory_mb": None,
+                    "peak_memory_mb": None,
                     "result_path": _normalise_path(existing_path, context) if existing_path else None,
                 }
                 rows.append(row)
@@ -3071,7 +3291,7 @@ def _run_single_benchmark(
         # Update progress bar with result status
         if show_progress:
             status = result.get("status", "unknown")
-            mem_mb = result.get("max_memory_mb") or 0
+            mem_mb = result.get("peak_memory_mb") or 0
             elapsed = result.get("elapsed_seconds") or 0
             method_iterator.set_postfix(  # type: ignore
                 status=status, 
@@ -3085,7 +3305,8 @@ def _run_single_benchmark(
             "description": method.description,
             "status": result.get("status"),
             "elapsed_seconds": result.get("elapsed_seconds"),
-            "max_memory_mb": result.get("max_memory_mb"),
+            "spawn_overhead_seconds": result.get("spawn_overhead_seconds"),
+            "peak_memory_mb": result.get("peak_memory_mb"),
             "avg_memory_mb": result.get("avg_memory_mb"),
         }
         summary = result.get("summary", {})

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable
+from typing import Dict, Iterable, Tuple
 
 import numpy as np
 import pandas as pd
@@ -45,8 +45,28 @@ def filter_cells_by_gene_count(
     min_genes: int = 100,
     gene_name_column: str | None = None,
     chunk_size: int = 2048,
-) -> np.ndarray:
-    """Return a boolean mask selecting cells with at least ``min_genes`` expressed genes."""
+    return_counts: bool = False,
+) -> np.ndarray | Tuple[np.ndarray, np.ndarray]:
+    """Return a boolean mask selecting cells with at least ``min_genes`` expressed genes.
+    
+    Parameters
+    ----------
+    path
+        Path to h5ad file.
+    min_genes
+        Minimum number of expressed genes per cell.
+    gene_name_column
+        Column in var containing gene names.
+    chunk_size
+        Number of cells to process per chunk.
+    return_counts
+        If True, return (mask, counts) tuple instead of just mask.
+        
+    Returns
+    -------
+    mask or (mask, counts)
+        Boolean mask, optionally with the raw gene counts per cell.
+    """
 
     backed = read_backed(path)
     try:
@@ -59,7 +79,11 @@ def filter_cells_by_gene_count(
                 counts[slc] = np.count_nonzero(block, axis=1)
     finally:
         backed.file.close()
-    return counts >= min_genes
+    
+    mask = counts >= min_genes
+    if return_counts:
+        return mask, counts
+    return mask
 
 
 def filter_perturbations_by_cell_count(
@@ -103,8 +127,30 @@ def filter_genes_by_cell_count(
     cell_mask: np.ndarray | None = None,
     gene_name_column: str | None = None,
     chunk_size: int = 2048,
-) -> np.ndarray:
-    """Return a boolean mask selecting genes expressed in at least ``min_cells`` cells."""
+    return_counts: bool = False,
+) -> np.ndarray | Tuple[np.ndarray, np.ndarray]:
+    """Return a boolean mask selecting genes expressed in at least ``min_cells`` cells.
+    
+    Parameters
+    ----------
+    path
+        Path to h5ad file.
+    min_cells
+        Minimum number of cells expressing each gene.
+    cell_mask
+        Optional mask for cells to consider.
+    gene_name_column
+        Column in var containing gene names.
+    chunk_size
+        Number of cells to process per chunk.
+    return_counts
+        If True, return (mask, counts) tuple instead of just mask.
+        
+    Returns
+    -------
+    mask or (mask, counts)
+        Boolean mask, optionally with the raw cell counts per gene.
+    """
 
     backed = read_backed(path)
     try:
@@ -123,7 +169,11 @@ def filter_genes_by_cell_count(
                 counts += np.count_nonzero(selected, axis=0)
     finally:
         backed.file.close()
-    return counts >= min_cells
+    
+    mask = counts >= min_cells
+    if return_counts:
+        return mask, counts
+    return mask
 
 
 def quality_control_summary(
@@ -153,11 +203,13 @@ def quality_control_summary(
     finally:
         backed.file.close()
 
-    cell_mask = filter_cells_by_gene_count(
+    # Get cell mask AND the gene counts per cell (reuse counts, avoid re-iteration)
+    cell_mask, gene_counts_per_cell = filter_cells_by_gene_count(
         path,
         min_genes=min_genes,
         gene_name_column=gene_name_column,
         chunk_size=chunk_size,
+        return_counts=True,
     )
     perturbation_mask = filter_perturbations_by_cell_count(
         path,
@@ -167,33 +219,16 @@ def quality_control_summary(
         base_mask=cell_mask,
     )
     combined_cell_mask = cell_mask & perturbation_mask
-    gene_mask = filter_genes_by_cell_count(
+    
+    # Get gene mask AND the cell counts per gene (reuse counts, avoid re-iteration)
+    gene_mask, gene_cell_counts = filter_genes_by_cell_count(
         path,
         min_cells=min_cells_per_gene,
         cell_mask=combined_cell_mask,
         gene_name_column=gene_name_column,
         chunk_size=chunk_size,
+        return_counts=True,
     )
-
-    backed = read_backed(path)
-    try:
-        counts = np.zeros(backed.n_vars, dtype=np.int64)
-        gene_counts_per_cell = np.zeros(backed.n_obs, dtype=np.int64)
-        for slc, block in iter_matrix_chunks(backed, axis=0, chunk_size=chunk_size, convert_to_dense=False):
-            if sp.issparse(block):
-                gene_counts_per_cell[slc] = np.asarray(block.getnnz(axis=1)).ravel()
-            else:
-                gene_counts_per_cell[slc] = np.count_nonzero(block, axis=1)
-            local_mask = combined_cell_mask[slc]
-            if not np.any(local_mask):
-                continue
-            selected = block[local_mask]
-            if sp.issparse(selected):
-                counts += np.asarray(selected.getnnz(axis=0)).ravel()
-            else:
-                counts += np.count_nonzero(selected, axis=0)
-    finally:
-        backed.file.close()
 
     filtered_path = resolve_output_path(path, suffix="filtered", output_dir=output_dir, data_name=data_name)
     write_filtered_subset(
@@ -218,6 +253,6 @@ def quality_control_summary(
         perturbation_keep=perturbation_keep,
         filtered=filtered,
         cell_gene_counts=gene_counts_per_cell,
-        gene_cell_counts=counts,
+        gene_cell_counts=gene_cell_counts,
     )
 

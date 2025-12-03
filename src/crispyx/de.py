@@ -462,6 +462,8 @@ def t_test(
         raise ValueError("Control group contains no cells")
 
     control_mean = sums[control_idx] / control_n
+    # Precompute control term for LFC calculation once (avoid recomputing per perturbation)
+    control_mean_expm1 = np.expm1(control_mean) + 1e-9
     control_var = np.zeros_like(control_mean)
     if control_n > 1:
         control_var = (sumsq[control_idx] - (sums[control_idx] ** 2) / control_n) / (control_n - 1)
@@ -542,6 +544,7 @@ def t_test(
             mean_buffer = np.zeros(n_genes, dtype=np.float64)
             var_buffer = np.zeros(n_genes, dtype=np.float64)
             se_buffer = np.zeros(n_genes, dtype=np.float64)
+            lfc_work_buffer = np.zeros(n_genes, dtype=np.float64)  # Work buffer for in-place LFC
 
             def compute_perturbation(label: str, slot: int) -> None:
                 idx = group_index[label]
@@ -582,7 +585,13 @@ def t_test(
                 )
 
                 order_buffer[slot] = np.argsort(-np.abs(stat_buffer[slot]))
-                np.copyto(lfc_buffer[slot], effect_f32)
+                # Scanpy-compatible log2 fold change: log2((expm1(mean_group) + eps) / (expm1(mean_rest) + eps))
+                # Use in-place operations to minimize temporary allocations
+                np.expm1(mean_buffer, out=lfc_work_buffer)
+                np.add(lfc_work_buffer, 1e-9, out=lfc_work_buffer)
+                np.divide(lfc_work_buffer, control_mean_expm1, out=lfc_work_buffer)
+                np.log2(lfc_work_buffer, out=lfc_work_buffer)
+                lfc_buffer[slot] = lfc_work_buffer.astype(np.float32)
 
             if n_groups > 0:
                 for batch_start in range(0, n_groups, batch_size):
@@ -1151,6 +1160,10 @@ def wilcoxon_test(
                     if control_values.nnz
                     else np.zeros(csr_block.shape[1], dtype=np.float64)
                 )
+                # Precompute control term for LFC calculation once per chunk
+                control_mean_expm1 = np.expm1(control_mean) + 1e-9
+                # Work buffer for in-place LFC calculation
+                lfc_work_buffer = np.empty_like(control_mean)
                 control_pts = np.divide(
                     control_expr,
                     control_n,
@@ -1220,8 +1233,13 @@ def wilcoxon_test(
                     )
                     pts = np.where(valid, pts, 0.0)
                     pts_rest = np.where(valid, control_pts, 0.0)
-                    log_fc = group_mean - control_mean
-                    log_fc = np.where(valid, log_fc, 0.0)
+                    # Scanpy-compatible log2 fold change: log2((expm1(mean_group) + eps) / (expm1(mean_rest) + eps))
+                    # Use in-place operations to minimize temporary allocations
+                    np.expm1(group_mean, out=lfc_work_buffer)
+                    np.add(lfc_work_buffer, 1e-9, out=lfc_work_buffer)
+                    np.divide(lfc_work_buffer, control_mean_expm1, out=lfc_work_buffer)
+                    np.log2(lfc_work_buffer, out=lfc_work_buffer)
+                    log_fc = np.where(valid, lfc_work_buffer, 0.0)
                     return idx, full_u, full_z, full_p, full_effect, log_fc, pts, pts_rest
 
                 tasks = [(idx, label) for idx, label in enumerate(candidates)]
