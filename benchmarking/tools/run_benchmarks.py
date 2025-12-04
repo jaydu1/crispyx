@@ -1931,6 +1931,30 @@ def _get_accuracy_emoji(corr: Optional[float]) -> str:
         return "❌"
 
 
+def _format_mean_std(mean: Optional[float], std: Optional[float]) -> str:
+    """Format mean ± std as a two-line string for markdown tables.
+    
+    Parameters
+    ----------
+    mean : float | None
+        Mean value
+    std : float | None
+        Standard deviation value
+        
+    Returns
+    -------
+    str
+        Formatted string like "0.950<br><small>±0.023</small>" or "-" if no data
+    """
+    if mean is None or pd.isna(mean):
+        return "-"
+    
+    if std is None or pd.isna(std) or std == 0:
+        return f"{mean:.3f}"
+    
+    return f"{mean:.3f}<br><small>±{std:.3f}</small>"
+
+
 def _get_method_category(method_name: str) -> tuple[str, str, int]:
     """Get category and test type for a method.
     
@@ -1983,27 +2007,28 @@ def _format_method_name(method: str) -> str:
     """Format method name for display with proper capitalization."""
     # Check for specific tool names first
     if "edger_" in method.lower():
-        return "edgeR"
+        return "NB-GLM"
     if "pertpy_" in method.lower() and "pydeseq2" in method.lower():
-        return "PyDESeq2"
+        return "NB-GLM"
     
     # Remove common prefixes
-    name = method.replace("crispyx_", "").replace("scanpy_", "").replace("pertpy_", "")
+    name = method.replace("crispyx_", "").replace("scanpy_", "").replace("pertpy_", "").replace("edger_", "")
     
     # Apply specific formatting
     name = name.replace("_", " ")
     
-    # Proper capitalizations
+    # Proper capitalizations - lowercase except for specific terms
     replacements = {
         "de t test": "t-test",
         "de wilcoxon": "Wilcoxon",
-        "de nb glm joint": "NB-GLM (Joint)",
+        "de nb glm joint": "NB-GLM (joint)",
         "de nb glm": "NB-GLM",
-        "de glm": "edgeR",
-        "de pydeseq2": "PyDESeq2",
-        "qc filtered": "QC Filter",
-        "pb avg": "Pseudobulk (Avg)",
-        "pb pseudobulk": "Pseudobulk",
+        "de glm": "NB-GLM",
+        "de pydeseq2": "NB-GLM",
+        "qc filtered": "QC filter",
+        "pb avg log": "pseudobulk (avg log)",
+        "pb avg": "pseudobulk (avg)",
+        "pb pseudobulk": "pseudobulk",
     }
     
     for old, new in replacements.items():
@@ -2011,15 +2036,33 @@ def _format_method_name(method: str) -> str:
             name = name.replace(old, new)
             break
     
-    # Add tool prefix if it's a reference tool (only if not already formatted)
-    if "scanpy" in method and not any(x in name for x in ["edgeR", "PyDESeq2"]):
-        name = f"Scanpy {name}"
-    
+    return name
+
+
+def _get_method_package(method: str) -> str:
+    """Get the package name for a method."""
+    if method.startswith("crispyx_"):
+        return "crispyx"
+    elif method.startswith("scanpy_"):
+        return "scanpy"
+    elif method.startswith("edger_"):
+        return "edgeR"
+    elif method.startswith("pertpy_"):
+        return "pertpy"
+    return ""
+
+
+def _format_full_method_name(method: str) -> str:
+    """Format full method name including package (e.g., 'edgeR NB-GLM')."""
+    package = _get_method_package(method)
+    name = _format_method_name(method)
+    if package:
+        return f"{package} {name}"
     return name
 
 
 def _is_crispyx_method(method: str) -> bool:
-    """Check if method is a CRISPYx method."""
+    """Check if method is a crispyx method."""
     return method.startswith("crispyx_")
 
 
@@ -2027,6 +2070,7 @@ def _generate_improved_markdown(
     perf_df: pd.DataFrame,
     perf_comp_results: List[Dict[str, Any]],
     accuracy_results: List[Dict[str, Any]],
+    overlap_heatmaps: Optional[Dict[str, Path]] = None,
 ) -> str:
     """Generate improved markdown with categorized tables and emoji indicators."""
     
@@ -2045,6 +2089,7 @@ def _generate_improved_markdown(
         perf_df = perf_df.sort_values("_sort_order")
         
         # Format method names for display
+        perf_df["Package"] = perf_df["method"].apply(_get_method_package)
         perf_df["Method"] = perf_df["method"].apply(_format_method_name)
         
         # Group by category
@@ -2057,9 +2102,9 @@ def _generate_improved_markdown(
             
             # Select columns based on category
             if "Preprocessing" in category or "QC" in category:
-                cols = ["Method", "status", "elapsed_seconds", "peak_memory_mb", "cells_kept", "genes_kept"]
+                cols = ["Package", "Method", "status", "elapsed_seconds", "peak_memory_mb", "cells_kept", "genes_kept"]
             else:
-                cols = ["Method", "status", "elapsed_seconds", "peak_memory_mb", "groups", "genes"]
+                cols = ["Package", "Method", "status", "elapsed_seconds", "peak_memory_mb", "groups", "genes"]
             
             # Keep only columns that exist
             cols = [c for c in cols if c in cat_df.columns]
@@ -2077,9 +2122,15 @@ def _generate_improved_markdown(
             }
             display_df = display_df.rename(columns={k: v for k, v in rename_map.items() if k in display_df.columns})
             
-            # Round numeric columns
-            for col in display_df.select_dtypes(include=["number"]).columns:
-                display_df[col] = display_df[col].round(2)
+            # Format numeric columns - integers for counts, decimals for time/memory
+            for col in display_df.columns:
+                if col in ["Cells", "Genes", "Groups"]:
+                    # Format as integers
+                    display_df[col] = display_df[col].apply(
+                        lambda x: int(x) if pd.notna(x) else x
+                    )
+                elif col in display_df.select_dtypes(include=["number"]).columns:
+                    display_df[col] = display_df[col].round(2)
             
             md += _frame_to_markdown_table(display_df)
             md += "\n\n"
@@ -2126,7 +2177,7 @@ def _generate_improved_markdown(
                     comparison = comp["comparison"]
                     parts = comparison.split(" vs ")
                     method_a = _format_method_name(parts[0])
-                    method_b = _format_method_name(parts[1])
+                    method_b = _format_full_method_name(parts[1])
                     
                     time_pct = comp.get("time_pct")
                     mem_pct = comp.get("mem_pct")
@@ -2137,8 +2188,8 @@ def _generate_improved_markdown(
                     mem_emoji = _get_performance_emoji(mem_pct, is_lower_better=True)
                     
                     rows.append({
-                        "CRISPYx Method": method_a,
-                        "Compared To": method_b,
+                        "crispyx method": method_a,
+                        "compared to": method_b,
                         "Time Δ": _format_diff(time_diff, "s"),
                         "Time %": _format_pct(time_pct),
                         "": time_emoji,
@@ -2172,8 +2223,10 @@ def _generate_improved_markdown(
                 mem_emoji = _get_performance_emoji(mem_pct, is_lower_better=True)
                 
                 rows.append({
-                    "Method A": method_a,
-                    "Method B": method_b,
+                    "package A": _get_method_package(parts[0]),
+                    "method A": method_a,
+                    "package B": _get_method_package(parts[1]),
+                    "method B": method_b,
                     "Time Δ (A-B)": _format_diff(time_diff, "s"),
                     "Time % (A/B)": _format_pct(time_pct),
                     "": time_emoji,
@@ -2189,7 +2242,7 @@ def _generate_improved_markdown(
     # Section 3: Accuracy Comparison
     # =========================================================================
     md += "## 3. Accuracy\n\n"
-    md += "_Correlation metrics between CRISPYx and reference methods. ✅ >0.95, ⚠️ 0.8-0.95, ❌ <0.8_\n\n"
+    md += "_Correlation metrics between crispyx and reference methods. ✅ >0.95, ⚠️ 0.8-0.95, ❌ <0.8_\n\n"
     
     if accuracy_results:
         # Separate CRISPYx comparisons from other comparisons
@@ -2231,7 +2284,7 @@ def _generate_improved_markdown(
                         comparison = acc["comparison"]
                         parts = comparison.split(" vs ")
                         method_a = _format_method_name(parts[0])
-                        method_b = _format_method_name(parts[1])
+                        method_b = _format_full_method_name(parts[1])
                         
                         cells_diff = acc.get("cells_diff", 0)
                         genes_diff = acc.get("genes_diff", 0)
@@ -2241,8 +2294,8 @@ def _generate_improved_markdown(
                         genes_emoji = "✅" if genes_diff == 0 else ("⚠️" if abs(genes_diff) < 10 else "❌")
                         
                         rows.append({
-                            "CRISPYx Method": method_a,
-                            "Compared To": method_b,
+                            "crispyx method": method_a,
+                            "compared to": method_b,
                             "Cells Δ": f"{int(cells_diff):+d}" if pd.notna(cells_diff) else "-",
                             "": cells_emoji,
                             "Genes Δ": f"{int(genes_diff):+d}" if pd.notna(genes_diff) else "-",
@@ -2251,31 +2304,42 @@ def _generate_improved_markdown(
                     
                     md += _frame_to_markdown_table(pd.DataFrame(rows))
                 else:
-                    # DE comparisons - show correlations
+                    # DE comparisons - show correlations (Pearson and Spearman)
                     rows = []
                     for acc in accs:
                         comparison = acc["comparison"]
                         parts = comparison.split(" vs ")
                         method_a = _format_method_name(parts[0])
-                        method_b = _format_method_name(parts[1])
+                        method_b = _format_full_method_name(parts[1])
                         
-                        effect_corr = acc.get("effect_pearson_corr")
-                        stat_corr = acc.get("statistic_pearson_corr")
-                        pval_corr = acc.get("pvalue_pearson_corr")
-                        
-                        effect_emoji = _get_accuracy_emoji(effect_corr)
-                        stat_emoji = _get_accuracy_emoji(stat_corr)
-                        pval_emoji = _get_accuracy_emoji(pval_corr)
+                        effect_p_mean = acc.get("effect_pearson_corr_mean")
+                        effect_p_std = acc.get("effect_pearson_corr_std")
+                        effect_s_mean = acc.get("effect_spearman_corr_mean")
+                        effect_s_std = acc.get("effect_spearman_corr_std")
+                        stat_p_mean = acc.get("statistic_pearson_corr_mean")
+                        stat_p_std = acc.get("statistic_pearson_corr_std")
+                        stat_s_mean = acc.get("statistic_spearman_corr_mean")
+                        stat_s_std = acc.get("statistic_spearman_corr_std")
+                        pval_p_mean = acc.get("pvalue_log_pearson_corr_mean")
+                        pval_p_std = acc.get("pvalue_log_pearson_corr_std")
+                        pval_s_mean = acc.get("pvalue_log_spearman_corr_mean")
+                        pval_s_std = acc.get("pvalue_log_spearman_corr_std")
                         
                         rows.append({
-                            "CRISPYx Method": method_a,
-                            "Compared To": method_b,
-                            "Effect ρ": f"{effect_corr:.3f}" if pd.notna(effect_corr) else "-",
-                            "": effect_emoji,
-                            "Stat ρ": f"{stat_corr:.3f}" if pd.notna(stat_corr) else "-",
-                            " ": stat_emoji,
-                            "P-val ρ": f"{pval_corr:.3f}" if pd.notna(pval_corr) else "-",
-                            "  ": pval_emoji,
+                            "crispyx method": method_a,
+                            "compared to": method_b,
+                            "Eff ρ": _format_mean_std(effect_p_mean, effect_p_std),
+                            "": _get_accuracy_emoji(effect_p_mean),
+                            "Eff ρₛ": _format_mean_std(effect_s_mean, effect_s_std),
+                            " ": _get_accuracy_emoji(effect_s_mean),
+                            "Stat ρ": _format_mean_std(stat_p_mean, stat_p_std),
+                            "  ": _get_accuracy_emoji(stat_p_mean),
+                            "Stat ρₛ": _format_mean_std(stat_s_mean, stat_s_std),
+                            "   ": _get_accuracy_emoji(stat_s_mean),
+                            "log-Pval ρ": _format_mean_std(pval_p_mean, pval_p_std),
+                            "    ": _get_accuracy_emoji(pval_p_mean),
+                            "log-Pval ρₛ": _format_mean_std(pval_s_mean, pval_s_std),
+                            "     ": _get_accuracy_emoji(pval_s_mean),
                         })
                     
                     md += _frame_to_markdown_table(pd.DataFrame(rows))
@@ -2293,27 +2357,108 @@ def _generate_improved_markdown(
                 method_a = _format_method_name(parts[0])
                 method_b = _format_method_name(parts[1])
                 
-                effect_corr = acc.get("effect_pearson_corr")
-                stat_corr = acc.get("statistic_pearson_corr")
-                pval_corr = acc.get("pvalue_pearson_corr")
-                
-                effect_emoji = _get_accuracy_emoji(effect_corr)
-                stat_emoji = _get_accuracy_emoji(stat_corr)
-                pval_emoji = _get_accuracy_emoji(pval_corr)
+                effect_p_mean = acc.get("effect_pearson_corr_mean")
+                effect_p_std = acc.get("effect_pearson_corr_std")
+                effect_s_mean = acc.get("effect_spearman_corr_mean")
+                effect_s_std = acc.get("effect_spearman_corr_std")
+                stat_p_mean = acc.get("statistic_pearson_corr_mean")
+                stat_p_std = acc.get("statistic_pearson_corr_std")
+                stat_s_mean = acc.get("statistic_spearman_corr_mean")
+                stat_s_std = acc.get("statistic_spearman_corr_std")
+                pval_p_mean = acc.get("pvalue_log_pearson_corr_mean")
+                pval_p_std = acc.get("pvalue_log_pearson_corr_std")
+                pval_s_mean = acc.get("pvalue_log_spearman_corr_mean")
+                pval_s_std = acc.get("pvalue_log_spearman_corr_std")
                 
                 rows.append({
-                    "Method A": method_a,
-                    "Method B": method_b,
-                    "Effect ρ": f"{effect_corr:.3f}" if pd.notna(effect_corr) else "-",
-                    "": effect_emoji,
-                    "Stat ρ": f"{stat_corr:.3f}" if pd.notna(stat_corr) else "-",
-                    " ": stat_emoji,
-                    "P-val ρ": f"{pval_corr:.3f}" if pd.notna(pval_corr) else "-",
-                    "  ": pval_emoji,
+                    "package A": _get_method_package(parts[0]),
+                    "method A": method_a,
+                    "package B": _get_method_package(parts[1]),
+                    "method B": method_b,
+                    "Eff ρ": _format_mean_std(effect_p_mean, effect_p_std),
+                    "": _get_accuracy_emoji(effect_p_mean),
+                    "Eff ρₛ": _format_mean_std(effect_s_mean, effect_s_std),
+                    " ": _get_accuracy_emoji(effect_s_mean),
+                    "Stat ρ": _format_mean_std(stat_p_mean, stat_p_std),
+                    "  ": _get_accuracy_emoji(stat_p_mean),
+                    "Stat ρₛ": _format_mean_std(stat_s_mean, stat_s_std),
+                    "   ": _get_accuracy_emoji(stat_s_mean),
+                    "log-Pval ρ": _format_mean_std(pval_p_mean, pval_p_std),
+                    "    ": _get_accuracy_emoji(pval_p_mean),
+                    "log-Pval ρₛ": _format_mean_std(pval_s_mean, pval_s_std),
+                    "     ": _get_accuracy_emoji(pval_s_mean),
                 })
             
             md += _frame_to_markdown_table(pd.DataFrame(rows))
             md += "\n\n"
+    
+    # =========================================================================
+    # Section 4: Gene Set Overlap
+    # =========================================================================
+    md += "## 4. Gene Set Overlap\n\n"
+    md += "_Overlap ratio of top-k DE genes between methods. ✅ >0.7, ⚠️ 0.5-0.7, ❌ <0.5_\n\n"
+    
+    if accuracy_results:
+        # Build overlap tables for effect size and p-value
+        for metric_type, metric_label in [("effect", "Effect Size"), ("pvalue", "P-value")]:
+            md += f"### {metric_label} Overlap\n\n"
+            
+            rows = []
+            for acc in accuracy_results:
+                comparison = acc["comparison"]
+                parts = comparison.split(" vs ")
+                method_a = _format_method_name(parts[0])
+                method_b = _format_full_method_name(parts[1])
+                
+                # Get overlap metrics for different k values
+                k50 = acc.get(f"{metric_type}_top_k_overlap")
+                k100_mean = acc.get(f"{metric_type}_top_100_overlap_mean")
+                k100_std = acc.get(f"{metric_type}_top_100_overlap_std")
+                k500_mean = acc.get(f"{metric_type}_top_500_overlap_mean")
+                k500_std = acc.get(f"{metric_type}_top_500_overlap_std")
+                
+                # Skip if no overlap data
+                if k50 is None and k100_mean is None and k500_mean is None:
+                    continue
+                
+                def _get_overlap_emoji(val: Optional[float]) -> str:
+                    if val is None or pd.isna(val):
+                        return ""
+                    if val >= 0.7:
+                        return "✅"
+                    elif val >= 0.5:
+                        return "⚠️"
+                    else:
+                        return "❌"
+                
+                rows.append({
+                    "crispyx method": method_a,
+                    "compared to": method_b,
+                    "Top-50": f"{k50:.3f}" if k50 is not None and pd.notna(k50) else "-",
+                    "": _get_overlap_emoji(k50),
+                    "Top-100": _format_mean_std(k100_mean, k100_std),
+                    " ": _get_overlap_emoji(k100_mean),
+                    "Top-500": _format_mean_std(k500_mean, k500_std),
+                    "  ": _get_overlap_emoji(k500_mean),
+                })
+            
+            if rows:
+                md += _frame_to_markdown_table(pd.DataFrame(rows))
+            else:
+                md += "_No overlap data available._\n"
+            md += "\n\n"
+    else:
+        md += "_No overlap data available._\n\n"
+    
+    # Embed top-100 overlap heatmaps if available
+    if overlap_heatmaps:
+        md += "### Overlap Heatmaps (Top-100)\n\n"
+        
+        for metric, label in [("effect", "Effect Size"), ("pvalue", "P-value")]:
+            heatmap_key = f"{metric}_top_100_overlap.png"
+            if heatmap_key in overlap_heatmaps:
+                md += f"#### {label}\n\n"
+                md += f"![{label} Top-100 Overlap]({heatmap_key})\n\n"
     
     # =========================================================================
     # Legend
@@ -2322,6 +2467,11 @@ def _generate_improved_markdown(
     md += "**Legend:**\n"
     md += "- Performance: ✅ >10% better | ⚠️ within ±10% | ❌ >10% worse\n"
     md += "- Accuracy: ✅ ρ≥0.95 | ⚠️ 0.8≤ρ<0.95 | ❌ ρ<0.8\n"
+    md += "- Overlap: ✅ ≥0.7 | ⚠️ 0.5-0.7 | ❌ <0.5\n"
+    md += "- ρ = Pearson correlation, ρₛ = Spearman correlation\n"
+    md += "- Correlation and overlap values shown as mean±std across perturbations\n"
+    md += "- log-Pval: correlations computed on -log₁₀(p) transformed values\n"
+    md += "- Top-k overlap: fraction of top-k genes shared between methods\n"
     
     return md
 
@@ -2378,6 +2528,9 @@ def evaluate_benchmarks(output_dir: Path) -> None:
     # Generate Performance Comparison Table
     perf_comp_results = []
     
+    # Collect DE results for heatmap generation
+    de_results_for_heatmaps: Dict[str, pd.DataFrame] = {}
+    
     # Define comparisons
     # Format: (method_a, method_b, comparison_type)
     comparisons = [
@@ -2397,6 +2550,29 @@ def evaluate_benchmarks(output_dir: Path) -> None:
         ("crispyx_de_t_test", "scanpy_de_t_test", "de"),
         ("crispyx_de_wilcoxon", "scanpy_de_wilcoxon", "de"),
     ]
+    
+    # Helper to load DE result DataFrame
+    def _load_de_result(method_name: str, result_path_val: str) -> Optional[pd.DataFrame]:
+        """Load and standardize a DE result from file."""
+        if pd.isna(result_path_val):
+            return None
+        
+        result_path = output_dir / str(result_path_val)
+        if not result_path.exists():
+            return None
+            
+        try:
+            if str(result_path).endswith('.h5ad'):
+                import anndata as ad
+                adata = ad.read_h5ad(str(result_path))
+                result_dict = _anndata_to_de_dict(adata)
+                return _streaming_de_to_frame(result_dict)
+            else:
+                result_df = pd.read_csv(result_path)
+                return _standardise_de_dataframe(result_df)
+        except Exception as e:
+            print(f"Warning: Could not load DE result for {method_name}: {e}")
+            return None
     
     for method_a_name, method_b_name, comp_type in comparisons:
         # Check if both exist and succeeded
@@ -2453,26 +2629,19 @@ def evaluate_benchmarks(output_dir: Path) -> None:
                 accuracy_results.append(acc)
                 
             elif comp_type == "de":
-                # Load DE results - handle both h5ad and csv files
-                import anndata as ad
+                # Load DE results using helper (also collect for heatmaps)
+                method_a_df = _load_de_result(method_a_name, method_a_path_val)
+                method_b_df = _load_de_result(method_b_name, method_b_path_val)
                 
-                # Load method_a results
-                if str(method_a_path).endswith('.h5ad'):
-                    method_a_adata = ad.read_h5ad(str(method_a_path))
-                    method_a_dict = _anndata_to_de_dict(method_a_adata)
-                    method_a_df = _streaming_de_to_frame(method_a_dict)
-                else:
-                    method_a_df = pd.read_csv(method_a_path)
-                    method_a_df = _standardise_de_dataframe(method_a_df)
+                # Store for heatmap generation
+                if method_a_df is not None and method_a_name not in de_results_for_heatmaps:
+                    de_results_for_heatmaps[method_a_name] = method_a_df
+                if method_b_df is not None and method_b_name not in de_results_for_heatmaps:
+                    de_results_for_heatmaps[method_b_name] = method_b_df
                 
-                # Load method_b results
-                if str(method_b_path).endswith('.h5ad'):
-                    method_b_adata = ad.read_h5ad(str(method_b_path))
-                    method_b_dict = _anndata_to_de_dict(method_b_adata)
-                    method_b_df = _streaming_de_to_frame(method_b_dict)
-                else:
-                    method_b_df = pd.read_csv(method_b_path)
-                    method_b_df = _standardise_de_dataframe(method_b_df)
+                if method_a_df is None or method_b_df is None:
+                    print(f"Skipping comparison {method_a_name} vs {method_b_name}: could not load results")
+                    continue
                 
                 # Compute metrics
                 metrics = compute_de_comparison_metrics(method_a_df, method_b_df)
@@ -2483,6 +2652,19 @@ def evaluate_benchmarks(output_dir: Path) -> None:
                 
         except Exception as e:
             print(f"Error comparing {method_a_name} vs {method_b_name}: {e}")
+    
+    # Generate overlap heatmaps
+    overlap_heatmaps: Dict[str, Path] = {}
+    if de_results_for_heatmaps:
+        try:
+            from .visualization import generate_overlap_heatmaps
+            overlap_heatmaps = generate_overlap_heatmaps(
+                de_results_for_heatmaps,
+                output_dir,
+                k_values=(50, 100, 500),
+            )
+        except Exception as e:
+            print(f"Warning: Could not generate overlap heatmaps: {e}")
             
     # Save tables
     perf_df.to_csv(output_dir / "performance_summary.csv", index=False)
@@ -2494,7 +2676,8 @@ def evaluate_benchmarks(output_dir: Path) -> None:
     md = _generate_improved_markdown(
         perf_df, 
         perf_comp_results, 
-        accuracy_results
+        accuracy_results,
+        overlap_heatmaps,
     )
         
     with open(output_dir / "results.md", "w") as f:
@@ -3149,7 +3332,7 @@ def create_benchmark_suite(
         ),
         "crispyx_de_nb_glm_joint": BenchmarkMethod(
             name="crispyx_de_nb_glm_joint",
-            description="Negative binomial GLM differential expression (joint covariate fitting)",
+            description="Negative binomial GLM differential expression (joint model with shared dispersion)",
             function=nb_glm_test,
             kwargs={
                 "path": dataset_path,
@@ -3158,21 +3341,7 @@ def create_benchmark_suite(
                 "data_name": "de_nb_glm_joint",
                 "n_jobs": n_cores,
                 "fit_method": "joint",
-            },
-            summary=_summarise_de_mapping,
-        ),
-        "crispyx_de_nb_glm_joint_shared_disp": BenchmarkMethod(
-            name="crispyx_de_nb_glm_joint_shared_disp",
-            description="Negative binomial GLM DE (joint fitting with shared dispersion)",
-            function=nb_glm_test,
-            kwargs={
-                "path": dataset_path,
-                **shared_kwargs,
-                "output_dir": de_dir,
-                "data_name": "de_nb_glm_joint_shared_disp",
-                "n_jobs": n_cores,
-                "fit_method": "joint",
-                "share_dispersion": True,
+                "lfc_shrinkage_type": "normal",  # Enable LFC shrinkage for better correlation with PyDESeq2
             },
             summary=_summarise_de_mapping,
         ),
