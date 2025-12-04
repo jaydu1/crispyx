@@ -99,6 +99,56 @@ returned :class:`cx.AnnData` wrapper stores previews of the results in
 ``.uns`` so printing ``adata.uns["rank_genes_groups"]`` shows the top genes
 per perturbation while ``.load()`` retrieves the full tables on demand.
 
+NB-GLM fitting methods
+~~~~~~~~~~~~~~~~~~~~~~
+
+The negative binomial GLM (``method="nb_glm"``) supports two fitting strategies
+via the ``fit_method`` parameter:
+
+* ``fit_method="independent"`` (default): Each perturbation is fit separately
+  against the control population. This is faster and suitable when you have
+  few perturbations or expect heterogeneous effects.
+
+* ``fit_method="joint"``: Estimates a global intercept (baseline expression)
+  from control cells, then fits perturbation effects relative to this shared
+  baseline. This provides more stable estimates when you have many perturbations
+  and expect similar baseline expression across conditions.
+
+Additionally, the ``share_dispersion`` parameter controls dispersion estimation:
+
+* ``share_dispersion=False`` (default): Dispersion is estimated separately for
+  each perturbation comparison.
+
+* ``share_dispersion=True``: Dispersion is estimated once using all cells
+  (similar to PyDESeq2's approach). This is more stable when sample sizes are
+  small or when you expect homogeneous dispersion across perturbations.
+
+.. code-block:: python
+
+   # Independent fitting (default, faster)
+   adata_de = cx.tl.rank_genes_groups(
+       adata_ro,
+       perturbation_column="perturbation",
+       method="nb_glm",
+   )
+
+   # Joint fitting with shared intercept
+   adata_de = cx.tl.rank_genes_groups(
+       adata_ro,
+       perturbation_column="perturbation",
+       method="nb_glm",
+       fit_method="joint",
+   )
+
+   # Joint fitting with shared intercept AND shared dispersion
+   adata_de = cx.tl.rank_genes_groups(
+       adata_ro,
+       perturbation_column="perturbation",
+       method="nb_glm",
+       fit_method="joint",
+       share_dispersion=True,
+   )
+
 Benchmarking
 ------------
 

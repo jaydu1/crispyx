@@ -34,6 +34,18 @@ The script accepts additional options to benchmark a subset of methods or to
 redirect outputs to a different directory. Refer to ``benchmarking/README.md``
 for further details.
 
+Available NB-GLM benchmark methods
+----------------------------------
+
+The benchmark suite includes three NB-GLM variants to compare fitting strategies:
+
+* ``crispyx_de_nb_glm``: Independent fitting (each perturbation fit separately)
+* ``crispyx_de_nb_glm_joint``: Joint fitting with shared intercept from control cells
+* ``crispyx_de_nb_glm_joint_shared_disp``: Joint fitting with shared intercept AND shared dispersion
+
+These allow systematic comparison of accuracy and runtime trade-offs between
+fitting strategies on your dataset.
+
 Latest Adamson_subset benchmark
 -------------------------------
 
