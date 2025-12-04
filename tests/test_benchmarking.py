@@ -17,7 +17,7 @@ SRC_PATH = PROJECT_ROOT / "src"
 if str(SRC_PATH) not in sys.path:
     sys.path.insert(0, str(SRC_PATH))
 
-from benchmarking.run_benchmarks import _summarise_dataframe, create_benchmark_suite
+from benchmarking.tools.run_benchmarks import _summarise_dataframe, create_benchmark_suite
 from crispyx import compute_average_log_expression
 
 

@@ -47,7 +47,8 @@ def create_test_dataset(tmp_path):
     )
     var = pd.DataFrame({"gene_symbol": [f"gene{i}" for i in range(x.shape[1])]})
     var.index = var["gene_symbol"]
-    adata = ad.AnnData(x, obs=obs, var=var)
+    # Use sparse matrix for t_test compatibility
+    adata = ad.AnnData(sp.csr_matrix(x), obs=obs, var=var)
     path = tmp_path / "test.h5ad"
     adata.write(path)
     return path, adata
@@ -183,8 +184,9 @@ def test_downstream_effect_outputs(tmp_path):
         output_dir=tmp_path,
         data_name="pseudo_effects",
     )
+    # t_test expects pre-normalized data, use the log-normalized version
     wald = t_test(
-        qc_result.filtered,
+        wilcoxon_input_path,
         perturbation_column="perturbation",
         control_label="ctrl",
         gene_name_column="gene_symbols",
@@ -216,7 +218,9 @@ def test_downstream_effect_outputs(tmp_path):
     filtered = qc_result.filtered.to_memory()
     ctrl_mask = (filtered.obs["perturbation"] == "ctrl").to_numpy()
     ko1_mask = (filtered.obs["perturbation"] == "KO1").to_numpy()
-    log_block = np.asarray(wilcoxon_input.X.toarray())
+    # compute_average_log_expression uses _normalize_total(target_sum=1e4) then log1p
+    raw_block = np.asarray(filtered.X.toarray())
+    log_block = np.log1p(_normalize_total(raw_block, target_sum=1e4))
     ctrl = log_block[ctrl_mask, 0]
     ko1 = log_block[ko1_mask, 0]
     expected = ko1.mean() - ctrl.mean()

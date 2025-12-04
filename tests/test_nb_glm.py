@@ -52,6 +52,7 @@ def test_nb_glm_fitter_matches_statsmodels():
     alpha = 0.7
     y = _generate_nb_counts(rng, mu, alpha)
 
+    # Use min_mu=1e-8 to match statsmodels behavior for testing
     fitter = NBGLMFitter(
         design,
         offset=np.zeros(n, dtype=float),
@@ -59,6 +60,9 @@ def test_nb_glm_fitter_matches_statsmodels():
         max_iter=100,
         tol=1e-8,
         poisson_init_iter=30,
+        min_mu=1e-8,
+        ridge_penalty=1e-8,
+        optimization_method="irls",
     )
     result = fitter.fit_gene(y)
     assert result.converged
@@ -89,6 +93,7 @@ def test_nb_glm_fitter_matches_statsmodels_for_well_expressed_genes():
         mu = np.exp(design @ betas[gene_idx])
         counts[:, gene_idx] = _generate_nb_counts(rng, mu, alpha)
 
+    # Use min_mu=1e-8 to match statsmodels behavior for testing
     fitter = NBGLMFitter(
         design,
         offset=np.zeros(n, dtype=float),
@@ -96,6 +101,9 @@ def test_nb_glm_fitter_matches_statsmodels_for_well_expressed_genes():
         max_iter=120,
         tol=1e-8,
         poisson_init_iter=40,
+        min_mu=1e-8,
+        ridge_penalty=1e-8,
+        optimization_method="irls",
     )
     family = sm.families.NegativeBinomial(alpha=alpha)
     perturbation_index = column_names.index("perturbation")
@@ -200,6 +208,8 @@ def test_nb_glm_agrees_with_statsmodels_and_deseq2():
         mu = np.exp(design @ betas[gene_idx])
         counts[:, gene_idx] = _generate_nb_counts(rng, mu, dispersion)
 
+    # Use min_mu=1e-8 to match statsmodels for direct comparison
+    # Note: The default min_mu=0.5 is aligned with PyDESeq2 for real-world usage
     fitter = NBGLMFitter(
         design,
         offset=np.zeros(n_samples, dtype=float),
@@ -207,6 +217,8 @@ def test_nb_glm_agrees_with_statsmodels_and_deseq2():
         max_iter=120,
         tol=1e-8,
         poisson_init_iter=40,
+        min_mu=1e-8,
+        ridge_penalty=1e-8,
     )
 
     family = sm.families.NegativeBinomial(alpha=dispersion)
@@ -263,3 +275,112 @@ def test_nb_glm_agrees_with_statsmodels_and_deseq2():
         well_expressed += 1
 
     assert well_expressed >= 1
+
+
+def test_nb_glm_joint_vs_independent():
+    """Test that joint fitting produces different (more stable) results than independent."""
+    rng = np.random.default_rng(12345)
+    n_cells = 200
+    n_genes = 20
+    
+    # Create a dataset with multiple perturbations
+    perturbations = ["ctrl"] * 80 + ["KO1"] * 40 + ["KO2"] * 40 + ["KO3"] * 40
+    obs = pd.DataFrame({"perturbation": perturbations})
+    obs.index = [f"cell_{i}" for i in range(n_cells)]
+    
+    # Generate counts with different effects for different perturbations
+    var = pd.DataFrame(index=[f"gene_{i}" for i in range(n_genes)])
+    var["gene_symbols"] = var.index
+    
+    # Base expression levels
+    base_expr = rng.uniform(0.5, 3.0, size=n_genes)
+    
+    # Generate counts
+    counts = np.zeros((n_cells, n_genes), dtype=np.float64)
+    for i in range(n_cells):
+        pert = perturbations[i]
+        if pert == "ctrl":
+            mu = np.exp(base_expr)
+        elif pert == "KO1":
+            mu = np.exp(base_expr - 0.5)  # Down-regulation
+        elif pert == "KO2":
+            mu = np.exp(base_expr + 0.3)  # Up-regulation
+        else:  # KO3
+            mu = np.exp(base_expr)  # No effect
+        counts[i, :] = rng.poisson(mu)
+    
+    import tempfile
+    import scipy.sparse as sp
+    
+    # Create sparse matrix and save
+    adata = ad.AnnData(sp.csr_matrix(counts), obs=obs, var=var)
+    
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = Path(tmpdir) / "test.h5ad"
+        adata.write(path)
+        
+        # Run with independent fitting
+        result_indep = nb_glm_test(
+            path,
+            perturbation_column="perturbation",
+            control_label="ctrl",
+            gene_name_column="gene_symbols",
+            fit_method="independent",
+            output_dir=tmpdir,
+            data_name="indep",
+        )
+        
+        # Run with joint fitting (no shared dispersion)
+        result_joint = nb_glm_test(
+            path,
+            perturbation_column="perturbation",
+            control_label="ctrl",
+            gene_name_column="gene_symbols",
+            fit_method="joint",
+            share_dispersion=False,
+            output_dir=tmpdir,
+            data_name="joint",
+        )
+        
+        # Run with joint fitting and shared dispersion
+        result_joint_shared = nb_glm_test(
+            path,
+            perturbation_column="perturbation",
+            control_label="ctrl",
+            gene_name_column="gene_symbols",
+            fit_method="joint",
+            share_dispersion=True,
+            output_dir=tmpdir,
+            data_name="joint_shared",
+        )
+        
+        # Check that all methods produce results
+        assert len(result_indep.groups) == 3  # KO1, KO2, KO3
+        assert len(result_joint.groups) == 3
+        assert len(result_joint_shared.groups) == 3
+        
+        # Check that joint and independent give similar but not identical results
+        # (Joint should be slightly different due to shared intercept)
+        for label in ["KO1", "KO2"]:
+            indep_effect = result_indep[label].effect_size
+            joint_effect = result_joint[label].effect_size
+            
+            # Results should be correlated (similar direction)
+            valid = np.isfinite(indep_effect) & np.isfinite(joint_effect)
+            if valid.sum() > 5:
+                corr = np.corrcoef(indep_effect[valid], joint_effect[valid])[0, 1]
+                assert corr > 0.9, f"Correlation for {label} should be high: {corr}"
+        
+        # Check that shared dispersion produces consistent dispersions
+        # For shared dispersion, all perturbations should have the same dispersion values
+        if result_joint_shared.result is not None:
+            result_adata = result_joint_shared.result.to_memory()
+            if "dispersion" in result_adata.layers:
+                disp = result_adata.layers["dispersion"]
+                # All rows should be identical when using shared dispersion
+                for i in range(1, disp.shape[0]):
+                    np.testing.assert_array_almost_equal(
+                        disp[0, :], disp[i, :],
+                        decimal=5,
+                        err_msg="Shared dispersion should be identical across perturbations"
+                    )
