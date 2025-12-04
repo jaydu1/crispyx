@@ -21,9 +21,15 @@ DE_METRIC_KEYS: tuple[str, ...] = (
     "pvalue_pearson_corr",
     "pvalue_spearman_corr",
     "pvalue_top_k_overlap",
-    "pvalue_stream_auroc",
-    "pvalue_reference_auroc",
+    "pvalue_method_a_auroc",
+    "pvalue_method_b_auroc",
+    "statistic_type_mismatch",
 )
+
+# Threshold for detecting F-statistics (which are always positive)
+# If all reference statistics are positive and the ratio of max to min
+# exceeds this threshold, we consider it likely to be F-statistics
+_F_STATISTIC_DETECTION_RATIO = 100.0
 
 _DEFAULT_TOP_K = 50
 _LABEL_COLUMN_CANDIDATES: tuple[str, ...] = (
@@ -57,6 +63,49 @@ _POSITIVE_LABEL_VALUES: set[str] = {
 }
 
 
+def _is_likely_f_statistic(series: pd.Series) -> bool:
+    """Detect if a statistic series is likely F-statistics (always non-negative).
+    
+    F-statistics from edgeR's quasi-likelihood F-test are always non-negative,
+    unlike Wald statistics (coef/SE) which can be positive or negative.
+    Direct comparison of these is meaningless for raw correlation.
+    
+    Returns True if the series appears to contain F-statistics.
+    """
+    valid = series.dropna()
+    if len(valid) < 10:
+        return False
+    
+    # F-statistics are always non-negative (can be 0)
+    if (valid < 0).any():
+        return False
+    
+    # Wald statistics are symmetric around 0, F-statistics are right-skewed
+    # Check if all values are non-negative AND there's right skew
+    mean_val = valid.mean()
+    median_val = valid.median()
+    
+    # F-statistics: mean > median (right skew), all non-negative
+    # Wald statistics: mean ≈ median (symmetric around 0)
+    
+    # Key check: Wald statistics will have negative values
+    # F-statistics will not. Since we already checked for negatives above,
+    # we check if the distribution looks like it could have come from 
+    # absolute values of a symmetric distribution
+    
+    # Check the ratio of values above vs below the mean
+    # For symmetric Wald: roughly 50% above mean
+    # For F-stat: more concentrated toward lower values
+    above_mean_ratio = (valid > mean_val).mean()
+    
+    # F-statistics are chi-squared-like: many small values, few large ones
+    # So above_mean_ratio should be < 0.5 (typically 0.3-0.4)
+    if above_mean_ratio < 0.45:
+        return True
+    
+    return False
+
+
 def _safe_corr(series_a: pd.Series, series_b: pd.Series, method: str) -> Optional[float]:
     valid = series_a.notna() & series_b.notna()
     if valid.sum() < 2:
@@ -69,14 +118,14 @@ def _safe_corr(series_a: pd.Series, series_b: pd.Series, method: str) -> Optiona
 
 
 def _top_k_overlap(
-    stream: pd.Series,
-    reference: pd.Series,
+    method_a: pd.Series,
+    method_b: pd.Series,
     *,
     top_k: int,
     use_absolute: bool,
     ascending: bool,
 ) -> Optional[float]:
-    frame = pd.DataFrame({"stream": stream, "reference": reference}).dropna()
+    frame = pd.DataFrame({"method_a": method_a, "method_b": method_b}).dropna()
     if frame.empty:
         return None
     k = min(int(top_k), len(frame))
@@ -84,16 +133,16 @@ def _top_k_overlap(
         return None
 
     if use_absolute:
-        stream_rank = frame["stream"].abs().sort_values(ascending=False).index[:k]
-        ref_rank = frame["reference"].abs().sort_values(ascending=False).index[:k]
+        method_a_rank = frame["method_a"].abs().sort_values(ascending=False).index[:k]
+        method_b_rank = frame["method_b"].abs().sort_values(ascending=False).index[:k]
     else:
-        stream_rank = frame["stream"].sort_values(ascending=ascending).index[:k]
-        ref_rank = frame["reference"].sort_values(ascending=ascending).index[:k]
+        method_a_rank = frame["method_a"].sort_values(ascending=ascending).index[:k]
+        method_b_rank = frame["method_b"].sort_values(ascending=ascending).index[:k]
 
-    if not stream_rank.size or not ref_rank.size:
+    if not method_a_rank.size or not method_b_rank.size:
         return None
 
-    overlap = len(set(stream_rank) & set(ref_rank))
+    overlap = len(set(method_a_rank) & set(method_b_rank))
     return float(overlap) / float(k)
 
 
@@ -162,8 +211,8 @@ def _compute_binary_roc_auc(labels: np.ndarray, scores: np.ndarray) -> Optional[
 
 
 def compute_de_comparison_metrics(
-    streaming: pd.DataFrame,
-    reference: pd.DataFrame,
+    method_a: pd.DataFrame,
+    method_b: pd.DataFrame,
     *,
     top_k: int = _DEFAULT_TOP_K,
 ) -> Dict[str, Optional[float]]:
@@ -173,14 +222,14 @@ def compute_de_comparison_metrics(
     differential expression result DataFrames. Both inputs must contain columns:
     'perturbation', 'gene', 'effect_size', 'statistic', and 'pvalue'.
     
-    Label-based metrics (pvalue_stream_auroc, pvalue_reference_auroc) require
+    Label-based metrics (pvalue_method_a_auroc, pvalue_method_b_auroc) require
     ground truth labels in a column such as 'is_hit', 'label', or 'ground_truth'.
     These AUROC metrics are typically only available in benchmark/validation
     scenarios where true positive perturbations are known.
     
     Args:
-        streaming: DataFrame with streaming/test DE results
-        reference: DataFrame with reference/baseline DE results
+        method_a: DataFrame with first method's DE results
+        method_b: DataFrame with second method's DE results
         top_k: Number of top hits to consider for overlap metrics (default: 50)
     
     Returns:
@@ -193,13 +242,13 @@ def compute_de_comparison_metrics(
 
     metrics: Dict[str, Optional[float]] = {key: None for key in DE_METRIC_KEYS}
 
-    if streaming is None or reference is None or streaming.empty or reference.empty:
+    if method_a is None or method_b is None or method_a.empty or method_b.empty:
         return metrics
 
-    merged = streaming.merge(
-        reference,
+    merged = method_a.merge(
+        method_b,
         on=["perturbation", "gene"],
-        suffixes=("_stream", "_reference"),
+        suffixes=("_method_a", "_method_b"),
         how="inner",
     )
     if merged.empty:
@@ -211,43 +260,65 @@ def compute_de_comparison_metrics(
 
     column_settings = {
         "effect": {
-            "stream": "effect_size_stream",
-            "reference": "effect_size_reference",
+            "method_a": "effect_size_method_a",
+            "method_b": "effect_size_method_b",
             "use_absolute": True,
             "ascending": False,
         },
         "statistic": {
-            "stream": "statistic_stream",
-            "reference": "statistic_reference",
+            "method_a": "statistic_method_a",
+            "method_b": "statistic_method_b",
             "use_absolute": True,
             "ascending": False,
         },
         "pvalue": {
-            "stream": "pvalue_stream",
-            "reference": "pvalue_reference",
+            "method_a": "pvalue_method_a",
+            "method_b": "pvalue_method_b",
             "use_absolute": False,
             "ascending": True,
         },
     }
 
+    # Detect if we're comparing Wald statistics (signed) vs F-statistics (unsigned)
+    statistic_type_mismatch = False
+    if "statistic_method_a" in merged.columns and "statistic_method_b" in merged.columns:
+        method_a_stat = pd.to_numeric(merged["statistic_method_a"], errors="coerce")
+        method_b_stat = pd.to_numeric(merged["statistic_method_b"], errors="coerce")
+        method_a_is_f = _is_likely_f_statistic(method_a_stat)
+        method_b_is_f = _is_likely_f_statistic(method_b_stat)
+        if method_a_is_f != method_b_is_f:
+            statistic_type_mismatch = True
+            metrics["statistic_type_mismatch"] = 1.0
+
     for name, settings in column_settings.items():
-        stream_col = settings["stream"]
-        ref_col = settings["reference"]
-        if stream_col not in merged.columns or ref_col not in merged.columns:
+        method_a_col = settings["method_a"]
+        method_b_col = settings["method_b"]
+        if method_a_col not in merged.columns or method_b_col not in merged.columns:
             continue
-        stream_series = pd.to_numeric(merged[stream_col], errors="coerce")
-        ref_series = pd.to_numeric(merged[ref_col], errors="coerce")
-        valid = stream_series.notna() & ref_series.notna()
+        method_a_series = pd.to_numeric(merged[method_a_col], errors="coerce")
+        method_b_series = pd.to_numeric(merged[method_b_col], errors="coerce")
+        valid = method_a_series.notna() & method_b_series.notna()
         if valid.sum() == 0:
             continue
-        diff = (stream_series[valid] - ref_series[valid]).abs()
+        diff = (method_a_series[valid] - method_b_series[valid]).abs()
         if not diff.empty:
             metrics[f"{name}_max_abs_diff"] = float(diff.max())
-        metrics[f"{name}_pearson_corr"] = _safe_corr(stream_series, ref_series, "pearson")
-        metrics[f"{name}_spearman_corr"] = _safe_corr(stream_series, ref_series, "spearman")
+        
+        # For statistics, if there's a type mismatch (Wald vs F), skip raw correlation
+        # but still compute overlap using absolute values
+        if name == "statistic" and statistic_type_mismatch:
+            # Use absolute values for correlation when comparing Wald vs F
+            method_a_abs = method_a_series.abs()
+            method_b_abs = method_b_series.abs()
+            metrics[f"{name}_pearson_corr"] = _safe_corr(method_a_abs, method_b_abs, "pearson")
+            metrics[f"{name}_spearman_corr"] = _safe_corr(method_a_abs, method_b_abs, "spearman")
+        else:
+            metrics[f"{name}_pearson_corr"] = _safe_corr(method_a_series, method_b_series, "pearson")
+            metrics[f"{name}_spearman_corr"] = _safe_corr(method_a_series, method_b_series, "spearman")
+        
         metrics[f"{name}_top_k_overlap"] = _top_k_overlap(
-            stream_series,
-            ref_series,
+            method_a_series,
+            method_b_series,
             top_k=top_k,
             use_absolute=settings["use_absolute"],
             ascending=settings["ascending"],
@@ -256,28 +327,28 @@ def compute_de_comparison_metrics(
     label_series = _find_label_series(merged)
     if label_series is not None:
         label_series = label_series.astype(float)
-        if "pvalue_stream" in merged.columns:
-            stream_scores = _prepare_auc_scores(merged["pvalue_stream"])
-            if stream_scores is not None:
+        if "pvalue_method_a" in merged.columns:
+            method_a_scores = _prepare_auc_scores(merged["pvalue_method_a"])
+            if method_a_scores is not None:
                 labels = label_series.dropna()
-                valid_idx = labels.index.intersection(stream_scores.index)
+                valid_idx = labels.index.intersection(method_a_scores.index)
                 if len(valid_idx) >= 2:
                     y_true = labels.loc[valid_idx].astype(int).to_numpy()
                     if np.unique(y_true).size == 2:
-                        y_score = stream_scores.loc[valid_idx].to_numpy()
-                        metrics["pvalue_stream_auroc"] = _compute_binary_roc_auc(
+                        y_score = method_a_scores.loc[valid_idx].to_numpy()
+                        metrics["pvalue_method_a_auroc"] = _compute_binary_roc_auc(
                             y_true, y_score
                         )
-        if "pvalue_reference" in merged.columns:
-            reference_scores = _prepare_auc_scores(merged["pvalue_reference"])
-            if reference_scores is not None:
+        if "pvalue_method_b" in merged.columns:
+            method_b_scores = _prepare_auc_scores(merged["pvalue_method_b"])
+            if method_b_scores is not None:
                 labels = label_series.dropna()
-                valid_idx = labels.index.intersection(reference_scores.index)
+                valid_idx = labels.index.intersection(method_b_scores.index)
                 if len(valid_idx) >= 2:
                     y_true = labels.loc[valid_idx].astype(int).to_numpy()
                     if np.unique(y_true).size == 2:
-                        y_score = reference_scores.loc[valid_idx].to_numpy()
-                        metrics["pvalue_reference_auroc"] = _compute_binary_roc_auc(
+                        y_score = method_b_scores.loc[valid_idx].to_numpy()
+                        metrics["pvalue_method_b_auroc"] = _compute_binary_roc_auc(
                             y_true, y_score
                         )
 

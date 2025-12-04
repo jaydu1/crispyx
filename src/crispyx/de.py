@@ -6,10 +6,10 @@ import logging
 import os
 import resource
 import tempfile
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Iterable, Literal, Mapping
+from typing import Dict, Iterable, Literal, Mapping, Tuple
 
 from numpy.typing import ArrayLike
 
@@ -30,7 +30,10 @@ from .data import (
 )
 from .glm import (
     NBGLMFitter,
+    NBGLMBatchFitter,
     build_design_matrix,
+    estimate_covariate_effects_streaming,
+    estimate_global_dispersion_streaming,
     fit_dispersion_trend,
     shrink_dispersions,
     shrink_log_foldchange,
@@ -656,10 +659,14 @@ def nb_glm_test(
     covariates: Iterable[str] | None = None,
     gene_name_column: str | None = None,
     perturbations: Iterable[str] | None = None,
+    fit_method: Literal["independent", "joint"] = "independent",
+    share_dispersion: bool = False,
     dispersion: float | None = None,
-    max_iter: int = 50,
+    dispersion_method: Literal["moments", "cox-reid"] = "cox-reid",
+    optimization_method: Literal["irls", "lbfgsb"] = "lbfgsb",
+    max_iter: int = 25,
     tol: float = 1e-6,
-    poisson_init_iter: int = 15,
+    poisson_init_iter: int = 5,
     min_cells_expressed: int = 0,
     min_total_count: float = 1.0,
     chunk_size: int = 256,
@@ -667,7 +674,8 @@ def nb_glm_test(
     size_factors: ArrayLike | None = None,
     cook_filter: bool = False,
     shrink_dispersion: bool = True,
-    shrink_logfc: bool = True,
+    shrink_logfc: bool = False,
+    lfc_shrinkage_type: Literal["normal", "apeglm", "none"] = "none",
     corr_method: Literal["benjamini-hochberg", "bonferroni"] = "benjamini-hochberg",
     output_dir: str | Path | None = None,
     data_name: str | None = None,
@@ -699,8 +707,36 @@ def nb_glm_test(
         Column in `adata.var` with gene symbols. If None, uses `adata.var_names`.
     perturbations
         Specific perturbations to test. If None, tests all non-control groups.
+    fit_method
+        Method for fitting the GLM model:
+        - "independent": Estimate intercept, covariates, and dispersion independently 
+          for each perturbation comparison (control vs one perturbation). This is 
+          faster but may produce less stable estimates.
+        - "joint": First estimate a global intercept and covariate effects using all
+          cells across all conditions (one extra pass through the data), then fit
+          per-perturbation effects with fixed intercept/covariate offsets. This 
+          provides more stable baseline estimates, especially when there are many
+          perturbations or few cells per condition.
+    share_dispersion
+        If True and fit_method="joint", estimate dispersion once using all cells
+        (similar to PyDESeq2's approach), then use the same dispersion values for
+        all per-perturbation Wald tests. This provides more stable dispersion 
+        estimates but assumes dispersion doesn't vary across conditions. If False
+        (default), dispersion is estimated separately for each perturbation 
+        comparison.
     dispersion
         Fixed dispersion parameter for negative binomial. If None, estimates per gene.
+    dispersion_method
+        Method for estimating dispersion when ``dispersion`` is None:
+        - "moments": Method-of-moments (fast but less accurate)
+        - "cox-reid": Cox-Reid adjusted profile likelihood (slower but more
+          accurate, similar to DESeq2). This is the default.
+    optimization_method
+        Method for coefficient optimization:
+        - "lbfgsb": L-BFGS-B optimization (PyDESeq2 style, default). Directly
+          optimizes the negative binomial log-likelihood.
+        - "irls": Iteratively Reweighted Least Squares (Fisher scoring). The
+          classic GLM fitting approach.
     max_iter
         Maximum iterations for GLM fitting.
     tol
@@ -727,7 +763,13 @@ def nb_glm_test(
         If True, fit a mean-dispersion trend and shrink gene-wise dispersions
         toward the trend using an empirical Bayes prior.
     shrink_logfc
-        If True, apply empirical Bayes shrinkage to log-fold changes.
+        Deprecated. Use `lfc_shrinkage_type` instead.
+        If True and lfc_shrinkage_type is "none", sets lfc_shrinkage_type to "normal".
+    lfc_shrinkage_type
+        Type of log-fold change shrinkage to apply:
+        - "none": No shrinkage (PyDESeq2 default, recommended for most cases)
+        - "normal": Normal-normal empirical Bayes shrinkage
+        - "apeglm": Adaptive shrinkage that preserves strong signals
     corr_method
         Method for p-value correction: "benjamini-hochberg" or "bonferroni".
     output_dir
@@ -746,6 +788,9 @@ def nb_glm_test(
         via dict-like interface: `result[label].effect_size`, `result[label].pvalue`, etc.
         The h5ad file path is available at `result.result_path`.
     """
+    # Handle deprecated shrink_logfc parameter
+    if shrink_logfc and lfc_shrinkage_type == "none":
+        lfc_shrinkage_type = "normal"
 
     covariates = list(covariates or [])
 
@@ -778,6 +823,59 @@ def nb_glm_test(
         size_factors = _validate_size_factors(size_factors, n_cells_total)
 
     offset = np.log(np.clip(size_factors, 1e-8, None))
+
+    # Stage 1: Joint estimation (if fit_method="joint")
+    # This estimates global intercept and covariate effects using all cells,
+    # providing more stable baseline estimates across perturbations.
+    beta_cov = None  # Will be (n_covariates, n_genes) if joint fitting
+    beta_intercept = None  # Will be (n_genes,) if joint fitting
+    global_dispersion = None  # Will be (n_genes,) if share_dispersion=True
+    
+    if fit_method == "joint":
+        logger.info("Stage 1: Estimating global intercept and covariate effects using all cells...")
+        backed = read_backed(path)
+        try:
+            result = estimate_covariate_effects_streaming(
+                backed,
+                obs_df=obs_df,
+                perturbation_labels=labels,
+                control_label=control_label,
+                covariate_columns=covariates,
+                size_factors=size_factors,
+                chunk_size=chunk_size,
+                poisson_iter=poisson_init_iter,
+                tol=tol,
+                return_intercept=True,
+            )
+            beta_cov, beta_intercept = result
+        finally:
+            backed.file.close()
+        
+        n_cov = beta_cov.shape[0] if beta_cov is not None else 0
+        logger.info(f"  Estimated global intercept and {n_cov} covariate effects for {n_genes} genes")
+        
+        # Optionally estimate global dispersion using all cells
+        if share_dispersion and dispersion is None:
+            logger.info("  Estimating global dispersion using all cells...")
+            backed = read_backed(path)
+            try:
+                global_dispersion = estimate_global_dispersion_streaming(
+                    backed,
+                    obs_df=obs_df,
+                    perturbation_labels=labels,
+                    control_label=control_label,
+                    covariate_columns=covariates,
+                    size_factors=size_factors,
+                    beta_intercept=beta_intercept,
+                    beta_cov=beta_cov,
+                    chunk_size=chunk_size,
+                    dispersion_method=dispersion_method,
+                    poisson_iter=poisson_init_iter,
+                    tol=tol,
+                )
+            finally:
+                backed.file.close()
+            logger.info(f"  Estimated global dispersion for {n_genes} genes")
 
     n_groups = len(candidates)
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -815,116 +913,223 @@ def nb_glm_test(
         iter_memmap = _create_memmap("iterations", np.int32, fill=0)
         convergence_memmap = _create_memmap("converged", np.bool_, fill=False)
 
-        # Note: n_jobs parameter accepted but not yet implemented for nb_glm_test
-        # due to file handle management complexity with per-perturbation chunking
-        # TODO: Implement parallelization using process-based approach with separate file handles
+        # Load control cells matrix once (all genes) - this is small enough to fit in memory
+        # since control is typically a subset of all cells
+        backed = read_backed(path)
+        try:
+            control_matrix = backed.X[control_mask, :]
+            if sp.issparse(control_matrix):
+                control_matrix = sp.csr_matrix(control_matrix, dtype=np.float64)
+            else:
+                control_matrix = np.asarray(control_matrix, dtype=np.float64)
+        finally:
+            backed.file.close()
+        
+        # Pre-compute control expression counts
+        if sp.issparse(control_matrix):
+            control_expr_counts = np.asarray(control_matrix.getnnz(axis=0)).ravel()
+        else:
+            control_expr_counts = np.sum(control_matrix > 0, axis=0)
+        
+        # Compute pts_rest once (same for all perturbations)
+        pts_rest_shared = np.divide(
+            control_expr_counts,
+            control_n,
+            out=np.zeros(n_genes, dtype=np.float32),
+            where=control_n > 0,
+        )
+
+        # Process each perturbation group - load full matrix per perturbation for vectorized fitting
         for group_idx, label in enumerate(candidates):
             group_mask = labels == label
             subset_mask = control_mask | group_mask
             subset_obs = obs_df.iloc[subset_mask]
             indicator = group_mask[subset_mask].astype(np.float64)
             subset_size_factors = np.asarray(size_factors)[subset_mask]
-            design, design_columns = build_design_matrix(
-                subset_obs,
-                covariate_columns=covariates,
-                perturbation_indicator=indicator,
-                intercept=True,
-            )
+            
+            # Build design matrix based on fit_method
+            if fit_method == "joint":
+                # Stage 2: Use simple design (perturbation only, no intercept)
+                # Intercept and covariates are handled via pre-computed offsets
+                design, design_columns = build_design_matrix(
+                    subset_obs,
+                    covariate_columns=[],  # No covariates in design
+                    perturbation_indicator=indicator,
+                    intercept=False,  # Intercept handled via offset
+                )
+            else:
+                # Independent fitting: include intercept and covariates in design
+                design, design_columns = build_design_matrix(
+                    subset_obs,
+                    covariate_columns=covariates,
+                    perturbation_indicator=indicator,
+                    intercept=True,
+                )
             perturbation_column_index = design_columns.index("perturbation")
-            fitter = NBGLMFitter(
-                design,
-                offset=offset[subset_mask],
-                dispersion=dispersion,
-                max_iter=max_iter,
-                tol=tol,
-                poisson_init_iter=poisson_init_iter,
-                min_total_count=min_total_count,
-                compute_cooks=cook_filter,
-            )
+            
             control_subset_mask = control_mask[subset_mask]
             group_subset_mask = group_mask[subset_mask]
             group_n = int(group_subset_mask.sum())
             subset_n = int(subset_mask.sum())
+            n_control = int(control_subset_mask.sum())
 
+            # Load perturbation group cells (all genes)
             backed = read_backed(path)
             try:
-                for slc, block in iter_matrix_chunks(
-                    backed, axis=1, chunk_size=chunk_size, convert_to_dense=False
-                ):
-                    csr_block = sp.csr_matrix(block, dtype=np.float64)
-                    subset_block = csr_block[subset_mask, :]
-                    normalized_block = subset_block.multiply(
-                        1.0 / subset_size_factors[:, None]
-                    )
-                    mean_expr = np.asarray(normalized_block.sum(axis=0)).ravel()
-                    if subset_n:
-                        mean_expr = mean_expr / subset_n
-                    control_block = subset_block[control_subset_mask, :]
-                    group_block = subset_block[group_subset_mask, :]
-                    control_expr = np.asarray(control_block.getnnz(axis=0)).ravel()
-                    group_expr = np.asarray(group_block.getnnz(axis=0)).ravel()
-                    total_expr = control_expr + group_expr
-                    valid_mask = total_expr >= min_cells_expressed
-                    chunk_indices = np.arange(slc.start, slc.stop)
-                    pts = np.divide(
-                        group_expr,
-                        group_n,
-                        out=np.zeros_like(group_expr, dtype=float),
-                        where=group_n > 0,
-                    )
-                    pts_rest = np.divide(
-                        control_expr,
-                        control_n,
-                        out=np.zeros_like(control_expr, dtype=float),
-                        where=control_n > 0,
-                    )
-                    pts_memmap[group_idx, chunk_indices] = np.where(
-                        valid_mask, pts, 0.0
-                    )
-                    pts_rest_memmap[group_idx, chunk_indices] = np.where(
-                        valid_mask, pts_rest, 0.0
-                    )
-                    mean_memmap[group_idx, chunk_indices] = mean_expr
-
-                    if not np.any(valid_mask):
-                        continue
-
-                    fit_block = subset_block[:, valid_mask]
-                    gene_results = fitter.fit_matrix(
-                        fit_block, batch_size=irls_batch_size
-                    )
-                    valid_indices = np.nonzero(valid_mask)[0]
-
-                    for local_idx, result in zip(valid_indices, gene_results):
-                        gene_idx = chunk_indices[local_idx]
-                        convergence_memmap[group_idx, gene_idx] = bool(
-                            result.converged
-                        )
-                        iter_memmap[group_idx, gene_idx] = int(result.n_iter)
-                        dispersion_raw_memmap[group_idx, gene_idx] = result.dispersion
-                        coef = float(result.coef[perturbation_column_index])
-                        se = float(result.se[perturbation_column_index])
-                        if (
-                            not result.converged
-                            or not np.isfinite(coef)
-                            or not np.isfinite(se)
-                            or se <= 0
-                        ):
-                            continue
-                        if cook_filter and result.max_cooks is not None:
-                            cook_cutoff = 4.0 / max(subset_n - design.shape[1], 1)
-                            if result.max_cooks > cook_cutoff:
-                                continue
-                        statistic = coef / se
-                        pvalue = float(2.0 * norm.sf(abs(statistic)))
-                        statistic_memmap[group_idx, gene_idx] = statistic
-                        pvalue_memmap[group_idx, gene_idx] = pvalue
-                        logfc_memmap[group_idx, gene_idx] = coef
-                        se_memmap[group_idx, gene_idx] = se
+                group_matrix = backed.X[group_mask, :]
+                if sp.issparse(group_matrix):
+                    group_matrix = sp.csr_matrix(group_matrix, dtype=np.float64)
+                else:
+                    group_matrix = np.asarray(group_matrix, dtype=np.float64)
             finally:
                 backed.file.close()
 
-            if shrink_dispersion:
+            # Combine control and group matrices, preserving original order
+            # The subset_mask ordering is based on original indices, so we need to interleave
+            if sp.issparse(control_matrix) and sp.issparse(group_matrix):
+                stacked = sp.vstack([control_matrix, group_matrix])
+                # Build reorder index: control cells come first in stacked, then group cells
+                reorder = np.empty(subset_n, dtype=np.int32)
+                reorder[np.where(control_subset_mask)[0]] = np.arange(n_control)
+                reorder[np.where(group_subset_mask)[0]] = np.arange(n_control, n_control + group_n)
+                subset_matrix = sp.csr_matrix(stacked[reorder, :])
+            else:
+                # Dense case
+                if sp.issparse(control_matrix):
+                    ctrl = control_matrix.toarray()
+                else:
+                    ctrl = control_matrix
+                if sp.issparse(group_matrix):
+                    grp = group_matrix.toarray()
+                else:
+                    grp = group_matrix
+                stacked = np.vstack([ctrl, grp])
+                reorder = np.empty(subset_n, dtype=np.int32)
+                reorder[np.where(control_subset_mask)[0]] = np.arange(n_control)
+                reorder[np.where(group_subset_mask)[0]] = np.arange(n_control, n_control + group_n)
+                subset_matrix = stacked[reorder, :]
+
+            # Compute expression counts for group cells
+            if sp.issparse(group_matrix):
+                group_expr_counts = np.asarray(group_matrix.getnnz(axis=0)).ravel()
+            else:
+                group_expr_counts = np.sum(group_matrix > 0, axis=0)
+            
+            total_expr_counts = control_expr_counts + group_expr_counts
+            valid_mask = total_expr_counts >= min_cells_expressed
+            valid_indices = np.where(valid_mask)[0]
+
+            # Compute pts for this group
+            pts = np.divide(
+                group_expr_counts,
+                group_n,
+                out=np.zeros(n_genes, dtype=np.float32),
+                where=group_n > 0,
+            )
+            pts_memmap[group_idx, :] = np.where(valid_mask, pts, 0.0)
+            pts_rest_memmap[group_idx, :] = np.where(valid_mask, pts_rest_shared, 0.0)
+
+            # Compute mean expression
+            if sp.issparse(subset_matrix):
+                normalized = subset_matrix.multiply(1.0 / subset_size_factors[:, None])
+                mean_expr = np.asarray(normalized.sum(axis=0)).ravel() / subset_n
+            else:
+                normalized = subset_matrix / subset_size_factors[:, None]
+                mean_expr = normalized.sum(axis=0) / subset_n
+            mean_memmap[group_idx, :] = mean_expr
+
+            if not np.any(valid_mask):
+                continue
+
+            # Fit all valid genes at once using NBGLMBatchFitter
+            fit_matrix = subset_matrix[:, valid_mask]
+            
+            batch_fitter = NBGLMBatchFitter(
+                design,
+                offset=offset[subset_mask],
+                max_iter=max_iter,
+                tol=tol,
+                poisson_init_iter=poisson_init_iter,
+                dispersion_method=dispersion_method,
+                min_mu=0.5,
+                min_total_count=min_total_count,
+            )
+            
+            # Choose fitting method based on fit_method parameter
+            if fit_method == "joint":
+                # Stage 2: Fit with pre-computed intercept and covariate offsets
+                # Build covariate offset if covariates exist
+                cov_offset = None
+                if beta_cov is not None and beta_cov.shape[0] > 0:
+                    cov_matrices = []
+                    for column in covariates:
+                        series = subset_obs[column]
+                        if series.dtype.kind in {"O", "U"} or str(series.dtype).startswith("category"):
+                            dummies = pd.get_dummies(series, prefix=column, drop_first=True, dtype=float)
+                            if dummies.shape[1] > 0:
+                                cov_matrices.append(dummies.to_numpy(dtype=np.float64))
+                        else:
+                            cov_matrices.append(series.to_numpy(dtype=np.float64).reshape(-1, 1))
+                    
+                    if cov_matrices:
+                        X_cov = np.hstack(cov_matrices)  # (subset_n, n_covariates)
+                        # Compute covariate offset for valid genes only
+                        cov_offset = X_cov @ beta_cov[:, valid_mask]  # (subset_n, n_valid_genes)
+                
+                # Prepare intercept offset for valid genes
+                intercept_offset = beta_intercept[valid_mask] if beta_intercept is not None else None
+                
+                # Prepare fixed dispersion for valid genes if using shared dispersion
+                fixed_disp = global_dispersion[valid_mask] if global_dispersion is not None else None
+                
+                batch_result = batch_fitter.fit_batch_with_joint_offsets(
+                    fit_matrix,
+                    intercept_offset=intercept_offset,
+                    covariate_offset=cov_offset,
+                    fixed_dispersion=fixed_disp,
+                )
+            else:
+                # Independent fitting: use standard fit_batch
+                batch_result = batch_fitter.fit_batch(fit_matrix)
+
+            # Extract results for all valid genes at once
+            convergence_memmap[group_idx, valid_indices] = batch_result.converged
+            iter_memmap[group_idx, valid_indices] = batch_result.n_iter
+            dispersion_raw_memmap[group_idx, valid_indices] = batch_result.dispersion
+
+            # Get coefficients and SEs for perturbation effect
+            coefs = batch_result.coef[:, perturbation_column_index]  # (n_valid_genes,)
+            ses = batch_result.se[:, perturbation_column_index]  # (n_valid_genes,)
+
+            # Compute Wald statistics and p-values for valid genes
+            valid_results = (
+                batch_result.converged
+                & np.isfinite(coefs)
+                & np.isfinite(ses)
+                & (ses > 0)
+            )
+            
+            # Apply results to memmaps
+            for local_idx, gene_idx in enumerate(valid_indices):
+                if not valid_results[local_idx]:
+                    continue
+                coef = coefs[local_idx]
+                se = ses[local_idx]
+                statistic = coef / se
+                pvalue = float(2.0 * norm.sf(abs(statistic)))
+                statistic_memmap[group_idx, gene_idx] = statistic
+                pvalue_memmap[group_idx, gene_idx] = pvalue
+                logfc_memmap[group_idx, gene_idx] = coef
+                se_memmap[group_idx, gene_idx] = se
+
+            # Handle dispersion: use global shared dispersion or fit per-perturbation trend
+            if global_dispersion is not None:
+                # Using shared global dispersion - copy to all slots for consistency
+                dispersion_raw_memmap[group_idx, :] = global_dispersion
+                dispersion_memmap[group_idx, :] = global_dispersion
+                # For trend, use the global dispersion as both raw and trend
+                dispersion_trend_memmap[group_idx, :] = global_dispersion
+            elif shrink_dispersion:
                 trend = fit_dispersion_trend(
                     mean_memmap[group_idx], dispersion_raw_memmap[group_idx]
                 )
@@ -937,13 +1142,14 @@ def nb_glm_test(
                 dispersion_memmap[group_idx] = dispersion_raw_memmap[group_idx]
 
             logfc_raw_memmap[group_idx] = logfc_memmap[group_idx]
-            if shrink_logfc:
+            if lfc_shrinkage_type != "none":
                 prior_var = None
                 finite_se = se_memmap[group_idx][np.isfinite(se_memmap[group_idx])]
                 if finite_se.size:
                     prior_var = float(np.nanmedian(finite_se ** 2))
                 shrunk_lfc = shrink_log_foldchange(
-                    logfc_memmap[group_idx], se_memmap[group_idx], prior_var
+                    logfc_memmap[group_idx], se_memmap[group_idx], 
+                    prior_var=prior_var, shrinkage_type=lfc_shrinkage_type
                 )
                 logfc_memmap[group_idx] = shrunk_lfc
                 effect_memmap[group_idx] = shrunk_lfc

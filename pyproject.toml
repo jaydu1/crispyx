@@ -10,6 +10,7 @@ authors = [{name = "Streamlining CRISPR Team"}]
 dependencies = [
     "anndata>=0.9",
     "numpy>=1.23",
+    "numba>=0.59",
     "pandas>=1.5",
     "scipy>=1.10,<=1.12.0",
     "scanpy>=1.9.2",
@@ -20,6 +21,7 @@ dependencies = [
 test = [
     "anndata>=0.9",
     "numpy>=1.23",
+    "numba>=0.59",
     "pandas>=1.5",
     "scipy>=1.10,<=1.12.0",
     "scanpy>=1.9.2",
@@ -37,3 +39,15 @@ benchmark = [
 
 [tool.pytest.ini_options]
 addopts = "-q"
+filterwarnings = [
+    # Ignore h5py deprecation warnings about numpy.product (third-party issue)
+    "ignore:`product` is deprecated as of NumPy 1.25.0:DeprecationWarning",
+    # Ignore pydeseq2 FutureWarnings about dtype incompatibility (third-party issue)
+    "ignore:Setting an item of incompatible dtype is deprecated:FutureWarning",
+    # Ignore UserWarnings from third-party libraries during tests
+    "ignore:Some cells have zero counts:UserWarning",
+    "ignore:Every gene contains at least one zero:UserWarning",
+    "ignore:The dispersion trend curve fitting did not converge:UserWarning",
+    # Ignore AnnData implicit modification warnings (third-party issue)
+    "ignore:Transforming to str index:anndata.ImplicitModificationWarning",
+]

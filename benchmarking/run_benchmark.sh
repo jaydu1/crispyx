@@ -98,7 +98,7 @@ for CONFIG_FILE in "${CONFIGS[@]}"; do
     log "Dataset log: $DATASET_LOG"
     
     # Run benchmark
-    if "$PYTHON_ENV" benchmarking/run_benchmarks.py --config "$CONFIG_FILE" > "$DATASET_LOG" 2>&1; then
+    if "$PYTHON_ENV" -m benchmarking.tools.run_benchmarks --config "$CONFIG_FILE" > "$DATASET_LOG" 2>&1; then
         log "✓ Benchmark completed successfully"
         SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
     else

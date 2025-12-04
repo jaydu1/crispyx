@@ -1,40 +1,136 @@
 # Benchmark Results
 
-## Performance
+## 1. Performance
 
-| method | status | elapsed_seconds | spawn_overhead_seconds | import_seconds | load_seconds | process_seconds | de_seconds | convert_seconds | save_seconds | peak_memory_mb | avg_memory_mb | cells_kept | genes_kept | groups |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| crispyx_de_nb_glm | success | 31.763 |  |  |  |  |  |  |  | 291.875 | 247.51 |  |  | 2.0 |
-| crispyx_de_t_test | success | 0.828 |  |  |  |  |  |  |  | 328.156 | 285.664 |  |  | 2.0 |
-| crispyx_de_wilcoxon | success | 3.539 |  |  |  |  |  |  |  | 319.73 | 315.293 |  |  | 2.0 |
-| crispyx_pb_avg_log | success | 1.047 |  |  |  |  |  |  |  | 704.602 | 435.78 |  |  |  |
-| crispyx_pb_pseudobulk | success | 0.842 |  |  |  |  |  |  |  | 552.078 | 334.284 |  |  |  |
-| crispyx_qc_filtered | success | 1.242 |  |  |  |  |  |  |  | 426.039 | 309.118 | 1716.0 | 10500.0 |  |
-| edger_de_glm | success | 100.458 |  | 0.562 | 0.079 | 98.958 |  |  | 0.118 | 2607.199 | 1815.683 |  |  | 2.0 |
-| pertpy_de_pydeseq2 | success | 23.638 | 1.6 | 1.669 | 0.055 | 19.949 | 19.948 | 0.001 | 0.124 | 2553.434 | 1436.582 |  |  | 2.0 |
-| scanpy_de_t_test | success | 2.406 | 1.484 | 0.454 | 0.054 | 0.267 |  |  | 0.075 | 375.348 | 232.978 |  |  | 2.0 |
-| scanpy_de_wilcoxon | success | 3.007 | 1.479 | 0.451 | 0.053 | 0.86 |  |  | 0.075 | 412.102 | 223.129 |  |  | 2.0 |
-| scanpy_qc_filtered | success | 2.306 | 1.521 | 0.455 | 0.054 | 0.141 |  |  | 0.061 | 475.84 | 224.487 | 1716.0 | 10500.0 |  |
+### Preprocessing / QC
+
+| Method | Status | Time (s) | Memory (MB) | Cells | Genes |
+| --- | --- | --- | --- | --- | --- |
+| QC Filter | success | 1.25 | 407.53 | 1716.0 | 10500.0 |
+| Scanpy QC Filter | success | 2.51 | 507.81 | 1716.0 | 10500.0 |
+| Pseudobulk (Avg) log | success | 1.05 | 709.41 |  |  |
+| Pseudobulk | success | 0.84 | 555.01 |  |  |
 
 
-## Performance Comparison
+### DE: t-test
 
-| comparison | crispyx_time_s | other_time_s | time_diff_s | time_pct | crispyx_mem_mb | other_mem_mb | mem_diff_mb | mem_pct |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| crispyx_qc_filtered vs scanpy_qc_filtered | 1.242 | 2.306 | -1.064 | 53.873 | 426.039 | 475.84 | -49.801 | 89.534 |
-| crispyx_de_nb_glm vs edger_de_glm | 31.763 | 100.458 | -68.694 | 31.618 | 291.875 | 2607.199 | -2315.324 | 11.195 |
-| crispyx_de_nb_glm vs pertpy_de_pydeseq2 | 31.763 | 23.638 | 8.125 | 134.371 | 291.875 | 2553.434 | -2261.559 | 11.431 |
-| crispyx_de_t_test vs scanpy_de_t_test | 0.828 | 2.406 | -1.578 | 34.406 | 328.156 | 375.348 | -47.191 | 87.427 |
-| crispyx_de_wilcoxon vs scanpy_de_wilcoxon | 3.539 | 3.007 | 0.533 | 117.713 | 319.73 | 412.102 | -92.371 | 77.585 |
+| Method | Status | Time (s) | Memory (MB) | Groups |
+| --- | --- | --- | --- | --- |
+| Scanpy t-test | success | 2.5 | 384.2 | 2.0 |
+| t-test | success | 0.83 | 322.8 | 2.0 |
 
 
-## Accuracy
+### DE: Wilcoxon
 
-| comparison | cells_diff | genes_diff | effect_max_abs_diff | effect_pearson_corr | effect_spearman_corr | effect_top_k_overlap | statistic_max_abs_diff | statistic_pearson_corr | statistic_spearman_corr | statistic_top_k_overlap | pvalue_max_abs_diff | pvalue_pearson_corr | pvalue_spearman_corr | pvalue_top_k_overlap | pvalue_stream_auroc | pvalue_reference_auroc |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| crispyx_qc_filtered vs scanpy_qc_filtered | 0.0 | 0.0 |  |  |  |  |  |  |  |  |  |  |  |  |  |  |
-| crispyx_de_nb_glm vs edger_de_glm |  |  | 2.652 | 0.949 | 0.957 | 0.5 | 731.197 | -0.226 | -0.317 | 0.56 | 0.993 | 0.84 | 0.892 | 0.68 |  |  |
-| crispyx_de_nb_glm vs pertpy_de_pydeseq2 |  |  | 2.406 | 0.721 | 0.574 | 0.5 | 10.487 | 0.818 | 0.589 | 0.64 | 1.0 | 0.304 | 0.4 | 0.64 |  |  |
-| crispyx_de_t_test vs scanpy_de_t_test |  |  | 0.0 | 1.0 | 1.0 | 1.0 | 0.001 | 1.0 | 1.0 | 1.0 | 0.001 | 1.0 | 1.0 | 0.98 |  |  |
-| crispyx_de_wilcoxon vs scanpy_de_wilcoxon |  |  | 0.0 | 1.0 | 1.0 | 1.0 | 0.0 | 1.0 | 1.0 | 1.0 | 0.0 | 1.0 | 1.0 | 1.0 |  |  |
+| Method | Status | Time (s) | Memory (MB) | Groups |
+| --- | --- | --- | --- | --- |
+| Wilcoxon | success | 3.24 | 302.91 | 2.0 |
+| Scanpy Wilcoxon | success | 3.11 | 373.99 | 2.0 |
 
+
+### DE: NB GLM
+
+| Method | Status | Time (s) | Memory (MB) | Groups |
+| --- | --- | --- | --- | --- |
+| NB-GLM | success | 46.89 | 2345.98 | 2.0 |
+| NB-GLM (Joint) shared disp | success | 20.69 | 2191.49 | 2.0 |
+| NB-GLM (Joint) | success | 34.26 | 2352.69 | 2.0 |
+| edgeR | success | 99.58 | 2601.56 | 2.0 |
+| PyDESeq2 | success | 23.93 | 2930.64 | 2.0 |
+
+
+## 2. Performance Comparison
+
+### CRISPYx vs Reference Tools
+
+_CRISPYx as baseline. Negative values = CRISPYx is faster/uses less memory._
+
+#### Preprocessing / QC
+
+| CRISPYx Method | Compared To | Time Δ | Time % |  | Mem Δ | Mem % |   |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| QC Filter | Scanpy QC Filter | -1.3s | 50.0% | ✅ | -100.3 MB | 80.3% | ✅ |
+
+
+#### DE: NB GLM
+
+| CRISPYx Method | Compared To | Time Δ | Time % |  | Mem Δ | Mem % |   |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| NB-GLM | edgeR | -52.7s | 47.1% | ✅ | -255.6 MB | 90.2% | ⚠️ |
+| NB-GLM | PyDESeq2 | +23.0s | 195.9% | ❌ | -584.7 MB | 80.1% | ✅ |
+| NB-GLM (Joint) | NB-GLM | -12.6s | 73.1% | ✅ | +6.7 MB | 100.3% | ⚠️ |
+| NB-GLM (Joint) | edgeR | -65.3s | 34.4% | ✅ | -248.9 MB | 90.4% | ⚠️ |
+| NB-GLM (Joint) | PyDESeq2 | +10.3s | 143.2% | ❌ | -577.9 MB | 80.3% | ✅ |
+
+
+#### DE: t-test
+
+| CRISPYx Method | Compared To | Time Δ | Time % |  | Mem Δ | Mem % |   |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| t-test | Scanpy t-test | -1.7s | 33.0% | ✅ | -61.4 MB | 84.0% | ✅ |
+
+
+#### DE: Wilcoxon
+
+| CRISPYx Method | Compared To | Time Δ | Time % |  | Mem Δ | Mem % |   |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Wilcoxon | Scanpy Wilcoxon | +0.1s | 104.2% | ⚠️ | -71.1 MB | 81.0% | ✅ |
+
+
+### Tool Comparisons
+
+_Comparisons between external tools._
+
+| Method A | Method B | Time Δ (A-B) | Time % (A/B) |  | Mem Δ (A-B) | Mem % (A/B) |   |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| edgeR | PyDESeq2 | +75.6s | 416.1% | ❌ | -329.1 MB | 88.8% | ✅ |
+
+
+## 3. Accuracy
+
+_Correlation metrics between CRISPYx and reference methods. ✅ >0.95, ⚠️ 0.8-0.95, ❌ <0.8_
+
+### Preprocessing / QC
+
+| CRISPYx Method | Compared To | Cells Δ |  | Genes Δ |   |
+| --- | --- | --- | --- | --- | --- |
+| QC Filter | Scanpy QC Filter | +0 | ✅ | +0 | ✅ |
+
+
+### DE: NB GLM
+
+| CRISPYx Method | Compared To | Effect ρ |  | Stat ρ |   | P-val ρ |    |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| NB-GLM | edgeR | 0.906 | ⚠️ | 0.699 | ❌ | 0.692 | ❌ |
+| NB-GLM | PyDESeq2 | 0.836 | ⚠️ | 0.879 | ⚠️ | 0.572 | ❌ |
+| NB-GLM (Joint) | NB-GLM | 0.452 | ❌ | 0.443 | ❌ | 0.154 | ❌ |
+| NB-GLM (Joint) | edgeR | 0.353 | ❌ | 0.148 | ❌ | 0.198 | ❌ |
+| NB-GLM (Joint) | PyDESeq2 | 0.407 | ❌ | 0.320 | ❌ | -0.090 | ❌ |
+
+
+### DE: t-test
+
+| CRISPYx Method | Compared To | Effect ρ |  | Stat ρ |   | P-val ρ |    |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| t-test | Scanpy t-test | 1.000 | ✅ | 1.000 | ✅ | 1.000 | ✅ |
+
+
+### DE: Wilcoxon
+
+| CRISPYx Method | Compared To | Effect ρ |  | Stat ρ |   | P-val ρ |    |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Wilcoxon | Scanpy Wilcoxon | 1.000 | ✅ | 1.000 | ✅ | 1.000 | ✅ |
+
+
+### Tool Comparisons
+
+| Method A | Method B | Effect ρ |  | Stat ρ |   | P-val ρ |    |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| edgeR | PyDESeq2 | 0.776 | ❌ | 0.679 | ❌ | 0.451 | ❌ |
+
+
+---
+
+**Legend:**
+- Performance: ✅ >10% better | ⚠️ within ±10% | ❌ >10% worse
+- Accuracy: ✅ ρ≥0.95 | ⚠️ 0.8≤ρ<0.95 | ❌ ρ<0.8

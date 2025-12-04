@@ -32,12 +32,12 @@ if str(SRC_PATH) not in sys.path:
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from benchmarking.env_config import (
+from .env_config import (
     EnvironmentConfig,
     configure_r_environment,
     set_thread_env_vars,
 )
-from benchmarking.generate_demo_dataset import write_demo_dataset
+from .generate_demo_dataset import write_demo_dataset
 from crispyx.data import (
     read_backed,
     resolve_control_label,
@@ -45,7 +45,7 @@ from crispyx.data import (
     standardize_dataset,
 )
 from crispyx.de import t_test, wilcoxon_test, nb_glm_test
-from crispyx.comparison import DE_METRIC_KEYS, compute_de_comparison_metrics
+from .comparison import DE_METRIC_KEYS, compute_de_comparison_metrics
 from crispyx.pseudobulk import (
     compute_average_log_expression,
     compute_pseudobulk_expression,
@@ -616,7 +616,7 @@ def run_edger_de(
     # Capture function start time (before imports)
     t_func_start = time.perf_counter()
     
-    from benchmarking.env_config import get_global_env_config
+    from .env_config import get_global_env_config
     
     # Configure R
     env_config = get_global_env_config()
@@ -972,24 +972,24 @@ class BenchmarkConfig:
 
 @dataclass
 class DifferentialComparisonSummary:
-    """Summary statistics for comparing streaming DE results to a reference tool."""
+    """Summary statistics for comparing two DE methods."""
 
     test_type: str
-    reference_tool: str
+    method_b_tool: str
     metrics: Dict[str, Optional[float]]
-    streaming_result_path: str | None
-    reference_result_path: str | None
+    method_a_result_path: str | None
+    method_b_result_path: str | None
     error: Optional[str] = None
-    stream_runtime_seconds: Optional[float] = None
-    reference_runtime_seconds: Optional[float] = None
-    stream_peak_memory_mb: Optional[float] = None
-    stream_avg_memory_mb: Optional[float] = None
-    stream_peak_memory_absolute_mb: Optional[float] = None
-    stream_avg_memory_absolute_mb: Optional[float] = None
-    reference_peak_memory_mb: Optional[float] = None
-    reference_avg_memory_mb: Optional[float] = None
-    reference_peak_memory_absolute_mb: Optional[float] = None
-    reference_avg_memory_absolute_mb: Optional[float] = None
+    method_a_runtime_seconds: Optional[float] = None
+    method_b_runtime_seconds: Optional[float] = None
+    method_a_peak_memory_mb: Optional[float] = None
+    method_a_avg_memory_mb: Optional[float] = None
+    method_a_peak_memory_absolute_mb: Optional[float] = None
+    method_a_avg_memory_absolute_mb: Optional[float] = None
+    method_b_peak_memory_mb: Optional[float] = None
+    method_b_avg_memory_mb: Optional[float] = None
+    method_b_peak_memory_absolute_mb: Optional[float] = None
+    method_b_avg_memory_absolute_mb: Optional[float] = None
 
     @property
     def effect_max_abs_diff(self) -> Optional[float]:
@@ -1043,6 +1043,8 @@ def _get_expected_output_path(method_name: str, output_dir: Path, data_name: str
         return de_dir / "crispyx_de_wilcoxon.h5ad"
     elif method_name == "crispyx_de_nb_glm":
         return de_dir / "crispyx_de_nb_glm.h5ad"
+    elif method_name == "crispyx_de_nb_glm_joint":
+        return de_dir / "crispyx_de_nb_glm_joint.h5ad"
     
     # Scanpy methods with module prefix
     elif method_name == "scanpy_qc_filtered":
@@ -1375,10 +1377,10 @@ def _postprocess_results(df: pd.DataFrame) -> pd.DataFrame:
         "columns",
         "groups",
         "genes",
-        "stream_peak_memory_mb",
-        "stream_avg_memory_mb",
-        "reference_peak_memory_mb",
-        "reference_avg_memory_mb",
+        "method_a_peak_memory_mb",
+        "method_a_avg_memory_mb",
+        "method_b_peak_memory_mb",
+        "method_b_avg_memory_mb",
     ]
     numeric_columns.extend(
         key for key in DE_METRIC_KEYS if key not in numeric_columns
@@ -1415,7 +1417,7 @@ def _postprocess_results(df: pd.DataFrame) -> pd.DataFrame:
         # 4. Comparison metadata
         "comparison_category",
         "test_type",
-        "reference_tool",
+        "method_b_tool",
         # 5. Comparison metrics - Effect size
         "effect_pearson_corr",
         "effect_spearman_corr",
@@ -1431,23 +1433,23 @@ def _postprocess_results(df: pd.DataFrame) -> pd.DataFrame:
         "pvalue_spearman_corr",
         "pvalue_top_k_overlap",
         "pvalue_max_abs_diff",
-        "pvalue_stream_auroc",
-        "pvalue_reference_auroc",
+        "pvalue_method_a_auroc",
+        "pvalue_method_b_auroc",
         # 8. Detailed comparison data
-        "stream_peak_memory_mb",
-        "stream_avg_memory_mb",
-        "reference_peak_memory_mb",
-        "reference_avg_memory_mb",
-        "stream_timing_breakdown",
-        "reference_timing_breakdown",
+        "method_a_peak_memory_mb",
+        "method_a_avg_memory_mb",
+        "method_b_peak_memory_mb",
+        "method_b_avg_memory_mb",
+        "method_a_timing_breakdown",
+        "method_b_timing_breakdown",
         "runtime_diff_seconds",
         "runtime_diff_pct",
         "memory_diff_mb",
         "memory_diff_pct",
         # 9. File paths
         "result_path",
-        "streaming_result_path",
-        "reference_result_path",
+        "method_a_result_path",
+        "method_b_result_path",
         # 10. Errors
         "error",
     ]
@@ -1867,9 +1869,466 @@ def _convert_reference_result_to_dataframe(result: Any) -> Optional[pd.DataFrame
     return None
 
 
+def _get_performance_emoji(pct: Optional[float], is_lower_better: bool = True) -> str:
+    """Return emoji indicator for performance comparison.
+    
+    Parameters
+    ----------
+    pct : float | None
+        Percentage value (method_a / method_b * 100)
+    is_lower_better : bool
+        If True, lower percentage means method_a is better (faster/less memory)
+        
+    Returns
+    -------
+    str
+        ✅ if method_a is significantly better (>10% improvement)
+        ⚠️ if similar (within ±10%)
+        ❌ if method_a is significantly worse (>10% worse)
+    """
+    if pct is None or pd.isna(pct):
+        return ""
+    
+    if is_lower_better:
+        if pct < 90:  # method_a uses <90% of method_b's resources = better
+            return "✅"
+        elif pct > 110:  # method_a uses >110% of method_b's resources = worse
+            return "❌"
+        else:
+            return "⚠️"
+    else:
+        if pct > 110:
+            return "✅"
+        elif pct < 90:
+            return "❌"
+        else:
+            return "⚠️"
+
+
+def _get_accuracy_emoji(corr: Optional[float]) -> str:
+    """Return emoji indicator for accuracy/correlation.
+    
+    Parameters
+    ----------
+    corr : float | None
+        Correlation value (0-1)
+        
+    Returns
+    -------
+    str
+        ✅ if excellent (>0.95)
+        ⚠️ if good (0.8-0.95)
+        ❌ if poor (<0.8)
+    """
+    if corr is None or pd.isna(corr):
+        return ""
+    
+    if corr >= 0.95:
+        return "✅"
+    elif corr >= 0.8:
+        return "⚠️"
+    else:
+        return "❌"
+
+
+def _get_method_category(method_name: str) -> tuple[str, str, int]:
+    """Get category and test type for a method.
+    
+    Returns
+    -------
+    tuple[str, str, int]
+        (category, test_type, sort_order)
+    """
+    if not isinstance(method_name, str):
+        return ("other", "unknown", 99)
+    
+    if "_qc_" in method_name or method_name.endswith("_qc_filtered"):
+        return ("Preprocessing / QC", "qc", 0)
+    elif "_pb_avg" in method_name:
+        return ("Preprocessing / QC", "pseudobulk_avg", 1)
+    elif "_pb_pseudobulk" in method_name:
+        return ("Preprocessing / QC", "pseudobulk", 2)
+    elif "_de_t_test" in method_name:
+        return ("DE: t-test", "t_test", 10)
+    elif "_de_wilcoxon" in method_name:
+        return ("DE: Wilcoxon", "wilcoxon", 20)
+    elif "_de_nb_glm_joint" in method_name:
+        return ("DE: NB GLM", "nb_glm_joint", 31)
+    elif "_de_nb_glm" in method_name:
+        return ("DE: NB GLM", "nb_glm", 30)
+    elif "_de_glm" in method_name:  # edger
+        return ("DE: NB GLM", "edger", 32)
+    elif "_de_pydeseq2" in method_name:
+        return ("DE: NB GLM", "pydeseq2", 33)
+    else:
+        return ("Other", "unknown", 99)
+
+
+def _format_pct(value: Optional[float], decimals: int = 1) -> str:
+    """Format percentage value."""
+    if value is None or pd.isna(value):
+        return "-"
+    return f"{value:.{decimals}f}%"
+
+
+def _format_diff(value: Optional[float], unit: str = "s", decimals: int = 1) -> str:
+    """Format difference value with sign."""
+    if value is None or pd.isna(value):
+        return "-"
+    sign = "+" if value > 0 else ""
+    return f"{sign}{value:.{decimals}f}{unit}"
+
+
+def _format_method_name(method: str) -> str:
+    """Format method name for display with proper capitalization."""
+    # Check for specific tool names first
+    if "edger_" in method.lower():
+        return "edgeR"
+    if "pertpy_" in method.lower() and "pydeseq2" in method.lower():
+        return "PyDESeq2"
+    
+    # Remove common prefixes
+    name = method.replace("crispyx_", "").replace("scanpy_", "").replace("pertpy_", "")
+    
+    # Apply specific formatting
+    name = name.replace("_", " ")
+    
+    # Proper capitalizations
+    replacements = {
+        "de t test": "t-test",
+        "de wilcoxon": "Wilcoxon",
+        "de nb glm joint": "NB-GLM (Joint)",
+        "de nb glm": "NB-GLM",
+        "de glm": "edgeR",
+        "de pydeseq2": "PyDESeq2",
+        "qc filtered": "QC Filter",
+        "pb avg": "Pseudobulk (Avg)",
+        "pb pseudobulk": "Pseudobulk",
+    }
+    
+    for old, new in replacements.items():
+        if old in name:
+            name = name.replace(old, new)
+            break
+    
+    # Add tool prefix if it's a reference tool (only if not already formatted)
+    if "scanpy" in method and not any(x in name for x in ["edgeR", "PyDESeq2"]):
+        name = f"Scanpy {name}"
+    
+    return name
+
+
+def _is_crispyx_method(method: str) -> bool:
+    """Check if method is a CRISPYx method."""
+    return method.startswith("crispyx_")
+
+
+def _generate_improved_markdown(
+    perf_df: pd.DataFrame,
+    perf_comp_results: List[Dict[str, Any]],
+    accuracy_results: List[Dict[str, Any]],
+) -> str:
+    """Generate improved markdown with categorized tables and emoji indicators."""
+    
+    md = "# Benchmark Results\n\n"
+    
+    # =========================================================================
+    # Section 1: Performance by Category
+    # =========================================================================
+    md += "## 1. Performance\n\n"
+    
+    if not perf_df.empty:
+        # Add category info to each method
+        perf_df = perf_df.copy()
+        perf_df["_category"] = perf_df["method"].apply(lambda x: _get_method_category(x)[0])
+        perf_df["_sort_order"] = perf_df["method"].apply(lambda x: _get_method_category(x)[2])
+        perf_df = perf_df.sort_values("_sort_order")
+        
+        # Format method names for display
+        perf_df["Method"] = perf_df["method"].apply(_format_method_name)
+        
+        # Group by category
+        categories = perf_df["_category"].unique()
+        
+        for category in categories:
+            cat_df = perf_df[perf_df["_category"] == category].copy()
+            
+            md += f"### {category}\n\n"
+            
+            # Select columns based on category
+            if "Preprocessing" in category or "QC" in category:
+                cols = ["Method", "status", "elapsed_seconds", "peak_memory_mb", "cells_kept", "genes_kept"]
+            else:
+                cols = ["Method", "status", "elapsed_seconds", "peak_memory_mb", "groups", "genes"]
+            
+            # Keep only columns that exist
+            cols = [c for c in cols if c in cat_df.columns]
+            display_df = cat_df[cols].copy()
+            
+            # Rename columns for display
+            rename_map = {
+                "status": "Status",
+                "elapsed_seconds": "Time (s)",
+                "peak_memory_mb": "Memory (MB)",
+                "cells_kept": "Cells",
+                "genes_kept": "Genes",
+                "groups": "Groups",
+                "genes": "Genes",
+            }
+            display_df = display_df.rename(columns={k: v for k, v in rename_map.items() if k in display_df.columns})
+            
+            # Round numeric columns
+            for col in display_df.select_dtypes(include=["number"]).columns:
+                display_df[col] = display_df[col].round(2)
+            
+            md += _frame_to_markdown_table(display_df)
+            md += "\n\n"
+    
+    # =========================================================================
+    # Section 2: Performance Comparison (CRISPYx as baseline)
+    # =========================================================================
+    md += "## 2. Performance Comparison\n\n"
+    
+    if perf_comp_results:
+        # Separate CRISPYx comparisons from other comparisons
+        crispyx_comps = []
+        other_comps = []
+        
+        for comp in perf_comp_results:
+            comparison = comp["comparison"]
+            method_a = comparison.split(" vs ")[0]
+            if _is_crispyx_method(method_a):
+                crispyx_comps.append(comp)
+            else:
+                other_comps.append(comp)
+        
+        # Section 2a: CRISPYx as baseline
+        if crispyx_comps:
+            md += "### CRISPYx vs Reference Tools\n\n"
+            md += "_CRISPYx as baseline. Negative values = CRISPYx is faster/uses less memory._\n\n"
+            
+            # Group by category
+            comp_by_category: Dict[str, List[Dict[str, Any]]] = {}
+            for comp in crispyx_comps:
+                comparison = comp["comparison"]
+                method_a = comparison.split(" vs ")[0]
+                category = _get_method_category(method_a)[0]
+                
+                if category not in comp_by_category:
+                    comp_by_category[category] = []
+                comp_by_category[category].append(comp)
+            
+            for category, comps in comp_by_category.items():
+                md += f"#### {category}\n\n"
+                
+                rows = []
+                for comp in comps:
+                    comparison = comp["comparison"]
+                    parts = comparison.split(" vs ")
+                    method_a = _format_method_name(parts[0])
+                    method_b = _format_method_name(parts[1])
+                    
+                    time_pct = comp.get("time_pct")
+                    mem_pct = comp.get("mem_pct")
+                    time_diff = comp.get("time_diff_s")
+                    mem_diff = comp.get("mem_diff_mb")
+                    
+                    time_emoji = _get_performance_emoji(time_pct, is_lower_better=True)
+                    mem_emoji = _get_performance_emoji(mem_pct, is_lower_better=True)
+                    
+                    rows.append({
+                        "CRISPYx Method": method_a,
+                        "Compared To": method_b,
+                        "Time Δ": _format_diff(time_diff, "s"),
+                        "Time %": _format_pct(time_pct),
+                        "": time_emoji,
+                        "Mem Δ": _format_diff(mem_diff, " MB"),
+                        "Mem %": _format_pct(mem_pct),
+                        " ": mem_emoji,
+                    })
+                
+                md += _frame_to_markdown_table(pd.DataFrame(rows))
+                md += "\n\n"
+        
+        # Section 2b: Other comparisons (e.g., edgeR vs PyDESeq2)
+        if other_comps:
+            md += "### Tool Comparisons\n\n"
+            md += "_Comparisons between external tools._\n\n"
+            
+            rows = []
+            for comp in other_comps:
+                comparison = comp["comparison"]
+                parts = comparison.split(" vs ")
+                method_a = _format_method_name(parts[0])
+                method_b = _format_method_name(parts[1])
+                
+                time_pct = comp.get("time_pct")
+                mem_pct = comp.get("mem_pct")
+                time_diff = comp.get("time_diff_s")
+                mem_diff = comp.get("mem_diff_mb")
+                
+                # For non-CRISPYx comparisons, interpret: method_a is the one we want to be faster
+                time_emoji = _get_performance_emoji(time_pct, is_lower_better=True)
+                mem_emoji = _get_performance_emoji(mem_pct, is_lower_better=True)
+                
+                rows.append({
+                    "Method A": method_a,
+                    "Method B": method_b,
+                    "Time Δ (A-B)": _format_diff(time_diff, "s"),
+                    "Time % (A/B)": _format_pct(time_pct),
+                    "": time_emoji,
+                    "Mem Δ (A-B)": _format_diff(mem_diff, " MB"),
+                    "Mem % (A/B)": _format_pct(mem_pct),
+                    " ": mem_emoji,
+                })
+            
+            md += _frame_to_markdown_table(pd.DataFrame(rows))
+            md += "\n\n"
+    
+    # =========================================================================
+    # Section 3: Accuracy Comparison
+    # =========================================================================
+    md += "## 3. Accuracy\n\n"
+    md += "_Correlation metrics between CRISPYx and reference methods. ✅ >0.95, ⚠️ 0.8-0.95, ❌ <0.8_\n\n"
+    
+    if accuracy_results:
+        # Separate CRISPYx comparisons from other comparisons
+        crispyx_accs = []
+        other_accs = []
+        
+        for acc in accuracy_results:
+            comparison = acc["comparison"]
+            method_a = comparison.split(" vs ")[0]
+            if _is_crispyx_method(method_a):
+                crispyx_accs.append(acc)
+            else:
+                other_accs.append(acc)
+        
+        # Section 3a: CRISPYx accuracy comparisons
+        if crispyx_accs:
+            # Group by category
+            acc_by_category: Dict[str, List[Dict[str, Any]]] = {}
+            
+            for acc in crispyx_accs:
+                comparison = acc["comparison"]
+                method_a = comparison.split(" vs ")[0]
+                category = _get_method_category(method_a)[0]
+                
+                if category not in acc_by_category:
+                    acc_by_category[category] = []
+                acc_by_category[category].append(acc)
+            
+            for category, accs in acc_by_category.items():
+                md += f"### {category}\n\n"
+                
+                # Check if this is QC comparison
+                is_qc = "QC" in category or "Preprocessing" in category
+                
+                if is_qc:
+                    # QC comparisons - show cell/gene differences
+                    rows = []
+                    for acc in accs:
+                        comparison = acc["comparison"]
+                        parts = comparison.split(" vs ")
+                        method_a = _format_method_name(parts[0])
+                        method_b = _format_method_name(parts[1])
+                        
+                        cells_diff = acc.get("cells_diff", 0)
+                        genes_diff = acc.get("genes_diff", 0)
+                        
+                        # Perfect match = ✅
+                        cells_emoji = "✅" if cells_diff == 0 else ("⚠️" if abs(cells_diff) < 10 else "❌")
+                        genes_emoji = "✅" if genes_diff == 0 else ("⚠️" if abs(genes_diff) < 10 else "❌")
+                        
+                        rows.append({
+                            "CRISPYx Method": method_a,
+                            "Compared To": method_b,
+                            "Cells Δ": f"{int(cells_diff):+d}" if pd.notna(cells_diff) else "-",
+                            "": cells_emoji,
+                            "Genes Δ": f"{int(genes_diff):+d}" if pd.notna(genes_diff) else "-",
+                            " ": genes_emoji,
+                        })
+                    
+                    md += _frame_to_markdown_table(pd.DataFrame(rows))
+                else:
+                    # DE comparisons - show correlations
+                    rows = []
+                    for acc in accs:
+                        comparison = acc["comparison"]
+                        parts = comparison.split(" vs ")
+                        method_a = _format_method_name(parts[0])
+                        method_b = _format_method_name(parts[1])
+                        
+                        effect_corr = acc.get("effect_pearson_corr")
+                        stat_corr = acc.get("statistic_pearson_corr")
+                        pval_corr = acc.get("pvalue_pearson_corr")
+                        
+                        effect_emoji = _get_accuracy_emoji(effect_corr)
+                        stat_emoji = _get_accuracy_emoji(stat_corr)
+                        pval_emoji = _get_accuracy_emoji(pval_corr)
+                        
+                        rows.append({
+                            "CRISPYx Method": method_a,
+                            "Compared To": method_b,
+                            "Effect ρ": f"{effect_corr:.3f}" if pd.notna(effect_corr) else "-",
+                            "": effect_emoji,
+                            "Stat ρ": f"{stat_corr:.3f}" if pd.notna(stat_corr) else "-",
+                            " ": stat_emoji,
+                            "P-val ρ": f"{pval_corr:.3f}" if pd.notna(pval_corr) else "-",
+                            "  ": pval_emoji,
+                        })
+                    
+                    md += _frame_to_markdown_table(pd.DataFrame(rows))
+                
+                md += "\n\n"
+        
+        # Section 3b: Other accuracy comparisons (e.g., edgeR vs PyDESeq2)
+        if other_accs:
+            md += "### Tool Comparisons\n\n"
+            
+            rows = []
+            for acc in other_accs:
+                comparison = acc["comparison"]
+                parts = comparison.split(" vs ")
+                method_a = _format_method_name(parts[0])
+                method_b = _format_method_name(parts[1])
+                
+                effect_corr = acc.get("effect_pearson_corr")
+                stat_corr = acc.get("statistic_pearson_corr")
+                pval_corr = acc.get("pvalue_pearson_corr")
+                
+                effect_emoji = _get_accuracy_emoji(effect_corr)
+                stat_emoji = _get_accuracy_emoji(stat_corr)
+                pval_emoji = _get_accuracy_emoji(pval_corr)
+                
+                rows.append({
+                    "Method A": method_a,
+                    "Method B": method_b,
+                    "Effect ρ": f"{effect_corr:.3f}" if pd.notna(effect_corr) else "-",
+                    "": effect_emoji,
+                    "Stat ρ": f"{stat_corr:.3f}" if pd.notna(stat_corr) else "-",
+                    " ": stat_emoji,
+                    "P-val ρ": f"{pval_corr:.3f}" if pd.notna(pval_corr) else "-",
+                    "  ": pval_emoji,
+                })
+            
+            md += _frame_to_markdown_table(pd.DataFrame(rows))
+            md += "\n\n"
+    
+    # =========================================================================
+    # Legend
+    # =========================================================================
+    md += "---\n\n"
+    md += "**Legend:**\n"
+    md += "- Performance: ✅ >10% better | ⚠️ within ±10% | ❌ >10% worse\n"
+    md += "- Accuracy: ✅ ρ≥0.95 | ⚠️ 0.8≤ρ<0.95 | ❌ ρ<0.8\n"
+    
+    return md
+
+
 def evaluate_benchmarks(output_dir: Path) -> None:
     """Evaluate benchmark results and generate report."""
-    from crispyx.comparison import compute_de_comparison_metrics
+    from .comparison import compute_de_comparison_metrics
     
     results_dir = output_dir / ".benchmark_cache"
     if not results_dir.exists():
@@ -1920,93 +2379,110 @@ def evaluate_benchmarks(output_dir: Path) -> None:
     perf_comp_results = []
     
     # Define comparisons
+    # Format: (method_a, method_b, comparison_type)
     comparisons = [
         # QC
         ("crispyx_qc_filtered", "scanpy_qc_filtered", "qc"),
-        # DE GLM
+        # DE GLM - independent vs external tools
         ("crispyx_de_nb_glm", "edger_de_glm", "de"),
         ("crispyx_de_nb_glm", "pertpy_de_pydeseq2", "de"),
+        # DE GLM - joint vs independent (internal comparison)
+        ("crispyx_de_nb_glm_joint", "crispyx_de_nb_glm", "de"),
+        # DE GLM - joint vs external tools
+        ("crispyx_de_nb_glm_joint", "edger_de_glm", "de"),
+        ("crispyx_de_nb_glm_joint", "pertpy_de_pydeseq2", "de"),
+        # DE GLM - external tool comparison
+        ("edger_de_glm", "pertpy_de_pydeseq2", "de"),
         # DE Tests
         ("crispyx_de_t_test", "scanpy_de_t_test", "de"),
         ("crispyx_de_wilcoxon", "scanpy_de_wilcoxon", "de"),
     ]
     
-    for stream_method, ref_method, comp_type in comparisons:
+    for method_a_name, method_b_name, comp_type in comparisons:
         # Check if both exist and succeeded
-        stream_res = df[df["method"] == stream_method]
-        ref_res = df[df["method"] == ref_method]
+        method_a_res = df[df["method"] == method_a_name]
+        method_b_res = df[df["method"] == method_b_name]
         
-        if stream_res.empty or ref_res.empty:
+        if method_a_res.empty or method_b_res.empty:
             continue
             
-        if stream_res.iloc[0]["status"] != "success" or ref_res.iloc[0]["status"] != "success":
+        if method_a_res.iloc[0]["status"] != "success" or method_b_res.iloc[0]["status"] != "success":
             continue
             
         # Performance Comparison
-        s_row = stream_res.iloc[0]
-        r_row = ref_res.iloc[0]
+        a_row = method_a_res.iloc[0]
+        b_row = method_b_res.iloc[0]
         
-        s_time = s_row.get("elapsed_seconds", np.nan)
-        r_time = r_row.get("elapsed_seconds", np.nan)
-        s_mem = s_row.get("peak_memory_mb", np.nan)
-        r_mem = r_row.get("peak_memory_mb", np.nan)
+        a_time = a_row.get("elapsed_seconds", np.nan)
+        b_time = b_row.get("elapsed_seconds", np.nan)
+        a_mem = a_row.get("peak_memory_mb", np.nan)
+        b_mem = b_row.get("peak_memory_mb", np.nan)
         
         comp = {
-            "comparison": f"{stream_method} vs {ref_method}",
-            "crispyx_time_s": s_time,
-            "other_time_s": r_time,
-            "time_diff_s": s_time - r_time if pd.notna(s_time) and pd.notna(r_time) else None,
-            "time_pct": (s_time / r_time * 100) if pd.notna(s_time) and pd.notna(r_time) and r_time > 0 else None,
-            "crispyx_mem_mb": s_mem,
-            "other_mem_mb": r_mem,
-            "mem_diff_mb": s_mem - r_mem if pd.notna(s_mem) and pd.notna(r_mem) else None,
-            "mem_pct": (s_mem / r_mem * 100) if pd.notna(s_mem) and pd.notna(r_mem) and r_mem > 0 else None,
+            "comparison": f"{method_a_name} vs {method_b_name}",
+            "method_a_time_s": a_time,
+            "method_b_time_s": b_time,
+            "time_diff_s": a_time - b_time if pd.notna(a_time) and pd.notna(b_time) else None,
+            "time_pct": (a_time / b_time * 100) if pd.notna(a_time) and pd.notna(b_time) and b_time > 0 else None,
+            "method_a_mem_mb": a_mem,
+            "method_b_mem_mb": b_mem,
+            "mem_diff_mb": a_mem - b_mem if pd.notna(a_mem) and pd.notna(b_mem) else None,
+            "mem_pct": (a_mem / b_mem * 100) if pd.notna(a_mem) and pd.notna(b_mem) and b_mem > 0 else None,
         }
         perf_comp_results.append(comp)
         
         # Load result files
         try:
-            stream_path_val = stream_res.iloc[0]["result_path"]
-            ref_path_val = ref_res.iloc[0]["result_path"]
+            method_a_path_val = method_a_res.iloc[0]["result_path"]
+            method_b_path_val = method_b_res.iloc[0]["result_path"]
             
-            if pd.isna(stream_path_val) or pd.isna(ref_path_val):
-                print(f"Skipping comparison {stream_method} vs {ref_method}: missing result path")
+            if pd.isna(method_a_path_val) or pd.isna(method_b_path_val):
+                print(f"Skipping comparison {method_a_name} vs {method_b_name}: missing result path")
                 continue
                 
-            stream_path = output_dir / str(stream_path_val)
-            ref_path = output_dir / str(ref_path_val)
+            method_a_path = output_dir / str(method_a_path_val)
+            method_b_path = output_dir / str(method_b_path_val)
             
             if comp_type == "qc":
                 # Compare cell/gene counts
                 acc = {
-                    "comparison": f"{stream_method} vs {ref_method}",
-                    "cells_diff": float(stream_res.iloc[0]["cells_kept"] - ref_res.iloc[0]["cells_kept"]),
-                    "genes_diff": float(stream_res.iloc[0]["genes_kept"] - ref_res.iloc[0]["genes_kept"]),
+                    "comparison": f"{method_a_name} vs {method_b_name}",
+                    "cells_diff": float(method_a_res.iloc[0]["cells_kept"] - method_b_res.iloc[0]["cells_kept"]),
+                    "genes_diff": float(method_a_res.iloc[0]["genes_kept"] - method_b_res.iloc[0]["genes_kept"]),
                 }
                 accuracy_results.append(acc)
                 
             elif comp_type == "de":
-                # Load DE results
+                # Load DE results - handle both h5ad and csv files
                 import anndata as ad
                 
-                # Load stream (h5ad)
-                stream_adata = ad.read_h5ad(str(stream_path))
-                stream_dict = _anndata_to_de_dict(stream_adata)
-                stream_df = _streaming_de_to_frame(stream_dict)
+                # Load method_a results
+                if str(method_a_path).endswith('.h5ad'):
+                    method_a_adata = ad.read_h5ad(str(method_a_path))
+                    method_a_dict = _anndata_to_de_dict(method_a_adata)
+                    method_a_df = _streaming_de_to_frame(method_a_dict)
+                else:
+                    method_a_df = pd.read_csv(method_a_path)
+                    method_a_df = _standardise_de_dataframe(method_a_df)
                 
-                # Load ref (csv)
-                ref_df = pd.read_csv(ref_path)
-                ref_df = _standardise_de_dataframe(ref_df)
+                # Load method_b results
+                if str(method_b_path).endswith('.h5ad'):
+                    method_b_adata = ad.read_h5ad(str(method_b_path))
+                    method_b_dict = _anndata_to_de_dict(method_b_adata)
+                    method_b_df = _streaming_de_to_frame(method_b_dict)
+                else:
+                    method_b_df = pd.read_csv(method_b_path)
+                    method_b_df = _standardise_de_dataframe(method_b_df)
                 
                 # Compute metrics
-                metrics = compute_de_comparison_metrics(stream_df, ref_df)
+                metrics = compute_de_comparison_metrics(method_a_df, method_b_df)
                 # Create new dict to avoid type errors
-                acc = {"comparison": f"{stream_method} vs {ref_method}"}
+                acc = {"comparison": f"{method_a_name} vs {method_b_name}"}
                 acc.update(metrics)
                 accuracy_results.append(acc)
                 
         except Exception as e:
-            print(f"Error comparing {stream_method} vs {ref_method}: {e}")
+            print(f"Error comparing {method_a_name} vs {method_b_name}: {e}")
             
     # Save tables
     perf_df.to_csv(output_dir / "performance_summary.csv", index=False)
@@ -2014,22 +2490,12 @@ def evaluate_benchmarks(output_dir: Path) -> None:
         acc_df = pd.DataFrame(accuracy_results)
         acc_df.to_csv(output_dir / "accuracy_summary.csv", index=False)
         
-    # Generate Markdown
-    md = "# Benchmark Results\n\n"
-    
-    md += "## Performance\n\n"
-    md += _frame_to_markdown_table(perf_df)
-    md += "\n\n"
-    
-    if perf_comp_results:
-        md += "## Performance Comparison\n\n"
-        md += _frame_to_markdown_table(pd.DataFrame(perf_comp_results))
-        md += "\n\n"
-    
-    if accuracy_results:
-        md += "## Accuracy\n\n"
-        md += _frame_to_markdown_table(pd.DataFrame(accuracy_results))
-        md += "\n"
+    # Generate improved Markdown
+    md = _generate_improved_markdown(
+        perf_df, 
+        perf_comp_results, 
+        accuracy_results
+    )
         
     with open(output_dir / "results.md", "w") as f:
         f.write(md)
@@ -2669,7 +3135,7 @@ def create_benchmark_suite(
         ),
         "crispyx_de_nb_glm": BenchmarkMethod(
             name="crispyx_de_nb_glm",
-            description="Negative binomial GLM differential expression",
+            description="Negative binomial GLM differential expression (independent)",
             function=nb_glm_test,
             kwargs={
                 "path": dataset_path,
@@ -2677,6 +3143,36 @@ def create_benchmark_suite(
                 "output_dir": de_dir,
                 "data_name": "de_nb_glm",
                 "n_jobs": n_cores,
+                "fit_method": "independent",
+            },
+            summary=_summarise_de_mapping,
+        ),
+        "crispyx_de_nb_glm_joint": BenchmarkMethod(
+            name="crispyx_de_nb_glm_joint",
+            description="Negative binomial GLM differential expression (joint covariate fitting)",
+            function=nb_glm_test,
+            kwargs={
+                "path": dataset_path,
+                **shared_kwargs,
+                "output_dir": de_dir,
+                "data_name": "de_nb_glm_joint",
+                "n_jobs": n_cores,
+                "fit_method": "joint",
+            },
+            summary=_summarise_de_mapping,
+        ),
+        "crispyx_de_nb_glm_joint_shared_disp": BenchmarkMethod(
+            name="crispyx_de_nb_glm_joint_shared_disp",
+            description="Negative binomial GLM DE (joint fitting with shared dispersion)",
+            function=nb_glm_test,
+            kwargs={
+                "path": dataset_path,
+                **shared_kwargs,
+                "output_dir": de_dir,
+                "data_name": "de_nb_glm_joint_shared_disp",
+                "n_jobs": n_cores,
+                "fit_method": "joint",
+                "share_dispersion": True,
             },
             summary=_summarise_de_mapping,
         ),
@@ -3038,8 +3534,8 @@ def _dataframe_to_markdown(
                 # For DE comparisons, add performance difference columns and correlation metrics
                 perf_diff_cols = [
                     "runtime_diff_seconds", "runtime_diff_pct",
-                    "stream_peak_memory_mb", "stream_avg_memory_mb",
-                    "reference_peak_memory_mb", "reference_avg_memory_mb",
+                    "method_a_peak_memory_mb", "method_a_avg_memory_mb",
+                    "method_b_peak_memory_mb", "method_b_avg_memory_mb",
                     "memory_diff_mb", "memory_diff_pct"
                 ]
                 comparison_cols.extend([col for col in perf_diff_cols if col in task_reference.columns])
@@ -3052,7 +3548,7 @@ def _dataframe_to_markdown(
             comparison_cols.extend([col for col in comparison_specific if col in task_reference.columns])
             
             # Add result paths
-            comparison_cols.extend(["streaming_result_path", "reference_result_path"])
+            comparison_cols.extend(["method_a_result_path", "method_b_result_path"])
             
             # Keep only columns that exist
             comparison_table_cols = [col for col in comparison_cols if col in task_reference.columns]
@@ -3345,7 +3841,7 @@ def main() -> None:
     args = parse_args()
     
     # Initialize global environment configuration from CLI args
-    from benchmarking.env_config import set_global_env_config, EnvironmentConfig
+    from .env_config import set_global_env_config, EnvironmentConfig
     
     env_config = EnvironmentConfig(
         r_home=args.r_home if hasattr(args, 'r_home') else None,
