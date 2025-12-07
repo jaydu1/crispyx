@@ -1,21 +1,37 @@
 # Benchmarking
 
-Scripts for profiling CRISPYx streaming methods against reference implementations (Scanpy, Pertpy, edgeR, PyDESeq2).
+Scripts for profiling crispyx streaming methods against reference implementations (Scanpy, Pertpy, edgeR, PyDESeq2).
 
 ## Quick Start
 
-### Single Dataset
+### Native Mode (Default)
 ```bash
+# Single dataset
 ./run_benchmark.sh config/Adamson.yaml
-```
 
-### Multiple Datasets
-```bash
-# Run specific datasets
+# Multiple datasets
 ./run_benchmark.sh config/Adamson.yaml config/Frangieh.yaml
 
-# Run all datasets in config directory
+# All datasets in config directory
 ./run_benchmark.sh config/*.yaml
+```
+
+### Docker Mode
+```bash
+# Build Docker image first (one time)
+docker build -t crispyx-benchmark -f benchmarking/Dockerfile .
+
+# Run single dataset in Docker
+./run_benchmark.sh --use-docker config/Adamson.yaml
+
+# Run all datasets in Docker
+./run_benchmark.sh --use-docker config/*.yaml
+
+# With custom Docker image
+./run_benchmark.sh --use-docker --docker-image myimage:tag config/*.yaml
+
+# Build image and run (convenience)
+./run_benchmark.sh --use-docker --build-docker config/Adamson.yaml
 ```
 
 ### Generate Configs for All Datasets
@@ -102,11 +118,14 @@ Automatically:
 ## Scripts
 
 ### `run_benchmark.sh`
-Run benchmarks on one or more datasets.
+Run benchmarks on one or more datasets, with optional Docker support.
 
 ```bash
-# Single dataset
+# Native mode (default)
 ./run_benchmark.sh config/Adamson.yaml
+
+# Docker mode
+./run_benchmark.sh --use-docker config/Adamson.yaml
 
 # Multiple datasets
 ./run_benchmark.sh config/Adamson.yaml config/Frangieh.yaml
@@ -114,9 +133,25 @@ Run benchmarks on one or more datasets.
 # All datasets
 ./run_benchmark.sh config/*.yaml
 
-# Datasets matching pattern
-./run_benchmark.sh config/Replogle-*.yaml
+# Force re-run (ignore cache)
+./run_benchmark.sh --force-rerun config/Adamson.yaml
+
+# Clean output directory before running
+./run_benchmark.sh --clean config/Adamson.yaml
+
+# Combined Docker options
+./run_benchmark.sh --use-docker --build-docker --force-rerun config/*.yaml
 ```
+
+**Options**:
+| Flag | Description |
+|------|-------------|
+| `--use-docker` | Run benchmarks in Docker containers |
+| `--docker-image IMAGE` | Docker image to use (default: `crispyx-benchmark:latest`) |
+| `--build-docker` | Build Docker image before running |
+| `--force-rerun` | Force re-run all methods (ignore cache) |
+| `--clean` | Delete output directory before running |
+| `-h, --help` | Show help message |
 
 **Features**:
 - Accepts one or more config files as arguments
@@ -165,7 +200,7 @@ python inspect_datasets.py
 
 ## Output Structure
 
-All CRISPYx outputs now use the `crispyx_` prefix to clearly distinguish them from reference tool outputs.
+All crispyx outputs now use the `crispyx_` prefix to clearly distinguish them from reference tool outputs.
 
 ```
 benchmarking/results/
@@ -189,16 +224,16 @@ benchmarking/results/
 │   │   ├── crispyx_pb_avg_log.h5ad        # Average log expression pseudobulk
 │   │   └── crispyx_pb_pseudobulk.h5ad     # Sum-based pseudobulk expression
 │   ├── de/
-│   │   ├── crispyx_de_t_test.h5ad         # CRISPYx t-test results
-│   │   ├── crispyx_de_wilcoxon.h5ad       # CRISPYx Wilcoxon test results
-│   │   ├── crispyx_de_nb_glm.h5ad         # CRISPYx negative binomial GLM results
+│   │   ├── crispyx_de_t_test.h5ad         # crispyx t-test results
+│   │   ├── crispyx_de_wilcoxon.h5ad       # crispyx Wilcoxon test results
+│   │   ├── crispyx_de_nb_glm.h5ad         # crispyx negative binomial GLM results
 │   │   ├── scanpy_de_t_test.csv           # Scanpy t-test results
 │   │   ├── scanpy_de_wilcoxon.csv         # Scanpy Wilcoxon test results
 │   │   ├── edger_de_glm.csv               # edgeR GLM results
 │   │   └── pertpy_de_pydeseq2.csv         # PyDESeq2 results via Pertpy
 │   ├── comparisons/                       # Detailed comparison data (optional)
-│   │   ├── edger_glm.csv                  # CRISPYx vs edgeR detailed comparison
-│   │   └── pertpy_pydeseq2.csv            # CRISPYx vs PyDESeq2 detailed comparison
+│   │   ├── edger_glm.csv                  # crispyx vs edgeR detailed comparison
+│   │   └── pertpy_pydeseq2.csv            # crispyx vs PyDESeq2 detailed comparison
 │   ├── results.csv                        # Benchmark summary table
 │   ├── results.md                         # Markdown report
 │   └── summary.json                       # Metadata with adaptive QC params
@@ -208,7 +243,7 @@ benchmarking/results/
 
 ### File Naming Convention
 
-**CRISPYx outputs**: `crispyx_{operation}_{method}.h5ad`
+**crispyx outputs**: `crispyx_{operation}_{method}.h5ad`
 - Examples: `crispyx_qc_filtered.h5ad`, `crispyx_de_t_test.h5ad`, `crispyx_pb_avg_log.h5ad`
 
 **Reference tool outputs**: `{tool}_de_{method}.csv`
@@ -238,7 +273,7 @@ This naming convention makes it easy to identify the source and type of each fil
 
 ## Benchmark Methods
 
-**CRISPYx Streaming Pipeline** (6 methods):
+**crispyx Streaming Pipeline** (6 methods):
 1. `crispyx_qc_filtered` - Streaming quality control filters
 2. `crispyx_pb_avg_log` - Average log-normalized expression per perturbation
 3. `crispyx_pb_pseudobulk` - Pseudo-bulk log fold-change per perturbation
@@ -260,7 +295,7 @@ This naming convention makes it easy to identify the source and type of each fil
   - **Peak Memory**: Maximum memory usage during execution
   - **Average Memory**: Mean memory usage sampled at 0.1-second intervals via background thread
 
-**Standardized Comparison Pipeline**: All comparison methods (scanpy, edgeR, pertpy) load pre-computed CRISPYx streaming results from cache files to ensure consistent timing and avoid pipeline variation. This means:
+**Standardized Comparison Pipeline**: All comparison methods (scanpy, edgeR, pertpy) load pre-computed crispyx streaming results from cache files to ensure consistent timing and avoid pipeline variation. This means:
 - **t-test/Wilcoxon comparisons** require `crispyx_de_t_test` or `crispyx_de_wilcoxon` to exist first
 - **GLM comparisons** (edgeR, PyDESeq2) require `crispyx_de_nb_glm` to exist first
 - If required cache files are missing, the benchmark will fail explicitly with a clear error message
@@ -345,4 +380,234 @@ ls -1t benchmarking/logs/ | head
 **Force re-standardization**: Set `force_restandardize: true`  
 **Override adaptive QC**: Specify explicit `qc_params` in config  
 **View all logs**: `ls -1 logs/` (timestamps at beginning for chronological sorting)
+
+---
+
+## Viewing Logs
+
+Benchmark execution generates multiple log files for debugging and monitoring.
+
+### Log Locations
+
+| Mode | Log Type | Location | Description |
+|------|----------|----------|-------------|
+| Native/Docker | Main log | `logs/{timestamp}_benchmark.log` | Overall benchmark progress, success/failure summary |
+| Native/Docker | Dataset logs | `logs/{timestamp}_{dataset}.log` | Per-dataset detailed output |
+| Docker | Container output | Captured in result JSON | stdout/stderr from Docker containers |
+
+### Viewing Logs
+
+```bash
+# List recent logs
+ls -1t logs/ | head
+
+# Follow main log during execution
+tail -f logs/$(ls -1t logs/*_benchmark.log | head -1)
+
+# View specific dataset log
+cat logs/20241207_143022_Adamson.log
+
+# Search for errors across all logs
+grep -i error logs/*.log
+```
+
+### Docker Container Logs
+
+When running in Docker mode (`--use-docker`), container stdout/stderr is captured in the benchmark results. The container output is saved to the result JSON file's `stdout` and `stderr` fields.
+
+To debug Docker execution issues:
+
+```bash
+# Check if Docker is running
+docker ps
+
+# View Docker daemon logs
+docker logs $(docker ps -lq)
+
+# Run interactively for debugging
+docker-compose run dev
+```
+
+### Cache Management
+
+Control caching behavior to re-run benchmarks:
+
+```bash
+# Force re-run all methods (ignore cache)
+./run_benchmark.sh --force-rerun config/Adamson.yaml
+
+# Delete entire output directory and start fresh
+./run_benchmark.sh --clean config/Adamson.yaml
+```
+
+---
+
+## Docker Execution Mode
+
+For reliable cross-platform memory limiting and reproducible benchmark environments, you can run benchmarks inside Docker containers.
+
+### Benefits
+
+- **Reliable memory limits**: Docker's `--memory` flag limits physical RAM (RSS), not virtual address space
+- **Cross-platform**: Works on Linux, macOS (Docker Desktop), and Windows (WSL2)
+- **Reproducible environment**: Pinned Python, R, and package versions
+- **No dependency conflicts**: Isolated from host system packages
+- **Full log capture**: stdout/stderr from containers saved to result JSON
+
+### Quick Start
+
+#### Using Shell Script (Recommended)
+```bash
+# Build Docker image (first time only)
+docker build -t crispyx-benchmark -f benchmarking/Dockerfile .
+
+# Run benchmarks in Docker via shell script
+./run_benchmark.sh --use-docker config/Adamson.yaml
+
+# Build and run in one command
+./run_benchmark.sh --use-docker --build-docker config/*.yaml
+```
+
+#### Using Python CLI Directly
+```bash
+# Run benchmarks with Docker
+python -m benchmarking.tools.run_benchmarks \
+  --config benchmarking/config/Adamson_subset.yaml \
+  --use-docker
+
+# Or build and run in one command
+python -m benchmarking.tools.run_benchmarks \
+  --config benchmarking/config/Adamson_subset.yaml \
+  --use-docker --build-docker
+```
+
+### Using Docker Compose
+
+```bash
+cd benchmarking
+
+# Run benchmark with default config
+docker-compose up benchmark
+
+# Run with specific config
+CONFIG_FILE=benchmarking/config/Adamson.yaml docker-compose run benchmark
+
+# Interactive development shell
+docker-compose run dev
+
+# Set memory limit (in GB)
+MEMORY_LIMIT=128 docker-compose up benchmark
+```
+
+### Configuration
+
+Enable Docker mode in your benchmark config:
+
+```yaml
+# In benchmarking/config/your_dataset.yaml
+docker_config:
+  enabled: true                      # Enable Docker execution
+  image: "crispyx-benchmark:latest"  # Docker image name
+```
+
+Or use CLI flags:
+
+```bash
+python -m benchmarking.tools.run_benchmarks \
+  --config benchmarking/config/Adamson.yaml \
+  --use-docker \
+  --docker-image crispyx-benchmark:latest \
+  --memory-limit 64
+```
+
+### CLI Options
+
+| Flag | Description |
+|------|-------------|
+| `--use-docker` | Enable Docker execution mode |
+| `--docker-image IMAGE` | Docker image name (default: `crispyx-benchmark:latest`) |
+| `--build-docker` | Build Docker image before running benchmarks |
+
+### Pre-built Images
+
+Docker images are automatically built and published to GitHub Container Registry on each release:
+
+```bash
+# Pull pre-built image
+docker pull ghcr.io/your-org/crispyx-benchmark:latest
+
+# Use specific version
+docker pull ghcr.io/your-org/crispyx-benchmark:v1.0.0
+
+# Run with pre-built image
+python -m benchmarking.tools.run_benchmarks \
+  --config benchmarking/config/Adamson.yaml \
+  --use-docker \
+  --docker-image ghcr.io/your-org/crispyx-benchmark:latest
+```
+
+### Building Locally
+
+```bash
+# Build from repository root
+docker build -t crispyx-benchmark -f benchmarking/Dockerfile .
+
+# Verify the build
+docker run --rm crispyx-benchmark python -c "import crispyx; print('OK')"
+docker run --rm crispyx-benchmark R -e "library(edgeR); cat('OK\n')"
+```
+
+### Memory Limiting
+
+Docker mode provides reliable memory limiting via cgroups:
+
+```bash
+# 64 GB memory limit
+docker run --rm --memory=64g \
+  -v $(pwd):/workspace \
+  crispyx-benchmark \
+  python -m benchmarking.tools.run_benchmarks \
+  --config benchmarking/config/Adamson.yaml
+```
+
+**Why Docker for memory limiting?**
+- `RLIMIT_AS` (used in native mode) limits virtual address space, not physical memory
+- Memory-mapped files (memmaps) use large virtual address space but minimal physical RAM
+- This causes false OOM kills for memmap-heavy methods (like joint NB-GLM)
+- Docker's `--memory` flag limits actual RSS, providing accurate memory control
+
+### Platform-Specific Notes
+
+**Linux**: Works out of the box with Docker Engine.
+
+**macOS**: Requires Docker Desktop. Memory limits work but may be less accurate due to VM layer.
+
+**Windows**: Requires WSL2 with Docker Desktop. Use WSL2 terminal for best results.
+
+### Troubleshooting Docker Mode
+
+**Image not found**:
+```bash
+docker build -t crispyx-benchmark benchmarking/
+```
+
+**Permission denied**:
+```bash
+# Add user to docker group (Linux)
+sudo usermod -aG docker $USER
+# Log out and back in
+```
+
+**Out of memory in container**:
+```bash
+# Increase memory limit
+docker run --memory=128g ...
+```
+
+**Volume mount issues on macOS/Windows**:
+```bash
+# Use absolute paths
+docker run -v /Users/yourname/project:/workspace ...
+```
+
 

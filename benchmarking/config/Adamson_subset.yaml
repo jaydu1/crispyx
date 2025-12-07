@@ -19,7 +19,7 @@ resource_limits:
 
 # Parallelization configuration
 parallel_config:
-  n_cores: 32
+  n_cores: 8  # Reduced from 32 to limit memory multiplication in parallel code
 
 # Environment configuration (optional - auto-detects if omitted)
 # environment_config:
@@ -37,3 +37,8 @@ methods_to_run: null
 # Progress and output options
 show_progress: true
 quiet: false
+
+# Docker configuration (optional - for cross-platform reproducible execution)
+# docker_config:
+#   enabled: false  # Set to true to run benchmarks inside Docker containers
+#   image: "crispyx-benchmark:latest"  # Docker image name

@@ -1,4 +1,4 @@
-# CRISPYx
+# crispyx
 
 A lightweight toolkit for streaming CRISPR screen analysis that processes large datasets without loading them into memory. Uses backed AnnData `.h5ad` files to perform QC, pseudo-bulk aggregation, and differential expression while data remains on disk.
 
@@ -16,7 +16,7 @@ A lightweight toolkit for streaming CRISPR screen analysis that processes large 
 ### v0.3.0+ (November 2025)
 
 **Breaking Changes: File Naming Standardization**
-- All CRISPYx output files now use `crispyx_` prefix for clarity
+- All crispyx output files now use `crispyx_` prefix for clarity
 - Benchmark method names updated to match output filenames
 - Output directory structure reorganized (see "Output Structure" section below)
 
@@ -139,7 +139,7 @@ sphinx-build docs docs/_build
 
 ## Output Structure
 
-CRISPYx uses a standardized directory structure with module-prefixed filenames for clarity.
+crispyx uses a standardized directory structure with module-prefixed filenames for clarity.
 
 ### Benchmark Results
 
@@ -164,16 +164,16 @@ benchmarking/results/DatasetName/
 │   ├── crispyx_pb_avg_log.h5ad          # Average log expression pseudobulk
 │   └── crispyx_pb_pseudobulk.h5ad       # Sum-based pseudobulk expression
 ├── de/
-│   ├── crispyx_de_t_test.h5ad           # CRISPYx t-test results
-│   ├── crispyx_de_wilcoxon.h5ad         # CRISPYx Wilcoxon test results
-│   ├── crispyx_de_nb_glm.h5ad           # CRISPYx negative binomial GLM results
+│   ├── crispyx_de_t_test.h5ad           # crispyx t-test results
+│   ├── crispyx_de_wilcoxon.h5ad         # crispyx Wilcoxon test results
+│   ├── crispyx_de_nb_glm.h5ad           # crispyx negative binomial GLM results
 │   ├── scanpy_de_t_test.csv             # Scanpy t-test results
 │   ├── scanpy_de_wilcoxon.csv           # Scanpy Wilcoxon test results
 │   ├── edger_de_glm.csv                 # edgeR GLM results
 │   └── pertpy_de_pydeseq2.csv           # PyDESeq2 results via Pertpy
 ├── comparisons/                         # Detailed comparison data (optional)
-│   ├── edger_glm.csv                    # CRISPYx vs edgeR detailed comparison
-│   └── pertpy_pydeseq2.csv              # CRISPYx vs PyDESeq2 detailed comparison
+│   ├── edger_glm.csv                    # crispyx vs edgeR detailed comparison
+│   └── pertpy_pydeseq2.csv              # crispyx vs PyDESeq2 detailed comparison
 ├── results.csv                          # Benchmark summary table
 ├── results.md                           # Markdown report
 └── summary.json                         # Metadata with adaptive QC params
@@ -181,7 +181,7 @@ benchmarking/results/DatasetName/
 
 ### File Naming Convention
 
-**CRISPYx outputs**: `crispyx_{operation}_{method}.h5ad`
+**crispyx outputs**: `crispyx_{operation}_{method}.h5ad`
 - Preprocessing: `crispyx_qc_filtered.h5ad`, `crispyx_pb_avg_log.h5ad`, `crispyx_pb_pseudobulk.h5ad`
 - Differential expression: `crispyx_de_t_test.h5ad`, `crispyx_de_wilcoxon.h5ad`, `crispyx_de_nb_glm.h5ad`
 
@@ -193,7 +193,7 @@ benchmarking/results/DatasetName/
 
 ### Standalone Analysis
 
-When using CRISPYx outside of benchmarking, outputs follow the same naming but can be customized:
+When using crispyx outside of benchmarking, outputs follow the same naming but can be customized:
 
 ```python
 import crispyx as cx

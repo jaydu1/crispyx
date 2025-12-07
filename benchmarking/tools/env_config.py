@@ -138,7 +138,10 @@ def set_thread_env_vars(n_threads: int) -> None:
     - NUMEXPR_NUM_THREADS: NumExpr library
     - VECLIB_MAXIMUM_THREADS: macOS Accelerate framework
     - R_THREADS: R threading control
-    - NUMBA_NUM_THREADS: Numba parallel execution
+    - NUMBA_NUM_THREADS: Numba parallel execution (only if Numba not yet initialized)
+    
+    For Numba, if the thread pool is already initialized, uses numba.set_num_threads()
+    to limit threads dynamically (can only reduce, not increase).
     """
     if n_threads < 1:
         n_threads = 1
@@ -150,4 +153,63 @@ def set_thread_env_vars(n_threads: int) -> None:
     os.environ['NUMEXPR_NUM_THREADS'] = n_threads_str
     os.environ['VECLIB_MAXIMUM_THREADS'] = n_threads_str
     os.environ['R_THREADS'] = n_threads_str
-    os.environ['NUMBA_NUM_THREADS'] = n_threads_str
+    
+    # Handle Numba threads specially - can't change env var after threads launched
+    _set_numba_threads(n_threads)
+
+
+def _set_numba_threads(n_threads: int) -> None:
+    """Set Numba thread count, handling already-initialized thread pools.
+    
+    Parameters
+    ----------
+    n_threads : int
+        Number of threads to use. Should be >= 1.
+    
+    Notes
+    -----
+    - If Numba is not imported yet, sets NUMBA_NUM_THREADS env var
+    - If Numba is imported but threads not launched, sets env var
+    - If Numba threads are already launched, uses numba.set_num_threads()
+      (can only reduce threads, not increase above NUMBA_NUM_THREADS)
+    """
+    import sys
+    
+    if n_threads < 1:
+        n_threads = 1
+    
+    # Check if numba is already imported
+    if 'numba' not in sys.modules:
+        # Safe to set env var before import
+        os.environ['NUMBA_NUM_THREADS'] = str(n_threads)
+        return
+    
+    # Numba is imported - try to use set_num_threads
+    try:
+        import numba
+        from numba import config as numba_config
+        
+        # Get the max threads Numba was configured with
+        max_threads = getattr(numba_config, 'NUMBA_NUM_THREADS', None)
+        
+        if max_threads is None:
+            # Numba config not fully initialized yet, try env var
+            os.environ['NUMBA_NUM_THREADS'] = str(n_threads)
+            return
+        
+        # Can only set threads <= max configured threads
+        effective_threads = min(n_threads, max_threads)
+        
+        try:
+            numba.set_num_threads(effective_threads)
+        except Exception:
+            # If set_num_threads fails, threads may not be launched yet
+            # Try setting env var (may fail if threads are launched)
+            try:
+                os.environ['NUMBA_NUM_THREADS'] = str(n_threads)
+            except Exception:
+                pass  # Silently ignore - threads are already running
+                
+    except ImportError:
+        # Numba not available, just set env var
+        os.environ['NUMBA_NUM_THREADS'] = str(n_threads)

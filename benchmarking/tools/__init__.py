@@ -1,5 +1,5 @@
-# Benchmarking tools package for CRISPYx
-"""Python modules for benchmarking CRISPYx against other tools."""
+# Benchmarking tools package for crispyx
+"""Python modules for benchmarking crispyx against other tools."""
 
 # Use lazy imports to avoid circular import issues when running as __main__
 def __getattr__(name: str):

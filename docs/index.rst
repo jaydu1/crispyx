@@ -1,4 +1,4 @@
-CRISPYx
+crispyx
 =======
 
 Welcome to the documentation for the ``crispyx`` package. The

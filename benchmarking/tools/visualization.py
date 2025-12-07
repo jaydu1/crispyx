@@ -11,7 +11,8 @@ import pandas as pd
 from .generate_results import SHRINKAGE_METADATA, LFCSHRINK_METHODS
 
 # Order for methods in overlap heatmaps
-# Ordered by: t-test, Wilcoxon, NB-GLM, NB-GLM (joint)
+# Ordered by: t-test, Wilcoxon, NB-GLM (base), NB-GLM (shrunk)
+# Note: Shrunk results are loaded from shrunk_result_path and stored with _shrunk suffix
 HEATMAP_METHOD_ORDER = [
     # t-test
     "crispyx_de_t_test",
@@ -23,8 +24,11 @@ HEATMAP_METHOD_ORDER = [
     "edger_de_glm",
     "crispyx_de_nb_glm",
     "pertpy_de_pydeseq2",
-    # NB-GLM (with shrinkage)
+    # NB-GLM (joint, no shrinkage)
     "crispyx_de_nb_glm_joint",
+    # NB-GLM (with shrinkage)
+    "crispyx_de_nb_glm_shrunk",
+    "crispyx_de_nb_glm_joint_shrunk",
     "pertpy_de_pydeseq2_shrunk",
 ]
 
@@ -35,35 +39,44 @@ def _format_heatmap_method_name(name: str) -> str:
     Parameters
     ----------
     name : str
-        Internal method name (e.g., 'crispyx_de_nb_glm_joint')
+        Internal method name (e.g., 'crispyx_de_nb_glm_joint' or 'crispyx_de_nb_glm_shrunk')
         
     Returns
     -------
     str
-        Display name with package prefix and lfcShrink suffix if applicable
+        Display name with package prefix and (lfcShrink) suffix if uses shrinkage
     """
-    # Handle shrunk PyDESeq2 first
+    # Handle shrunk method names (these have _shrunk suffix for heatmap purposes)
     if name == "pertpy_de_pydeseq2_shrunk":
         return "PyDESeq2 (lfcShrink)"
+    elif name == "crispyx_de_nb_glm_joint_shrunk":
+        return "crispyx NB-GLM (joint, lfcShrink)"
+    elif name == "crispyx_de_nb_glm_shrunk":
+        return "crispyx NB-GLM (lfcShrink)"
+    # Handle base method names
     elif name == "pertpy_de_pydeseq2":
         return "PyDESeq2"
     elif name == "crispyx_de_nb_glm_joint":
-        return "crispyx NB-GLM (lfcShrink)"
+        return "crispyx NB-GLM (joint)"
     elif name == "crispyx_de_nb_glm":
         return "crispyx NB-GLM"
     elif name == "edger_de_glm":
         return "edgeR NB-GLM"
+    elif name == "crispyx_de_t_test":
+        return "crispyx t-test"
+    elif name == "scanpy_de_t_test":
+        return "scanpy t-test"
+    elif name == "crispyx_de_wilcoxon":
+        return "crispyx Wilcoxon"
+    elif name == "scanpy_de_wilcoxon":
+        return "scanpy Wilcoxon"
     
     # Generic formatting for other methods
     display_name = name.replace("crispyx_", "crispyx ").replace("scanpy_", "scanpy ")
     display_name = display_name.replace("pertpy_", "pertpy ").replace("edger_", "edgeR ")
     display_name = display_name.replace("de_", "").replace("_", " ")
-    
-    # Check if method uses shrinkage
-    if name in LFCSHRINK_METHODS:
-        shrink_type = SHRINKAGE_METADATA.get(name, "")
-        if shrink_type:
-            display_name = f"{display_name} (lfcShrink)"
+    if uses_shrinkage:
+        display_name = f"{display_name}{shrink_suffix}"
     
     return display_name
 

@@ -19,6 +19,21 @@ from importlib import import_module
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Union
 
+# ============================================================================
+# Early Thread Configuration
+# ============================================================================
+# Set thread limits BEFORE importing any numerical libraries (numpy, numba, etc.)
+# This prevents Numba from initializing with os.cpu_count() threads and later
+# failing when we try to change NUMBA_NUM_THREADS.
+# Default to a reasonable value; will be overridden by config if available.
+if 'NUMBA_NUM_THREADS' not in os.environ:
+    # Use a conservative default that can be increased later
+    # Config-based n_cores will override this via set_thread_env_vars
+    _default_threads = str(min(os.cpu_count() or 8, 32))
+    os.environ['NUMBA_NUM_THREADS'] = _default_threads
+    os.environ.setdefault('OMP_NUM_THREADS', _default_threads)
+    os.environ.setdefault('MKL_NUM_THREADS', _default_threads)
+
 import numpy as np
 import pandas as pd
 import yaml
@@ -40,6 +55,13 @@ from .env_config import (
 )
 from .generate_demo_dataset import write_demo_dataset
 from .generate_results import evaluate_benchmarks
+from .memory import (
+    MemoryTracker,
+    get_peak_memory_bytes,
+    get_peak_memory_mb,
+    get_current_rss_bytes,
+    sample_subprocess_memory,
+)
 from crispyx.data import (
     read_backed,
     resolve_control_label,
@@ -56,6 +78,13 @@ from crispyx.qc import quality_control_summary
 
 
 # ============================================================================
+# Cache Version
+# ============================================================================
+# Increment this version when the cache format changes to force re-computation
+CACHE_VERSION = "1.0.0"
+
+
+# ============================================================================
 # Reference Method Runners
 # ============================================================================
 
@@ -68,15 +97,6 @@ from crispyx.data import (
     normalize_total_block,
 )
 from crispyx.de import _tie_correction
-
-
-def _get_peak_memory_bytes() -> float:
-    """Return the current process peak RSS in bytes."""
-
-    usage = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-    if sys.platform == "darwin":
-        return float(usage)
-    return float(usage) * 1024.0
 
 
 def _normalize_total(matrix: np.ndarray, target_sum: float = 1e4) -> tuple[np.ndarray, np.ndarray]:
@@ -133,216 +153,6 @@ def _filter_genes(matrix: np.ndarray, min_cells: int) -> np.ndarray:
     else:
         expressed = (matrix > 0).sum(axis=0)
     return expressed >= min_cells
-
-
-def _get_peak_memory_mb() -> float:
-    """Return the current process peak RSS in megabytes."""
-
-    return _get_peak_memory_bytes() / (1024.0 * 1024.0)
-
-
-def _peak_memory_delta_mb(baseline_bytes: float) -> float:
-    return max(0.0, (_get_peak_memory_bytes() - baseline_bytes) / (1024.0 * 1024.0))
-
-
-# Global flag to track if current RSS warning has been logged
-_CURRENT_RSS_WARNING_LOGGED = False
-
-
-def _get_current_rss_bytes() -> Optional[float]:
-    """Return the current process RSS in bytes (not peak).
-    
-    Platform-specific implementation:
-    - Linux: Reads /proc/self/statm (VmRSS field)
-    - macOS: Falls back to peak RSS (ru_maxrss) - not true current
-    - Windows: Attempts psutil if available
-    
-    Returns
-    -------
-    float | None
-        Current RSS in bytes, or None if unavailable
-        
-    Notes
-    -----
-    On macOS, this function returns peak RSS (same as _get_peak_memory_bytes())
-    because macOS lacks a direct API for current RSS without psutil.
-    A warning is logged once when this limitation is detected.
-    Users should install psutil for accurate average memory tracking on macOS.
-    """
-    global _CURRENT_RSS_WARNING_LOGGED
-    
-    if sys.platform.startswith('linux'):
-        # Linux: Read /proc/self/statm
-        # Format: size resident shared text lib data dt
-        # We want resident (field 2), which is in pages
-        try:
-            with open('/proc/self/statm', 'r') as f:
-                fields = f.readline().split()
-                if len(fields) >= 2:
-                    resident_pages = int(fields[1])
-                    page_size = resource.getpagesize()
-                    return float(resident_pages * page_size)
-        except (IOError, OSError, ValueError) as exc:
-            if not _CURRENT_RSS_WARNING_LOGGED:
-                print(f"Warning: Failed to read /proc/self/statm for current RSS: {exc}")
-                _CURRENT_RSS_WARNING_LOGGED = True
-            return None
-    
-    elif sys.platform == 'darwin':
-        # macOS: Try psutil if available for current RSS, else fall back to peak RSS
-        try:
-            import psutil
-            process = psutil.Process()
-            return float(process.memory_info().rss)
-        except ImportError:
-            if not _CURRENT_RSS_WARNING_LOGGED:
-                print("Warning: macOS does not support current RSS without psutil. "
-                      "Average memory will equal peak memory. Install psutil for accurate tracking.")
-                _CURRENT_RSS_WARNING_LOGGED = True
-            return _get_peak_memory_bytes()
-    
-    elif sys.platform == 'win32':
-        # Windows: Try psutil if available
-        try:
-            import psutil
-            process = psutil.Process()
-            return float(process.memory_info().rss)
-        except ImportError:
-            if not _CURRENT_RSS_WARNING_LOGGED:
-                print("Warning: psutil not available on Windows for current RSS. "
-                      "Average memory tracking unavailable.")
-                _CURRENT_RSS_WARNING_LOGGED = True
-            return None
-        except Exception as exc:
-            if not _CURRENT_RSS_WARNING_LOGGED:
-                print(f"Warning: Failed to get current RSS via psutil: {exc}")
-                _CURRENT_RSS_WARNING_LOGGED = True
-            return None
-    
-    # Unknown platform
-    if not _CURRENT_RSS_WARNING_LOGGED:
-        print(f"Warning: Platform {sys.platform} not supported for current RSS tracking.")
-        _CURRENT_RSS_WARNING_LOGGED = True
-    return None
-
-
-def _sample_subprocess_memory(
-    pid: int,
-    stop_event: threading.Event,
-    memory_samples: list,
-    sample_interval: float = 0.1
-) -> None:
-    """Background thread function to sample subprocess memory from parent process.
-    
-    Uses psutil to track memory of a subprocess, which works correctly for
-    spawned processes where getrusage resets the peak RSS counter.
-    Falls back to /proc/{pid}/statm on Linux if psutil is unavailable.
-    
-    Parameters
-    ----------
-    pid : int
-        Process ID of the subprocess to monitor
-    stop_event : threading.Event
-        Event to signal when to stop sampling
-    memory_samples : list
-        List to store memory samples in bytes (float)
-    sample_interval : float
-        Time interval between samples in seconds (default: 0.1)
-    """
-    proc = None
-    use_proc_fallback = False
-    
-    try:
-        import psutil
-        proc = psutil.Process(pid)
-    except ImportError:
-        # psutil not available, try /proc fallback on Linux
-        if sys.platform.startswith('linux'):
-            use_proc_fallback = True
-            print(
-                "Warning: psutil not installed. Using /proc fallback for memory tracking. "
-                "Install psutil for more accurate memory measurements: pip install psutil",
-                file=sys.stderr
-            )
-        else:
-            print(
-                "Warning: psutil not installed and no fallback available for this platform. "
-                "Memory tracking will be unavailable. Install psutil: pip install psutil",
-                file=sys.stderr
-            )
-            return
-    except Exception as e:
-        # psutil.NoSuchProcess or other errors
-        return
-    
-    while not stop_event.is_set():
-        try:
-            if use_proc_fallback:
-                # Read RSS from /proc/{pid}/statm (second field is RSS in pages)
-                statm_path = f'/proc/{pid}/statm'
-                try:
-                    with open(statm_path, 'r') as f:
-                        fields = f.read().split()
-                        if len(fields) >= 2:
-                            rss_pages = int(fields[1])
-                            page_size = os.sysconf('SC_PAGE_SIZE')
-                            memory_samples.append(float(rss_pages * page_size))
-                except (FileNotFoundError, ProcessLookupError):
-                    # Process terminated
-                    break
-            else:
-                mem_info = proc.memory_info()
-                memory_samples.append(float(mem_info.rss))
-        except Exception:
-            # Process terminated or access denied
-            break
-        time.sleep(sample_interval)
-
-
-def _sample_memory_continuously(
-    stop_event: threading.Event,
-    memory_samples: list,
-    sample_interval: float = 0.1
-) -> None:
-    """Background thread function to sample memory usage continuously.
-    
-    Samples current RSS (not peak) for accurate average memory calculation.
-    On platforms where current RSS is unavailable, samples will be None.
-    
-    Parameters
-    ----------
-    stop_event : threading.Event
-        Event to signal when to stop sampling
-    memory_samples : list
-        List to store memory samples in bytes (float or None)
-    sample_interval : float
-        Time interval between samples in seconds (default: 0.1)
-    """
-    while not stop_event.is_set():
-        current_rss_bytes = _get_current_rss_bytes()
-        memory_samples.append(current_rss_bytes)
-        time.sleep(sample_interval)
-
-
-def _track_memory_stats(baseline_bytes: float) -> tuple[float, float]:
-    """Start background memory tracking and return peak and average memory.
-    
-    Returns peak and average memory delta from baseline in MB.
-    This is a context manager approach - use with start/stop.
-    
-    Parameters
-    ----------
-    baseline_bytes : float
-        Baseline memory in bytes before execution
-        
-    Returns
-    -------
-    tuple[float, float]
-        (peak_memory_mb, avg_memory_mb) - both as delta from baseline
-    """
-    # This is a helper that will be used by reference methods
-    # Actual implementation is in the reference method functions
-    pass
 
 
 def _subprocess_worker(pipe, func, args, kwargs):  # type: ignore[override]
@@ -824,7 +634,7 @@ def run_pertpy_de(
     }
 
 
-def run_pydeseq2_shrunk(
+def run_pydeseq2_integrated(
     dataset_path: Path,
     *,
     perturbation_column: str,
@@ -832,14 +642,14 @@ def run_pydeseq2_shrunk(
     output_dir: Path,
     n_jobs: int | None = None,
 ) -> Dict[str, Any]:
-    """Run PyDESeq2 with apeGLM LFC shrinkage directly (not via pertpy).
+    """Run PyDESeq2 with base DE and apeGLM LFC shrinkage, saving both outputs.
     
     This function calls PyDESeq2 directly and applies apeGLM LFC shrinkage,
-    which pertpy doesn't expose. This is useful for comparing shrunken LFCs
-    between crispyx and PyDESeq2.
+    saving both non-shrunk and shrunk results for comparison.
     
     Returns timing breakdown with separate base_seconds (DE fitting) and 
     shrinkage_seconds (lfcShrink) components for detailed performance analysis.
+    Both result_path (base) and shrunk_result_path are returned.
     """
     import gc
     import io
@@ -865,7 +675,8 @@ def run_pydeseq2_shrunk(
     perturbations = [p for p in adata.obs[perturbation_column].unique() if p != control_label]
     
     t_process_start = time.perf_counter()
-    all_results = []
+    all_base_results = []
+    all_shrunk_results = []
     
     # Track timing for base DE and shrinkage separately
     total_base_seconds = 0.0
@@ -917,6 +728,16 @@ def run_pydeseq2_shrunk(
                 t_base_end = time.perf_counter()
                 total_base_seconds += (t_base_end - t_base_start)
                 
+                # Save base (non-shrunk) results before applying shrinkage
+                base_results_df = stat_res.results_df.copy()
+                base_results_df["log2FoldChange"] = -base_results_df["log2FoldChange"]
+                if "stat" in base_results_df.columns:
+                    base_results_df["stat"] = -base_results_df["stat"]
+                base_results_df["gene"] = base_results_df.index
+                base_results_df[perturbation_column] = pert
+                base_results_df = base_results_df.reset_index(drop=True)
+                all_base_results.append(base_results_df)
+                
                 # Apply apeGLM LFC shrinkage (timed separately)
                 t_shrink_start = time.perf_counter()
                 shrinkage_applied = False
@@ -938,21 +759,21 @@ def run_pydeseq2_shrunk(
                 t_shrink_end = time.perf_counter()
                 total_shrinkage_seconds += (t_shrink_end - t_shrink_start)
                 
-                # Extract results
-                results_df = stat_res.results_df.copy()
+                # Extract shrunk results
+                shrunk_results_df = stat_res.results_df.copy()
                 
                 # Negate LFC to get perturbation vs control (we computed control vs pert)
-                results_df["log2FoldChange"] = -results_df["log2FoldChange"]
+                shrunk_results_df["log2FoldChange"] = -shrunk_results_df["log2FoldChange"]
                 # Also negate the stat to match
-                if "stat" in results_df.columns:
-                    results_df["stat"] = -results_df["stat"]
+                if "stat" in shrunk_results_df.columns:
+                    shrunk_results_df["stat"] = -shrunk_results_df["stat"]
                 
-                results_df["gene"] = results_df.index
-                results_df[perturbation_column] = pert
-                results_df["shrinkage_applied"] = shrinkage_applied
-                results_df = results_df.reset_index(drop=True)
+                shrunk_results_df["gene"] = shrunk_results_df.index
+                shrunk_results_df[perturbation_column] = pert
+                shrunk_results_df["shrinkage_applied"] = shrinkage_applied
+                shrunk_results_df = shrunk_results_df.reset_index(drop=True)
                 
-                all_results.append(results_df)
+                all_shrunk_results.append(shrunk_results_df)
                 
             except Exception as e:
                 # Skip this perturbation if it fails
@@ -960,30 +781,36 @@ def run_pydeseq2_shrunk(
     
     t_process_end = time.perf_counter()
     
-    # Combine all results
-    if all_results:
-        df = pd.concat(all_results, ignore_index=True)
-        # Rename columns to match expected format
-        df = df.rename(columns={
-            "log2FoldChange": "log_fc",
-            "lfcSE": "log_fc_se", 
-            "stat": "statistic",
-            "pvalue": "pvalue",
-            "padj": "pvalue_adj",
-        })
-    else:
-        df = pd.DataFrame()
+    # Helper to format dataframe
+    def format_df(results_list):
+        if results_list:
+            df = pd.concat(results_list, ignore_index=True)
+            df = df.rename(columns={
+                "log2FoldChange": "log_fc",
+                "lfcSE": "log_fc_se", 
+                "stat": "statistic",
+                "pvalue": "pvalue",
+                "padj": "pvalue_adj",
+            })
+            return df
+        return pd.DataFrame()
     
-    # Save results
+    base_df = format_df(all_base_results)
+    shrunk_df = format_df(all_shrunk_results)
+    
+    # Save both results
     t_save_start = time.perf_counter()
-    output_path = output_dir / "pertpy_de_pydeseq2_shrunk.csv"
-    df.to_csv(output_path, index=False)
+    base_output_path = output_dir / "pertpy_de_pydeseq2.csv"
+    shrunk_output_path = output_dir / "pertpy_de_pydeseq2_shrunk.csv"
+    base_df.to_csv(base_output_path, index=False)
+    shrunk_df.to_csv(shrunk_output_path, index=False)
     t_save_end = time.perf_counter()
     
     gc.collect()
     
     return {
-        "result_path": str(output_path),
+        "result_path": str(base_output_path),
+        "shrunk_result_path": str(shrunk_output_path),
         "groups": len(perturbations),
         "import_seconds": t_load_start - t_func_start,
         "load_seconds": t_load_end - t_load_start,
@@ -991,6 +818,128 @@ def run_pydeseq2_shrunk(
         "base_seconds": total_base_seconds,
         "shrinkage_seconds": total_shrinkage_seconds,
         "save_seconds": t_save_end - t_save_start,
+    }
+
+
+def run_nb_glm_integrated(
+    path: Path,
+    *,
+    perturbation_column: str,
+    control_label: str,
+    output_dir: Path,
+    n_jobs: int | None = None,
+    joint: bool = False,
+    shrinkage_type: str = "apeglm",
+    size_factor_method: str = "deseq2",
+    scale_size_factors: bool = False,
+    gene_name_column: str | None = None,  # Accept but pass to nb_glm_test
+) -> Dict[str, Any]:
+    """Run NB-GLM followed by LFC shrinkage, saving both base and shrunk results.
+    
+    This function runs nb_glm_test and shrink_lfc in sequence, tracking timing
+    for each step separately. Both base and shrunk outputs are saved.
+    
+    Step-wise metrics are returned for detailed analysis:
+    - base_seconds, shrinkage_seconds
+    - result_path (base), shrunk_result_path
+    
+    Parameters
+    ----------
+    path
+        Path to input h5ad file
+    perturbation_column
+        Column name for perturbation labels
+    control_label
+        Label for control cells
+    output_dir
+        Directory for output files
+    n_jobs
+        Number of parallel jobs
+    joint
+        If True, use joint model fitting; if False, use independent fitting
+    shrinkage_type
+        Type of LFC shrinkage ("apeglm" or "normal")
+    size_factor_method
+        Method for size factor calculation
+    scale_size_factors
+        Whether to scale size factors
+    gene_name_column
+        Column name for gene names (passed to nb_glm_test)
+        
+    Returns
+    -------
+    Dict with step-wise metrics and both result paths
+    """
+    import time
+    from typing import Literal, cast
+    
+    # Determine base data name based on joint flag
+    base_data_name = "de_nb_glm_joint" if joint else "de_nb_glm"
+    shrunk_data_name = "de_nb_glm_joint_shrunk" if joint else "de_nb_glm_shrunk"
+    fit_method = "joint" if joint else "independent"
+    
+    # Cast string parameters to their literal types
+    size_factor_method_lit = cast(Literal["sparse", "deseq2"], size_factor_method)
+    shrinkage_type_lit = cast(Literal["normal", "apeglm"], shrinkage_type)
+    
+    # Step 1: Run NB-GLM base fitting
+    t_base_start = time.perf_counter()
+    base_result = nb_glm_test(
+        path=path,
+        perturbation_column=perturbation_column,
+        control_label=control_label,
+        output_dir=output_dir,
+        data_name=base_data_name,
+        n_jobs=n_jobs,
+        fit_method=fit_method,
+        lfc_shrinkage_type="none",  # No shrinkage in base step
+        size_factor_method=size_factor_method_lit,
+        scale_size_factors=scale_size_factors,
+        gene_name_column=gene_name_column,
+    )
+    t_base_end = time.perf_counter()
+    base_seconds = t_base_end - t_base_start
+    
+    # Get base result path
+    base_result_path = getattr(base_result, "result_path", None)
+    if base_result_path is None:
+        # Construct expected path
+        suffix = "_nb_glm" if joint else ""
+        base_result_path = output_dir / f"crispyx_{base_data_name}{suffix}.h5ad"
+    
+    # Step 2: Apply LFC shrinkage
+    t_shrink_start = time.perf_counter()
+    shrunk_result = shrink_lfc(
+        path=base_result_path,
+        shrinkage_type=shrinkage_type_lit,
+        output_dir=output_dir,
+        data_name=shrunk_data_name,
+    )
+    t_shrink_end = time.perf_counter()
+    shrinkage_seconds = t_shrink_end - t_shrink_start
+    
+    # Get shrunk output path from result
+    shrunk_result_path = getattr(shrunk_result, "result_path", None)
+    
+    # Get group/gene counts from base result (same for shrunk)
+    n_groups = len(list(base_result.keys())) if hasattr(base_result, "keys") else 0
+    n_genes = 0
+    if n_groups > 0:
+        first_key = list(base_result.keys())[0]
+        first_group = base_result[first_key]
+        if hasattr(first_group, "genes"):
+            n_genes = len(first_group.genes)
+    
+    return {
+        "result_path": str(base_result_path) if base_result_path else None,
+        "shrunk_result_path": str(shrunk_result_path) if shrunk_result_path else None,
+        "groups": n_groups,
+        "genes": n_genes,
+        # Step-wise metrics (for detailed analysis)
+        "base_seconds": base_seconds,
+        "shrinkage_seconds": shrinkage_seconds,
+        "joint": joint,
+        "shrinkage_type": shrinkage_type,
     }
 
 
@@ -1049,6 +998,8 @@ class BenchmarkConfig:
     skip_existing: bool = True  # Skip methods with existing output files
     environment_config: Optional[EnvironmentConfig] = None
     chunk_size: Optional[int] = None  # Override chunk size for all operations
+    use_docker: bool = False  # Run benchmarks inside Docker containers
+    docker_image: str = "crispyx-benchmark:latest"  # Docker image name
 
     @classmethod
     def from_dict(
@@ -1100,6 +1051,11 @@ class BenchmarkConfig:
         skip_existing = data.get("skip_existing", True)
         chunk_size = data.get("chunk_size")
 
+        # Parse docker configuration
+        docker_data = data.get("docker_config", {})
+        use_docker = docker_data.get("enabled", False) if docker_data else False
+        docker_image = docker_data.get("image", "crispyx-benchmark:latest") if docker_data else "crispyx-benchmark:latest"
+
         return cls(
             dataset_path=dataset_path,
             dataset_name=dataset_name,
@@ -1118,6 +1074,8 @@ class BenchmarkConfig:
             skip_existing=skip_existing,
             environment_config=environment_config,
             chunk_size=chunk_size,
+            use_docker=use_docker,
+            docker_image=docker_image,
         )
 
     @classmethod
@@ -1204,7 +1162,7 @@ def _get_expected_output_path(method_name: str, output_dir: Path, data_name: str
     preprocessing_dir = output_dir / "preprocessing"
     de_dir = output_dir / "de"
     
-    # CRISPYx methods with module prefix
+    # crispyx methods with module prefix
     if method_name == "crispyx_qc_filtered":
         return preprocessing_dir / "crispyx_qc_filtered.h5ad"
     elif method_name == "crispyx_pb_avg_log":
@@ -1217,12 +1175,8 @@ def _get_expected_output_path(method_name: str, output_dir: Path, data_name: str
         return de_dir / "crispyx_de_wilcoxon.h5ad"
     elif method_name == "crispyx_de_nb_glm":
         return de_dir / "crispyx_de_nb_glm.h5ad"
-    elif method_name == "crispyx_de_nb_glm_shrunk":
-        return de_dir / "crispyx_de_nb_glm_shrunk.h5ad"
     elif method_name == "crispyx_de_nb_glm_joint":
         return de_dir / "crispyx_de_nb_glm_joint_nb_glm.h5ad"  # resolve_output_path adds _nb_glm suffix
-    elif method_name == "crispyx_de_nb_glm_joint_shrunk":
-        return de_dir / "crispyx_de_nb_glm_joint_shrunk.h5ad"
     
     # Scanpy methods with module prefix
     elif method_name == "scanpy_qc_filtered":
@@ -1237,10 +1191,76 @@ def _get_expected_output_path(method_name: str, output_dir: Path, data_name: str
         return de_dir / "edger_de_glm.csv"
     elif method_name == "pertpy_de_pydeseq2":
         return de_dir / "pertpy_de_pydeseq2.csv"
-    elif method_name == "pertpy_de_pydeseq2_shrunk":
-        return de_dir / "pertpy_de_pydeseq2_shrunk.csv"
     
     return None
+
+
+def _is_scalar_na(value: Any) -> bool:
+    """Check if a value is NA/NaN, handling arrays properly.
+    
+    For arrays, returns False (arrays are not scalar NA values).
+    For scalars, returns True if NA/NaN/None.
+    """
+    # Handle None explicitly
+    if value is None:
+        return True
+    # Handle numpy arrays - they are not scalar NA
+    if isinstance(value, np.ndarray):
+        return False
+    # Handle pandas Series/DataFrame - not scalar NA
+    if hasattr(value, '__len__') and hasattr(value, 'dtype'):
+        return False
+    # Try pandas isna for scalars
+    try:
+        result = pd.isna(value)
+        # If result is a scalar bool, return it
+        if isinstance(result, (bool, np.bool_)):
+            return bool(result)
+        # If result is array-like, this wasn't a scalar - return False
+        return False
+    except (TypeError, ValueError):
+        return False
+
+
+def _make_json_serializable(value: Any) -> Any:
+    """Convert a value to a JSON-serializable type.
+    
+    Handles numpy arrays, numpy scalars, pandas types, Path objects, etc.
+    """
+    # Handle None
+    if value is None:
+        return None
+    
+    # Handle numpy arrays - convert to list
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    
+    # Handle numpy scalar types
+    if isinstance(value, (np.integer,)):
+        return int(value)
+    if isinstance(value, (np.floating,)):
+        return float(value)
+    if isinstance(value, (np.bool_,)):
+        return bool(value)
+    
+    # Handle Path objects
+    if isinstance(value, Path):
+        return str(value)
+    
+    # Handle pandas NA types
+    if pd.isna(value) if not hasattr(value, '__len__') else False:
+        return None
+    
+    # Handle lists recursively
+    if isinstance(value, list):
+        return [_make_json_serializable(v) for v in value]
+    
+    # Handle dicts recursively
+    if isinstance(value, dict):
+        return {k: _make_json_serializable(v) for k, v in value.items()}
+    
+    # Return as-is for standard JSON types (str, int, float, bool)
+    return value
 
 
 def _save_method_result(method_name: str, row_dict: Dict[str, Any], output_dir: Path) -> None:
@@ -1265,14 +1285,7 @@ def _save_method_result(method_name: str, row_dict: Dict[str, Any], output_dir: 
         # Convert non-serializable types to JSON-compatible formats
         serializable_dict = {}
         for key, value in row_dict.items():
-            if pd.isna(value):
-                serializable_dict[key] = None
-            elif isinstance(value, (np.integer, np.floating)):
-                serializable_dict[key] = float(value)
-            elif isinstance(value, (Path,)):
-                serializable_dict[key] = str(value)
-            else:
-                serializable_dict[key] = value
+            serializable_dict[key] = _make_json_serializable(value)
         
         # Atomic write: write to temp file, then rename
         with temp_file.open('w') as f:
@@ -1376,6 +1389,7 @@ def _save_cache_config(output_dir: Path, qc_params: Optional[Dict[str, Any]], st
     temp_file = cache_dir / ".config.json.tmp"
     
     config = {
+        "cache_version": CACHE_VERSION,
         "qc_params": qc_params,
         "standardized_dataset_path": standardized_path,
         "timestamp": time.time(),
@@ -1738,7 +1752,7 @@ def _anndata_to_de_dict_legacy(adata: Any) -> Dict[str, Any]:
     
     result_dict = {}
     
-    # CRISPYx stores results in layers: logfoldchange, statistic, pvalue
+    # crispyx stores results in layers: logfoldchange, statistic, pvalue
     # with obs representing perturbations
     if "logfoldchange" in adata.layers and "pvalue" in adata.layers:
         perturbations = adata.obs["perturbation"].tolist()
@@ -2387,12 +2401,12 @@ def _generate_improved_markdown(
             md += "\n\n"
     
     # =========================================================================
-    # Section 2: Performance Comparison (CRISPYx as baseline)
+    # Section 2: Performance Comparison (crispyx as baseline)
     # =========================================================================
     md += "## 2. Performance Comparison\n\n"
     
     if perf_comp_results:
-        # Separate CRISPYx comparisons from other comparisons
+        # Separate crispyx comparisons from other comparisons
         crispyx_comps = []
         other_comps = []
         
@@ -2404,10 +2418,10 @@ def _generate_improved_markdown(
             else:
                 other_comps.append(comp)
         
-        # Section 2a: CRISPYx as baseline
+        # Section 2a: crispyx as baseline
         if crispyx_comps:
-            md += "### CRISPYx vs Reference Tools\n\n"
-            md += "_CRISPYx as baseline. Negative values = CRISPYx is faster/uses less memory._\n\n"
+            md += "### crispyx vs Reference Tools\n\n"
+            md += "_crispyx as baseline. Negative values = crispyx is faster/uses less memory._\n\n"
             
             # Group by category
             comp_by_category: Dict[str, List[Dict[str, Any]]] = {}
@@ -2469,7 +2483,7 @@ def _generate_improved_markdown(
                 time_diff = comp.get("time_diff_s")
                 mem_diff = comp.get("mem_diff_mb")
                 
-                # For non-CRISPYx comparisons, interpret: method_a is the one we want to be faster
+                # For non-crispyx comparisons, interpret: method_a is the one we want to be faster
                 time_emoji = _get_performance_emoji(time_pct, is_lower_better=True)
                 mem_emoji = _get_performance_emoji(mem_pct, is_lower_better=True)
                 
@@ -2496,7 +2510,7 @@ def _generate_improved_markdown(
     md += "_Correlation metrics between crispyx and reference methods. ✅ >0.95, ⚠️ 0.8-0.95, ❌ <0.8_\n\n"
     
     if accuracy_results:
-        # Separate CRISPYx comparisons from other comparisons
+        # Separate crispyx comparisons from other comparisons
         crispyx_accs = []
         other_accs = []
         
@@ -2508,7 +2522,7 @@ def _generate_improved_markdown(
             else:
                 other_accs.append(acc)
         
-        # Section 3a: CRISPYx accuracy comparisons
+        # Section 3a: crispyx accuracy comparisons
         if crispyx_accs:
             # Group by category
             acc_by_category: Dict[str, List[Dict[str, Any]]] = {}
@@ -2786,19 +2800,23 @@ def _evaluate_benchmarks_legacy(output_dir: Path) -> None:
     
     # Define comparisons
     # Format: (method_a, method_b, comparison_type)
+    # For de_lfcshrink comparisons, the code will automatically use shrunk_result_path
+    # instead of result_path for methods that have integrated shrinkage
     comparisons = [
         # QC
         ("crispyx_qc_filtered", "scanpy_qc_filtered", "qc"),
-        # DE GLM - independent vs external tools
+        # DE GLM - independent vs external tools (base LFCs)
         ("crispyx_de_nb_glm", "edger_de_glm", "de"),
         ("crispyx_de_nb_glm", "pertpy_de_pydeseq2", "de"),
-        # DE GLM - joint vs independent (internal comparison)
+        # DE GLM - independent shrunk vs PyDESeq2 shrunk (uses shrunk_result_path)
+        ("crispyx_de_nb_glm", "pertpy_de_pydeseq2", "de_lfcshrink"),
+        # DE GLM - joint vs independent (internal comparison, base LFCs)
         ("crispyx_de_nb_glm_joint", "crispyx_de_nb_glm", "de"),
-        # DE GLM - joint vs external tools
+        # DE GLM - joint vs external tools (base LFCs)
         ("crispyx_de_nb_glm_joint", "edger_de_glm", "de"),
         ("crispyx_de_nb_glm_joint", "pertpy_de_pydeseq2", "de_raw"),  # Raw LFC comparison (standard)
-        # DE GLM - joint vs PyDESeq2 with lfcShrink applied
-        ("crispyx_de_nb_glm_joint", "pertpy_de_pydeseq2_shrunk", "de_lfcshrink"),
+        # DE GLM - joint shrunk vs PyDESeq2 shrunk (uses shrunk_result_path)
+        ("crispyx_de_nb_glm_joint", "pertpy_de_pydeseq2", "de_lfcshrink"),
         # DE GLM - external tool comparison
         ("edger_de_glm", "pertpy_de_pydeseq2", "de"),
         # DE Tests
@@ -2845,6 +2863,53 @@ def _evaluate_benchmarks_legacy(output_dir: Path) -> None:
             print(f"Warning: Could not load DE result for {method_name}: {e}")
             return None
     
+    # Explicitly collect DE methods (base and shrunk) for heatmaps
+    de_methods = [
+        "crispyx_de_t_test", "scanpy_de_t_test",
+        "crispyx_de_wilcoxon", "scanpy_de_wilcoxon",
+        "crispyx_de_nb_glm", "crispyx_de_nb_glm_joint", "edger_de_glm", "pertpy_de_pydeseq2",
+    ]
+    methods_with_shrunk = ["crispyx_de_nb_glm", "crispyx_de_nb_glm_joint", "pertpy_de_pydeseq2"]
+    
+    for method_name in de_methods:
+        method_res = df[df["method"] == method_name]
+        if method_res.empty or method_res.iloc[0]["status"] != "success":
+            continue
+        # Load base result
+        result_path_val = method_res.iloc[0].get("result_path")
+        if method_name not in de_results_for_heatmaps and not pd.isna(result_path_val):
+            method_df = _load_de_result(method_name, result_path_val)
+            if method_df is not None:
+                de_results_for_heatmaps[method_name] = method_df
+        # Load shrunk result if available
+        if method_name in methods_with_shrunk:
+            shrunk_path_val = method_res.iloc[0].get("shrunk_result_path")
+            shrunk_method_name = f"{method_name}_shrunk"
+            if shrunk_method_name not in de_results_for_heatmaps and not pd.isna(shrunk_path_val):
+                # Handle paths that may be relative to project root or to output_dir
+                shrunk_path_str = str(shrunk_path_val)
+                if shrunk_path_str.startswith("/"):
+                    shrunk_path = Path(shrunk_path_str)
+                elif shrunk_path_str.startswith("benchmarking/"):
+                    # Path from project root
+                    shrunk_path = Path(shrunk_path_str)
+                else:
+                    shrunk_path = output_dir / shrunk_path_str
+                if shrunk_path.exists():
+                    try:
+                        if str(shrunk_path).endswith('.h5ad'):
+                            import anndata as ad
+                            adata = ad.read_h5ad(str(shrunk_path))
+                            result_dict = _anndata_to_de_dict(adata)
+                            shrunk_df = _streaming_de_to_frame(result_dict)
+                        else:
+                            shrunk_df = pd.read_csv(shrunk_path)
+                            shrunk_df = _standardise_de_dataframe(shrunk_df)
+                        if shrunk_df is not None:
+                            de_results_for_heatmaps[shrunk_method_name] = shrunk_df
+                    except Exception as e:
+                        print(f"Warning: Could not load shrunk DE result for {shrunk_method_name}: {e}")
+    
     for method_a_name, method_b_name, comp_type in comparisons:
         # Check if both exist and succeeded
         method_a_res = df[df["method"] == method_a_name]
@@ -2880,8 +2945,18 @@ def _evaluate_benchmarks_legacy(output_dir: Path) -> None:
         
         # Load result files
         try:
-            method_a_path_val = method_a_res.iloc[0]["result_path"]
-            method_b_path_val = method_b_res.iloc[0]["result_path"]
+            # For de_lfcshrink comparisons, use shrunk_result_path if available
+            if comp_type == "de_lfcshrink":
+                method_a_path_val = method_a_res.iloc[0].get("shrunk_result_path", method_a_res.iloc[0]["result_path"])
+                method_b_path_val = method_b_res.iloc[0].get("shrunk_result_path", method_b_res.iloc[0]["result_path"])
+                # Handle case where shrunk_result_path is NaN - fall back to result_path
+                if pd.isna(method_a_path_val):
+                    method_a_path_val = method_a_res.iloc[0]["result_path"]
+                if pd.isna(method_b_path_val):
+                    method_b_path_val = method_b_res.iloc[0]["result_path"]
+            else:
+                method_a_path_val = method_a_res.iloc[0]["result_path"]
+                method_b_path_val = method_b_res.iloc[0]["result_path"]
             
             if pd.isna(method_a_path_val) or pd.isna(method_b_path_val):
                 print(f"Skipping comparison {method_a_name} vs {method_b_name}: missing result path")
@@ -3139,6 +3214,390 @@ def _is_cgroups_available() -> bool:
     return _CGROUPS_AVAILABLE
 
 
+# ============================================================================
+# Docker-based Execution
+# ============================================================================
+
+# Cache Docker availability check
+_DOCKER_AVAILABLE: bool | None = None
+
+
+def _check_docker_available() -> bool:
+    """Check if Docker is available and the benchmark image exists.
+    
+    Returns True if docker command works and crispyx-benchmark image exists.
+    """
+    try:
+        # Check if docker command exists
+        result = subprocess.run(
+            ["docker", "--version"],
+            capture_output=True,
+            timeout=5,
+        )
+        if result.returncode != 0:
+            return False
+        
+        # Check if docker daemon is running
+        result = subprocess.run(
+            ["docker", "info"],
+            capture_output=True,
+            timeout=10,
+        )
+        return result.returncode == 0
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return False
+
+
+def _is_docker_available() -> bool:
+    """Check Docker availability with caching."""
+    global _DOCKER_AVAILABLE
+    if _DOCKER_AVAILABLE is None:
+        _DOCKER_AVAILABLE = _check_docker_available()
+    return _DOCKER_AVAILABLE
+
+
+def _docker_image_exists(image_name: str = "crispyx-benchmark:latest") -> bool:
+    """Check if the Docker image exists locally."""
+    try:
+        result = subprocess.run(
+            ["docker", "image", "inspect", image_name],
+            capture_output=True,
+            timeout=10,
+        )
+        return result.returncode == 0
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return False
+
+
+def _build_docker_image(
+    dockerfile_path: Path | None = None,
+    image_name: str = "crispyx-benchmark:latest",
+    quiet: bool = False,
+) -> bool:
+    """Build the Docker benchmark image.
+    
+    Parameters
+    ----------
+    dockerfile_path : Path | None
+        Path to Dockerfile. If None, uses benchmarking/Dockerfile.
+    image_name : str
+        Name and tag for the image.
+    quiet : bool
+        If True, suppress build output.
+    
+    Returns
+    -------
+    bool
+        True if build succeeded, False otherwise.
+    """
+    if dockerfile_path is None:
+        dockerfile_path = REPO_ROOT / "benchmarking" / "Dockerfile"
+    
+    context_path = dockerfile_path.parent.parent  # Repository root
+    
+    cmd = [
+        "docker", "build",
+        "-t", image_name,
+        "-f", str(dockerfile_path),
+        str(context_path),
+    ]
+    
+    if not quiet:
+        print(f"Building Docker image: {image_name}")
+        print(f"  Dockerfile: {dockerfile_path}")
+        print(f"  Context: {context_path}")
+    
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=quiet,
+            timeout=1800,  # 30 minutes timeout for build
+        )
+        if result.returncode == 0:
+            if not quiet:
+                print(f"  ✓ Image built successfully: {image_name}")
+            return True
+        else:
+            if not quiet:
+                print(f"  ✗ Image build failed")
+                if result.stderr:
+                    print(result.stderr.decode()[-500:])
+            return False
+    except subprocess.TimeoutExpired:
+        if not quiet:
+            print("  ✗ Image build timed out (30 minutes)")
+        return False
+    except Exception as e:
+        if not quiet:
+            print(f"  ✗ Image build error: {e}")
+        return False
+
+
+class DockerRunner:
+    """Execute benchmark methods inside Docker containers with memory limits.
+    
+    This class provides reliable cross-platform memory limiting by running
+    benchmark methods inside Docker containers with --memory limits.
+    
+    Parameters
+    ----------
+    image_name : str
+        Docker image name and tag.
+    memory_limit_gb : float
+        Memory limit in gigabytes.
+    n_cores : int
+        Number of CPU cores to use.
+    workspace_root : Path
+        Path to the workspace root (for volume mounts).
+    quiet : bool
+        If True, suppress verbose output.
+    """
+    
+    def __init__(
+        self,
+        image_name: str = "crispyx-benchmark:latest",
+        memory_limit_gb: float = 64.0,
+        n_cores: int = 8,
+        workspace_root: Path | None = None,
+        quiet: bool = False,
+    ):
+        self.image_name = image_name
+        self.memory_limit_gb = memory_limit_gb
+        self.n_cores = n_cores
+        self.workspace_root = workspace_root or REPO_ROOT.parent
+        self.quiet = quiet
+        
+        # Validate Docker is available
+        if not _is_docker_available():
+            raise RuntimeError(
+                "Docker is not available. Please install Docker or use native execution."
+            )
+    
+    def _get_function_info(self, method: BenchmarkMethod) -> Dict[str, str]:
+        """Extract function module and name from a BenchmarkMethod."""
+        func = method.function
+        module_name = func.__module__
+        func_name = func.__name__
+        
+        # Handle __main__ case - replace with actual module path
+        if module_name == "__main__":
+            module_name = "benchmarking.tools.run_benchmarks"
+        
+        return {"function_module": module_name, "function_name": func_name}
+    
+    def _convert_paths_to_container(self, kwargs: Dict[str, Any]) -> Dict[str, Any]:
+        """Convert host paths in kwargs to container paths."""
+        result = {}
+        for key, value in kwargs.items():
+            if isinstance(value, Path):
+                # Convert to container path
+                try:
+                    relative = value.relative_to(self.workspace_root)
+                    result[key] = f"/workspace/{relative}"
+                except ValueError:
+                    # Path not under workspace, use as-is
+                    result[key] = str(value)
+            else:
+                result[key] = value
+        return result
+    
+    def _normalize_container_paths(self, output: Dict[str, Any]) -> Dict[str, Any]:
+        """Convert container paths back to host-relative paths.
+        
+        Paths returned from Docker containers use /workspace/ prefix.
+        This method strips the prefix to make paths relative to workspace root.
+        
+        Parameters
+        ----------
+        output : Dict[str, Any]
+            Output dictionary from Docker worker
+            
+        Returns
+        -------
+        Dict[str, Any]
+            Output with normalized paths
+        """
+        result = output.copy()
+        
+        # Normalize paths in summary dict
+        if "summary" in result and isinstance(result["summary"], dict):
+            summary = result["summary"].copy()
+            for key in ["result_path"]:
+                if key in summary and isinstance(summary[key], str):
+                    path = summary[key]
+                    # Strip /workspace/ prefix if present
+                    if path.startswith("/workspace/"):
+                        summary[key] = path[len("/workspace/"):]
+            result["summary"] = summary
+        
+        # Also check top-level result_path
+        if "result_path" in result and isinstance(result["result_path"], str):
+            path = result["result_path"]
+            if path.startswith("/workspace/"):
+                result["result_path"] = path[len("/workspace/"):]
+        
+        return result
+    
+    def run(
+        self,
+        method: BenchmarkMethod,
+        context: Dict[str, Any],
+        time_limit: int | None = None,
+    ) -> Dict[str, Any]:
+        """Run a benchmark method inside a Docker container.
+        
+        Parameters
+        ----------
+        method : BenchmarkMethod
+            The benchmark method to run.
+        context : Dict[str, Any]
+            Context dictionary with dataset info.
+        time_limit : int | None
+            Time limit in seconds (None = no limit).
+        
+        Returns
+        -------
+        Dict[str, Any]
+            Result dictionary with status, timing, memory, etc.
+        """
+        import tempfile
+        import uuid
+        
+        # Create temporary directory for IPC
+        run_id = str(uuid.uuid4())[:8]
+        temp_dir = Path(tempfile.mkdtemp(prefix=f"crispyx_docker_{run_id}_"))
+        
+        try:
+            # Prepare input configuration
+            func_info = self._get_function_info(method)
+            container_kwargs = self._convert_paths_to_container(method.kwargs)
+            
+            input_config = {
+                "method_name": method.name,
+                "function_module": func_info["function_module"],
+                "function_name": func_info["function_name"],
+                "kwargs": container_kwargs,
+                "context": context,
+                "n_threads": self.n_cores,
+            }
+            
+            # Write input JSON
+            input_file = temp_dir / "input.json"
+            with open(input_file, 'w') as f:
+                json.dump(input_config, f, indent=2, default=str)
+            
+            output_file = temp_dir / "output.json"
+            
+            # Build docker run command
+            memory_bytes = int(self.memory_limit_gb * 1024 * 1024 * 1024)
+            
+            cmd = [
+                "docker", "run", "--rm",
+                f"--memory={memory_bytes}",
+                "--memory-swap=-1",  # Disable swap to enforce memory limit
+                f"--cpus={self.n_cores}",
+                # Mount workspace
+                "-v", f"{self.workspace_root}:/workspace:rw",
+                # Mount temp directory for IPC
+                "-v", f"{temp_dir}:/ipc:rw",
+                # Environment variables
+                "-e", f"NUMBA_NUM_THREADS={self.n_cores}",
+                "-e", f"OMP_NUM_THREADS={self.n_cores}",
+                "-e", f"MKL_NUM_THREADS={self.n_cores}",
+                # Working directory
+                "-w", "/workspace",
+                # Image
+                self.image_name,
+                # Worker arguments
+                "--input", "/ipc/input.json",
+                "--output", "/ipc/output.json",
+            ]
+            
+            if not self.quiet:
+                print(f"  🐳 Running {method.name} in Docker container...")
+            
+            # Run container
+            start_time = time.perf_counter()
+            
+            try:
+                timeout = time_limit + 60 if time_limit else None  # Add buffer for container startup
+                result = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    timeout=timeout,
+                )
+                elapsed = time.perf_counter() - start_time
+                
+                # Read output
+                if output_file.exists():
+                    with open(output_file, 'r') as f:
+                        output = json.load(f)
+                    
+                    # Normalize container paths to host-relative paths
+                    output = self._normalize_container_paths(output)
+                    
+                    # Add elapsed time from parent (includes container overhead)
+                    output["elapsed_seconds"] = elapsed
+                    output["container_overhead_seconds"] = elapsed - (output.get("elapsed_seconds", elapsed) or elapsed)
+                    
+                    return output
+                else:
+                    # Container failed before writing output
+                    error_msg = result.stderr.decode() if result.stderr else "Unknown error"
+                    if result.returncode == 137:
+                        return {
+                            "method": method.name,
+                            "status": "memory_limit",
+                            "elapsed_seconds": elapsed,
+                            "error": f"Container killed (OOM): {error_msg[-500:]}",
+                        }
+                    else:
+                        return {
+                            "method": method.name,
+                            "status": "error",
+                            "elapsed_seconds": elapsed,
+                            "error": f"Container failed (exit {result.returncode}): {error_msg[-500:]}",
+                        }
+                        
+            except subprocess.TimeoutExpired:
+                elapsed = time.perf_counter() - start_time
+                # Kill container if still running
+                subprocess.run(["docker", "kill", f"crispyx_{run_id}"], capture_output=True)
+                return {
+                    "method": method.name,
+                    "status": "timeout",
+                    "elapsed_seconds": elapsed,
+                    "error": f"Container timed out after {time_limit}s",
+                }
+                
+        finally:
+            # Cleanup temp directory
+            import shutil
+            try:
+                shutil.rmtree(temp_dir)
+            except Exception:
+                pass
+    
+    def ensure_image(self) -> bool:
+        """Ensure the Docker image exists, building if necessary.
+        
+        Returns
+        -------
+        bool
+            True if image is available, False otherwise.
+        """
+        if _docker_image_exists(self.image_name):
+            if not self.quiet:
+                print(f"  ✓ Docker image available: {self.image_name}")
+            return True
+        
+        if not self.quiet:
+            print(f"  ⚠ Docker image not found: {self.image_name}")
+            print("  Building image (this may take several minutes)...")
+        
+        return _build_docker_image(quiet=self.quiet)
+
+
 def _worker(
     queue: mp.Queue,
     method: BenchmarkMethod,
@@ -3225,35 +3684,23 @@ def _worker(
         _apply_resource_limit(memory_limit, resource.RLIMIT_AS, "virtual memory")
     _apply_resource_limit(time_limit, resource.RLIMIT_CPU, "CPU time")
 
-    # Start background memory sampling thread for average memory calculation
-    stop_event = threading.Event()
-    memory_samples = []
-    memory_thread = threading.Thread(
-        target=_sample_memory_continuously,
-        args=(stop_event, memory_samples, 0.1),
-        daemon=True
-    )
-    memory_thread.start()
+    # Use MemoryTracker for memory measurement
+    tracker = MemoryTracker(sample_interval=0.1)
+    tracker.start()
     
     start = time.perf_counter()
     try:
         result = method.function(**method.kwargs)
         elapsed = time.perf_counter() - start
         
-        # Stop memory sampling
-        stop_event.set()
-        memory_thread.join(timeout=1.0)
+        # Stop memory tracking
+        tracker.stop()
         
         # Use absolute peak memory (total RSS, not delta)
-        peak_memory_mb = _get_peak_memory_bytes() / (1024.0 * 1024.0)
+        peak_memory_mb = tracker.get_peak_absolute_mb()
         
         # Calculate average memory from samples (absolute values)
-        avg_memory_mb = None
-        if memory_samples:
-            # Filter out None values
-            valid_samples = [s for s in memory_samples if s is not None]
-            if valid_samples:
-                avg_memory_mb = np.mean(valid_samples) / (1024.0 * 1024.0)
+        avg_memory_mb = tracker.get_average_absolute_mb()
         
         summary = method.summary(result, context)
         queue.put(
@@ -3266,9 +3713,11 @@ def _worker(
             }
         )
     except MemoryError as exc:
-        # Stop memory sampling
-        stop_event.set()
-        memory_thread.join(timeout=1.0)
+        # Stop memory tracking
+        try:
+            tracker.stop()
+        except RuntimeError:
+            pass  # Already stopped or never started
         
         elapsed = time.perf_counter() - start
         queue.put(
@@ -3281,9 +3730,11 @@ def _worker(
             }
         )
     except Exception as exc:  # pragma: no cover - defensive reporting
-        # Stop memory sampling
-        stop_event.set()
-        memory_thread.join(timeout=1.0)
+        # Stop memory tracking
+        try:
+            tracker.stop()
+        except RuntimeError:
+            pass  # Already stopped or never started
         
         elapsed = time.perf_counter() - start
         queue.put(
@@ -3316,7 +3767,13 @@ def _run_with_limits(
     context: Dict[str, Any],
     memory_limit: int | None,
     time_limit: int | None,
+    use_docker: bool = False,
+    docker_runner: Optional[DockerRunner] = None,
 ) -> Dict[str, Any]:
+    # If Docker mode is enabled, use DockerRunner
+    if use_docker and docker_runner is not None:
+        return docker_runner.run(method, context, time_limit)
+    
     # Extract n_jobs/n_cores from method kwargs to set thread limits
     n_threads = method.kwargs.get('n_jobs') or method.kwargs.get('n_cores') or 1
     if n_threads is None or n_threads <= 0:
@@ -3332,35 +3789,23 @@ def _run_with_limits(
     if 'edger_direct' in method.name.lower():
         set_thread_env_vars(n_threads)
         
-        # Start background memory sampling thread for average memory calculation
-        stop_event = threading.Event()
-        memory_samples = []
-        memory_thread = threading.Thread(
-            target=_sample_memory_continuously,
-            args=(stop_event, memory_samples, 0.1),
-            daemon=True
-        )
-        memory_thread.start()
+        # Use MemoryTracker for memory measurement
+        tracker = MemoryTracker(sample_interval=0.1)
+        tracker.start()
         
         start = time.perf_counter()
         try:
             result = method.function(**method.kwargs)
             elapsed = time.perf_counter() - start
             
-            # Stop memory sampling
-            stop_event.set()
-            memory_thread.join(timeout=1.0)
+            # Stop memory tracking
+            tracker.stop()
             
             # Use absolute peak memory (total RSS)
-            peak_memory_mb = _get_peak_memory_bytes() / (1024.0 * 1024.0)
+            peak_memory_mb = tracker.get_peak_absolute_mb()
             
             # Calculate average memory from samples (absolute values)
-            avg_memory_mb = None
-            if memory_samples:
-                # Filter out None values
-                valid_samples = [s for s in memory_samples if s is not None]
-                if valid_samples:
-                    avg_memory_mb = np.mean(valid_samples) / (1024.0 * 1024.0)
+            avg_memory_mb = tracker.get_average_absolute_mb()
             
             summary = method.summary(result, context)
             return {
@@ -3371,18 +3816,15 @@ def _run_with_limits(
                 "summary": summary,
             }
         except Exception as exc:
-            # Stop memory sampling
-            stop_event.set()
-            memory_thread.join(timeout=1.0)
+            # Stop memory tracking
+            try:
+                tracker.stop()
+            except RuntimeError:
+                pass  # Already stopped or never started
             
             elapsed = time.perf_counter() - start
             
-            avg_memory_mb = None
-            if memory_samples:
-                # Filter out None values and convert to MB
-                valid_samples = [s for s in memory_samples if s is not None]
-                if valid_samples:
-                    avg_memory_mb = np.mean(valid_samples) / (1024.0 * 1024.0)
+            avg_memory_mb = tracker.get_average_absolute_mb()
             
             return {
                 "status": "error",
@@ -3393,9 +3835,14 @@ def _run_with_limits(
                 "traceback": traceback.format_exc(),
             }
     
-    # Use spawn context for R/rpy2 compatibility and to avoid OpenMP fork issues
-    # triggered by some scanpy workflows.
-    needs_spawn = 'pertpy' in method.name.lower() or 'scanpy' in method.name.lower()
+    # Use spawn context for R/rpy2 compatibility, to avoid OpenMP fork issues
+    # triggered by some scanpy workflows, AND for crispyx NB-GLM methods that
+    # use Numba (forking inherits the parent's already-initialized Numba threads).
+    needs_spawn = (
+        'pertpy' in method.name.lower() 
+        or 'scanpy' in method.name.lower()
+        or 'nb_glm' in method.name.lower()  # Numba-based methods need spawn
+    )
     mp_context = mp.get_context('spawn') if needs_spawn else mp
     
     # Track wall-clock time at parent process level for accuracy
@@ -3416,7 +3863,7 @@ def _run_with_limits(
     parent_memory_thread = None
     if needs_spawn and process.pid:
         parent_memory_thread = threading.Thread(
-            target=_sample_subprocess_memory,
+            target=sample_subprocess_memory,
             args=(process.pid, parent_stop_event, parent_memory_samples, 0.1),
             daemon=True
         )
@@ -3659,63 +4106,35 @@ def create_benchmark_suite(
         ),
         "crispyx_de_nb_glm": BenchmarkMethod(
             name="crispyx_de_nb_glm",
-            description="Negative binomial GLM differential expression (independent, no shrinkage)",
-            function=nb_glm_test,
+            description="NB-GLM (independent) with base + apeGLM shrinkage",
+            function=run_nb_glm_integrated,
             kwargs={
                 "path": dataset_path,
                 **shared_kwargs,
                 "output_dir": de_dir,
-                "data_name": "de_nb_glm",
                 "n_jobs": n_cores,
-                "fit_method": "independent",
-                "lfc_shrinkage_type": "none",  # No shrinkage - base method
-                "size_factor_method": "deseq2",  # Use DESeq2-style size factors for better PyDESeq2 alignment
-                "scale_size_factors": False,  # Match PyDESeq2's unscaled behavior
-            },
-            summary=_summarise_de_mapping,
-        ),
-        "crispyx_de_nb_glm_shrunk": BenchmarkMethod(
-            name="crispyx_de_nb_glm_shrunk",
-            description="LFC shrinkage on independent NB-GLM results (apeglm)",
-            function=shrink_lfc,
-            kwargs={
-                "path": de_dir / "crispyx_de_nb_glm.h5ad",  # Input from base method
+                "joint": False,
                 "shrinkage_type": "apeglm",
-                "output_dir": de_dir,
-                "data_name": "de_nb_glm_shrunk",
+                "size_factor_method": "deseq2",
+                "scale_size_factors": False,
             },
-            summary=_summarise_de_mapping,
-            depends_on="crispyx_de_nb_glm",
+            summary=_summarise_runner_result,
         ),
         "crispyx_de_nb_glm_joint": BenchmarkMethod(
             name="crispyx_de_nb_glm_joint",
-            description="Negative binomial GLM differential expression (joint model, no shrinkage)",
-            function=nb_glm_test,
+            description="NB-GLM (joint) with base + apeGLM shrinkage",
+            function=run_nb_glm_integrated,
             kwargs={
                 "path": dataset_path,
                 **shared_kwargs,
                 "output_dir": de_dir,
-                "data_name": "de_nb_glm_joint",
                 "n_jobs": n_cores,
-                "fit_method": "joint",
-                "lfc_shrinkage_type": "none",  # No shrinkage - base method
-                "size_factor_method": "deseq2",  # Use DESeq2-style size factors for better PyDESeq2 alignment
-                "scale_size_factors": False,  # Match PyDESeq2's unscaled behavior
-            },
-            summary=_summarise_de_mapping,
-        ),
-        "crispyx_de_nb_glm_joint_shrunk": BenchmarkMethod(
-            name="crispyx_de_nb_glm_joint_shrunk",
-            description="LFC shrinkage on joint NB-GLM results (apeglm)",
-            function=shrink_lfc,
-            kwargs={
-                "path": de_dir / "crispyx_de_nb_glm_joint_nb_glm.h5ad",  # Input from base method (resolve_output_path adds _nb_glm suffix)
+                "joint": True,
                 "shrinkage_type": "apeglm",
-                "output_dir": de_dir,
-                "data_name": "de_nb_glm_joint_shrunk",
+                "size_factor_method": "deseq2",
+                "scale_size_factors": False,
             },
-            summary=_summarise_de_mapping,
-            depends_on="crispyx_de_nb_glm_joint",
+            summary=_summarise_runner_result,
         ),
         "scanpy_qc_filtered": BenchmarkMethod(
             name="scanpy_qc_filtered",
@@ -3774,22 +4193,8 @@ def create_benchmark_suite(
         ),
         "pertpy_de_pydeseq2": BenchmarkMethod(
             name="pertpy_de_pydeseq2",
-            description="Differential expression using Pertpy (PyDESeq2)",
-            function=run_pertpy_de,
-            kwargs={
-                "dataset_path": dataset_path,
-                "perturbation_column": shared_kwargs["perturbation_column"],
-                "control_label": shared_kwargs["control_label"],
-                "backend": "pydeseq2",
-                "output_dir": de_dir,
-                "n_jobs": n_cores,
-            },
-            summary=_summarise_runner_result,
-        ),
-        "pertpy_de_pydeseq2_shrunk": BenchmarkMethod(
-            name="pertpy_de_pydeseq2_shrunk",
-            description="Differential expression using PyDESeq2 with apeGLM LFC shrinkage",
-            function=run_pydeseq2_shrunk,
+            description="PyDESeq2 with base + apeGLM shrinkage",
+            function=run_pydeseq2_integrated,
             kwargs={
                 "dataset_path": dataset_path,
                 "perturbation_column": shared_kwargs["perturbation_column"],
@@ -3887,6 +4292,32 @@ def parse_args() -> argparse.Namespace:
         "--quiet",
         action="store_true",
         help="Suppress progress bars and non-essential output",
+    )
+    parser.add_argument(
+        "--use-docker",
+        action="store_true",
+        help="Run benchmarks inside Docker containers for reliable memory limiting and reproducibility",
+    )
+    parser.add_argument(
+        "--docker-image",
+        type=str,
+        default="crispyx-benchmark:latest",
+        help="Docker image name for benchmark execution (default: crispyx-benchmark:latest)",
+    )
+    parser.add_argument(
+        "--build-docker",
+        action="store_true",
+        help="Build the Docker image before running benchmarks (requires --use-docker)",
+    )
+    parser.add_argument(
+        "-f", "--force",
+        action="store_true",
+        help="Force re-run all methods by clearing the .benchmark_cache directory",
+    )
+    parser.add_argument(
+        "--clear-results",
+        action="store_true",
+        help="Clear the entire output directory before running benchmarks",
     )
     return parser.parse_args()
 
@@ -4193,8 +4624,13 @@ def _run_single_benchmark(
         should_invalidate = True
         invalidate_reason = "force_restandardize=True"
     elif cached_config is not None:
+        # Check if cache version changed
+        if cached_config.get("cache_version") != CACHE_VERSION:
+            should_invalidate = True
+            cached_version = cached_config.get("cache_version", "unknown")
+            invalidate_reason = f"cache version changed ({cached_version} -> {CACHE_VERSION})"
         # Check if QC params changed
-        if cached_config.get("qc_params") != qc_params_used:
+        elif cached_config.get("qc_params") != qc_params_used:
             should_invalidate = True
             invalidate_reason = "QC parameters changed"
         # Check if standardized dataset path changed
@@ -4298,6 +4734,31 @@ def _run_single_benchmark(
     if config.resource_limits.memory_limit > 0:
         memory_limit_bytes = int(config.resource_limits.memory_limit * 1024 * 1024 * 1024)
 
+    # Initialize Docker runner if Docker mode is enabled
+    docker_runner = None
+    if config.use_docker:
+        if not _is_docker_available():
+            raise RuntimeError(
+                "Docker mode requested but Docker is not available. "
+                "Please install Docker or remove --use-docker flag."
+            )
+        docker_runner = DockerRunner(
+            image_name=config.docker_image,
+            memory_limit_gb=config.resource_limits.memory_limit,
+            n_cores=config.n_cores or 8,
+            workspace_root=REPO_ROOT.parent,
+            quiet=config.quiet,
+        )
+        # Ensure Docker image is available
+        if not docker_runner.ensure_image():
+            raise RuntimeError(
+                f"Docker image {config.docker_image} is not available and could not be built. "
+                "Please build the image manually: docker build -t crispyx-benchmark benchmarking/"
+            )
+        if not config.quiet:
+            print(f"  🐳 Docker mode enabled with image: {config.docker_image}")
+            print(f"      Memory limit: {config.resource_limits.memory_limit:.1f} GB")
+
     # Create progress bar for benchmark execution
     show_progress = config.show_progress and not config.quiet
     if show_progress:
@@ -4351,7 +4812,7 @@ def _run_single_benchmark(
                         postfix_dict["time"] = f"{runtime:.1f}s"
                     method_iterator.set_postfix(postfix_dict, refresh=False)  # type: ignore
             else:
-                # No cache, but output exists - create minimal row
+                # No cache, but output exists - create minimal row and save to cache
                 if not config.quiet:
                     print(f"  ⏭️  Skipping {method.name} (output exists)")
                 
@@ -4364,6 +4825,10 @@ def _run_single_benchmark(
                     "peak_memory_mb": None,
                     "result_path": _normalise_path(existing_path, context) if existing_path else None,
                 }
+                
+                # Save to cache so future runs can find result_path for comparisons
+                _save_method_result(method.name, row, config.output_dir)
+                
                 rows.append(row)
                 
                 # Update progress bar for skipped items
@@ -4381,7 +4846,8 @@ def _run_single_benchmark(
             method_iterator.set_description(f"Running {method.name}")  # type: ignore
         
         result = _run_with_limits(
-            method, context, memory_limit_bytes, config.resource_limits.time_limit
+            method, context, memory_limit_bytes, config.resource_limits.time_limit,
+            use_docker=config.use_docker, docker_runner=docker_runner,
         )
         
         # Update progress bar with result status
@@ -4479,6 +4945,12 @@ def main() -> None:
             # Allow CLI to override the methods list when using a config file
             if args.methods is not None:
                 config.methods_to_run = args.methods
+            
+            # Handle Docker flags from CLI (CLI takes precedence)
+            if hasattr(args, 'use_docker') and args.use_docker:
+                config.use_docker = True
+            if hasattr(args, 'docker_image') and args.docker_image != "crispyx-benchmark:latest":
+                config.docker_image = args.docker_image
     else:
         # Traditional CLI mode - create config from arguments
         dataset_path = args.data_path
@@ -4517,7 +4989,35 @@ def main() -> None:
             n_cores=args.n_cores if hasattr(args, 'n_cores') else None,
             environment_config=env_config,
             chunk_size=args.chunk_size if hasattr(args, 'chunk_size') else None,
+            use_docker=args.use_docker if hasattr(args, 'use_docker') else False,
+            docker_image=args.docker_image if hasattr(args, 'docker_image') else "crispyx-benchmark:latest",
         )]
+    
+    # Handle --build-docker flag
+    if hasattr(args, 'build_docker') and args.build_docker:
+        if not any(c.use_docker for c in configs):
+            print("Warning: --build-docker specified but --use-docker is not enabled.")
+        print("Building Docker image...")
+        if not _build_docker_image(quiet=args.quiet):
+            print("Error: Failed to build Docker image.")
+            sys.exit(1)
+    
+    # Handle --clear-results flag (clear entire output directory)
+    if hasattr(args, 'clear_results') and args.clear_results:
+        for config in configs:
+            if config.output_dir.exists():
+                import shutil
+                print(f"Clearing output directory: {config.output_dir}")
+                shutil.rmtree(config.output_dir)
+    
+    # Handle --force flag (clear cache to force re-run of all methods)
+    if hasattr(args, 'force') and args.force:
+        for config in configs:
+            cache_dir = config.output_dir / ".benchmark_cache"
+            if cache_dir.exists():
+                import shutil
+                print(f"Clearing benchmark cache: {cache_dir}")
+                shutil.rmtree(cache_dir)
     
     # Run benchmarks for each configuration
     for i, config in enumerate(configs):

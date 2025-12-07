@@ -1,2 +1,2 @@
-# Benchmarking package for CRISPYx
-"""Benchmarking tools and utilities for CRISPYx."""
+# Benchmarking package for crispyx
+"""Benchmarking tools and utilities for crispyx."""
