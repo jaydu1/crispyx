@@ -138,6 +138,7 @@ def set_thread_env_vars(n_threads: int) -> None:
     - NUMEXPR_NUM_THREADS: NumExpr library
     - VECLIB_MAXIMUM_THREADS: macOS Accelerate framework
     - R_THREADS: R threading control
+    - NUMBA_NUM_THREADS: Numba parallel execution
     """
     if n_threads < 1:
         n_threads = 1
@@ -149,3 +150,4 @@ def set_thread_env_vars(n_threads: int) -> None:
     os.environ['NUMEXPR_NUM_THREADS'] = n_threads_str
     os.environ['VECLIB_MAXIMUM_THREADS'] = n_threads_str
     os.environ['R_THREADS'] = n_threads_str
+    os.environ['NUMBA_NUM_THREADS'] = n_threads_str

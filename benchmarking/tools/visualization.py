@@ -8,6 +8,90 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 
+from .generate_results import SHRINKAGE_METADATA, LFCSHRINK_METHODS
+
+# Order for methods in overlap heatmaps
+# Ordered by: t-test, Wilcoxon, NB-GLM, NB-GLM (joint)
+HEATMAP_METHOD_ORDER = [
+    # t-test
+    "crispyx_de_t_test",
+    "scanpy_de_t_test",
+    # Wilcoxon
+    "crispyx_de_wilcoxon",
+    "scanpy_de_wilcoxon",
+    # NB-GLM (no shrinkage) - edgeR first as reference
+    "edger_de_glm",
+    "crispyx_de_nb_glm",
+    "pertpy_de_pydeseq2",
+    # NB-GLM (with shrinkage)
+    "crispyx_de_nb_glm_joint",
+    "pertpy_de_pydeseq2_shrunk",
+]
+
+
+def _format_heatmap_method_name(name: str) -> str:
+    """Format method name for heatmap display with shrinkage indicator.
+    
+    Parameters
+    ----------
+    name : str
+        Internal method name (e.g., 'crispyx_de_nb_glm_joint')
+        
+    Returns
+    -------
+    str
+        Display name with package prefix and lfcShrink suffix if applicable
+    """
+    # Handle shrunk PyDESeq2 first
+    if name == "pertpy_de_pydeseq2_shrunk":
+        return "PyDESeq2 (lfcShrink)"
+    elif name == "pertpy_de_pydeseq2":
+        return "PyDESeq2"
+    elif name == "crispyx_de_nb_glm_joint":
+        return "crispyx NB-GLM (lfcShrink)"
+    elif name == "crispyx_de_nb_glm":
+        return "crispyx NB-GLM"
+    elif name == "edger_de_glm":
+        return "edgeR NB-GLM"
+    
+    # Generic formatting for other methods
+    display_name = name.replace("crispyx_", "crispyx ").replace("scanpy_", "scanpy ")
+    display_name = display_name.replace("pertpy_", "pertpy ").replace("edger_", "edgeR ")
+    display_name = display_name.replace("de_", "").replace("_", " ")
+    
+    # Check if method uses shrinkage
+    if name in LFCSHRINK_METHODS:
+        shrink_type = SHRINKAGE_METADATA.get(name, "")
+        if shrink_type:
+            display_name = f"{display_name} (lfcShrink)"
+    
+    return display_name
+
+
+def _order_heatmap_methods(methods: list[str]) -> list[str]:
+    """Order methods for heatmap display.
+    
+    Parameters
+    ----------
+    methods : list[str]
+        List of method names
+        
+    Returns
+    -------
+    list[str]
+        Ordered list of method names
+    """
+    ordered = []
+    # First add methods in the predefined order
+    for m in HEATMAP_METHOD_ORDER:
+        if m in methods:
+            ordered.append(m)
+    # Then add any remaining methods not in the predefined order
+    for m in methods:
+        if m not in ordered:
+            ordered.append(m)
+    return ordered
+
 
 def plot_overlap_heatmap(
     overlap_matrix: pd.DataFrame,
@@ -76,14 +160,8 @@ def plot_overlap_heatmap(
     # Create a mask for NaN values
     mask = overlap_matrix.isna()
     
-    # Format method names for display (remove package prefixes)
-    def format_name(name: str) -> str:
-        name = name.replace("crispyx_", "").replace("scanpy_", "")
-        name = name.replace("pertpy_", "").replace("edger_", "edgeR ")
-        name = name.replace("de_", "").replace("_", " ")
-        return name
-    
-    formatted_labels = [format_name(n) for n in overlap_matrix.columns]
+    # Use the new formatting function
+    formatted_labels = [_format_heatmap_method_name(n) for n in overlap_matrix.columns]
     
     # Create heatmap with custom settings
     heatmap = sns.heatmap(
@@ -154,8 +232,8 @@ def generate_overlap_heatmaps(
     """Generate heatmaps for multiple k values and both effect/pvalue metrics.
     
     Creates 2 × len(k_values) heatmaps:
-    - effect_top_{k}_overlap.png for each k
-    - pvalue_top_{k}_overlap.png for each k
+    - benchmark_effect_top_{k}_overlap.png for each k
+    - benchmark_pvalue_top_{k}_overlap.png for each k
     
     Parameters
     ----------
@@ -177,12 +255,16 @@ def generate_overlap_heatmaps(
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     
+    # Order methods for consistent heatmap display
+    ordered_methods = _order_heatmap_methods(list(de_results.keys()))
+    ordered_de_results = {m: de_results[m] for m in ordered_methods if m in de_results}
+    
     generated_files = {}
     
     for k in k_values:
         for metric in ("effect", "pvalue"):
             matrix, effective_k = compute_pairwise_overlap_matrix(
-                de_results,
+                ordered_de_results,
                 top_k=k,
                 metric=metric,
             )
@@ -190,10 +272,15 @@ def generate_overlap_heatmaps(
             if matrix.empty:
                 continue
             
+            # Reorder matrix rows/columns to match method order
+            ordered_names = [m for m in ordered_methods if m in matrix.columns]
+            matrix = matrix.loc[ordered_names, ordered_names]
+            
             metric_label = "Effect Size" if metric == "effect" else "P-value"
             title = f"Top-{k} {metric_label} Gene Overlap"
             
-            filename = f"{metric}_top_{k}_overlap.png"
+            # Use benchmark_ prefix for output files
+            filename = f"benchmark_{metric}_top_{k}_overlap.png"
             output_path = output_dir / filename
             
             result_path = plot_overlap_heatmap(

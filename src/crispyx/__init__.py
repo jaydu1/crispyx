@@ -20,6 +20,7 @@ from .de import (
     RankGenesGroupsResult,
     _adjust_pvalue_matrix,
     nb_glm_test,
+    shrink_lfc,
     t_test,
     wilcoxon_test,
 )
@@ -450,6 +451,7 @@ __all__ = [
     "t_test",
     "wilcoxon_test",
     "nb_glm_test",
+    "shrink_lfc",
     "ensure_gene_symbol_column",
     "AnnData",
     "read_h5ad_ondisk",

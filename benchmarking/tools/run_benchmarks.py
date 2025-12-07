@@ -7,6 +7,7 @@ import json
 import multiprocessing as mp
 import os
 import resource
+import subprocess
 import sys
 import threading
 import time
@@ -38,13 +39,14 @@ from .env_config import (
     set_thread_env_vars,
 )
 from .generate_demo_dataset import write_demo_dataset
+from .generate_results import evaluate_benchmarks
 from crispyx.data import (
     read_backed,
     resolve_control_label,
     calculate_adaptive_qc_thresholds,
     standardize_dataset,
 )
-from crispyx.de import t_test, wilcoxon_test, nb_glm_test
+from crispyx.de import t_test, wilcoxon_test, nb_glm_test, shrink_lfc
 from .comparison import DE_METRIC_KEYS, compute_de_comparison_metrics
 from crispyx.pseudobulk import (
     compute_average_log_expression,
@@ -821,6 +823,177 @@ def run_pertpy_de(
         "save_seconds": t_save_end - t_save_start,
     }
 
+
+def run_pydeseq2_shrunk(
+    dataset_path: Path,
+    *,
+    perturbation_column: str,
+    control_label: str,
+    output_dir: Path,
+    n_jobs: int | None = None,
+) -> Dict[str, Any]:
+    """Run PyDESeq2 with apeGLM LFC shrinkage directly (not via pertpy).
+    
+    This function calls PyDESeq2 directly and applies apeGLM LFC shrinkage,
+    which pertpy doesn't expose. This is useful for comparing shrunken LFCs
+    between crispyx and PyDESeq2.
+    
+    Returns timing breakdown with separate base_seconds (DE fitting) and 
+    shrinkage_seconds (lfcShrink) components for detailed performance analysis.
+    """
+    import gc
+    import io
+    import time
+    from contextlib import redirect_stdout, redirect_stderr
+    
+    import numpy as np
+    import pandas as pd
+    import scanpy as sc
+    import scipy.sparse as sp
+    from pydeseq2.dds import DeseqDataSet
+    from pydeseq2.ds import DeseqStats
+    
+    t_func_start = time.perf_counter()
+    
+    # Load data
+    t_load_start = time.perf_counter()
+    adata = sc.read_h5ad(str(dataset_path))
+    t_load_end = time.perf_counter()
+    gc.collect()
+    
+    # Get unique perturbations (excluding control)
+    perturbations = [p for p in adata.obs[perturbation_column].unique() if p != control_label]
+    
+    t_process_start = time.perf_counter()
+    all_results = []
+    
+    # Track timing for base DE and shrinkage separately
+    total_base_seconds = 0.0
+    total_shrinkage_seconds = 0.0
+    
+    for pert in perturbations:
+        # Subset to control + current perturbation
+        mask = adata.obs[perturbation_column].isin([control_label, pert])
+        adata_subset = adata[mask].copy()
+        
+        # PyDESeq2 requires dense matrix with integer counts
+        if sp.issparse(adata_subset.X):
+            adata_subset.X = np.asarray(adata_subset.X.todense())
+        # Ensure integer counts
+        adata_subset.X = np.round(adata_subset.X).astype(int)
+        
+        # Reorder categories so perturbation is first (becomes reference)
+        # This allows us to shrink the control coefficient and then negate
+        try:
+            adata_subset.obs[perturbation_column] = adata_subset.obs[perturbation_column].cat.reorder_categories([pert, control_label])
+        except Exception:
+            pass  # Skip if reordering fails
+        
+        # Run PyDESeq2
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            try:
+                # Time base DE fitting
+                t_base_start = time.perf_counter()
+                dds = DeseqDataSet(
+                    adata=adata_subset,
+                    design_factors=perturbation_column,
+                    refit_cooks=True,
+                    n_cpus=n_jobs or 1,
+                )
+                dds.deseq2()
+                
+                # The coefficient is control vs perturbation (since pert is reference)
+                # We need to use control as the treatment coefficient
+                coeff_name = f"{perturbation_column}[T.{control_label}]"
+                
+                # Create contrast for control vs perturbation (will negate later)
+                stat_res = DeseqStats(
+                    dds,
+                    contrast=[perturbation_column, control_label, pert],
+                    alpha=0.05,
+                    n_cpus=n_jobs or 1,
+                )
+                stat_res.summary()
+                t_base_end = time.perf_counter()
+                total_base_seconds += (t_base_end - t_base_start)
+                
+                # Apply apeGLM LFC shrinkage (timed separately)
+                t_shrink_start = time.perf_counter()
+                shrinkage_applied = False
+                try:
+                    stat_res.lfc_shrink(coeff=coeff_name)
+                    shrinkage_applied = True
+                except Exception as e:
+                    # Try to find available coefficients
+                    try:
+                        if hasattr(dds, 'varm') and 'LFC' in dds.varm:
+                            available_coeffs = list(dds.varm['LFC'].columns)
+                            # Find the non-intercept coefficient
+                            matching = [c for c in available_coeffs if c != 'Intercept']
+                            if matching:
+                                stat_res.lfc_shrink(coeff=matching[0])
+                                shrinkage_applied = True
+                    except Exception:
+                        pass  # Fall back to unshrunken if shrinkage fails
+                t_shrink_end = time.perf_counter()
+                total_shrinkage_seconds += (t_shrink_end - t_shrink_start)
+                
+                # Extract results
+                results_df = stat_res.results_df.copy()
+                
+                # Negate LFC to get perturbation vs control (we computed control vs pert)
+                results_df["log2FoldChange"] = -results_df["log2FoldChange"]
+                # Also negate the stat to match
+                if "stat" in results_df.columns:
+                    results_df["stat"] = -results_df["stat"]
+                
+                results_df["gene"] = results_df.index
+                results_df[perturbation_column] = pert
+                results_df["shrinkage_applied"] = shrinkage_applied
+                results_df = results_df.reset_index(drop=True)
+                
+                all_results.append(results_df)
+                
+            except Exception as e:
+                # Skip this perturbation if it fails
+                continue
+    
+    t_process_end = time.perf_counter()
+    
+    # Combine all results
+    if all_results:
+        df = pd.concat(all_results, ignore_index=True)
+        # Rename columns to match expected format
+        df = df.rename(columns={
+            "log2FoldChange": "log_fc",
+            "lfcSE": "log_fc_se", 
+            "stat": "statistic",
+            "pvalue": "pvalue",
+            "padj": "pvalue_adj",
+        })
+    else:
+        df = pd.DataFrame()
+    
+    # Save results
+    t_save_start = time.perf_counter()
+    output_path = output_dir / "pertpy_de_pydeseq2_shrunk.csv"
+    df.to_csv(output_path, index=False)
+    t_save_end = time.perf_counter()
+    
+    gc.collect()
+    
+    return {
+        "result_path": str(output_path),
+        "groups": len(perturbations),
+        "import_seconds": t_load_start - t_func_start,
+        "load_seconds": t_load_end - t_load_start,
+        "process_seconds": t_process_end - t_process_start,
+        "base_seconds": total_base_seconds,
+        "shrinkage_seconds": total_shrinkage_seconds,
+        "save_seconds": t_save_end - t_save_start,
+    }
+
+
 # End of scanpy validation utilities
 # ============================================================================
 
@@ -834,6 +1007,7 @@ class BenchmarkMethod:
     function: Callable[..., Any]
     kwargs: Dict[str, Any]
     summary: Callable[[Any, Dict[str, Any]], Dict[str, Any]]
+    depends_on: Optional[str] = None  # Name of method that must run first
 
 
 @dataclass
@@ -1043,8 +1217,12 @@ def _get_expected_output_path(method_name: str, output_dir: Path, data_name: str
         return de_dir / "crispyx_de_wilcoxon.h5ad"
     elif method_name == "crispyx_de_nb_glm":
         return de_dir / "crispyx_de_nb_glm.h5ad"
+    elif method_name == "crispyx_de_nb_glm_shrunk":
+        return de_dir / "crispyx_de_nb_glm_shrunk.h5ad"
     elif method_name == "crispyx_de_nb_glm_joint":
-        return de_dir / "crispyx_de_nb_glm_joint.h5ad"
+        return de_dir / "crispyx_de_nb_glm_joint_nb_glm.h5ad"  # resolve_output_path adds _nb_glm suffix
+    elif method_name == "crispyx_de_nb_glm_joint_shrunk":
+        return de_dir / "crispyx_de_nb_glm_joint_shrunk.h5ad"
     
     # Scanpy methods with module prefix
     elif method_name == "scanpy_qc_filtered":
@@ -1059,6 +1237,8 @@ def _get_expected_output_path(method_name: str, output_dir: Path, data_name: str
         return de_dir / "edger_de_glm.csv"
     elif method_name == "pertpy_de_pydeseq2":
         return de_dir / "pertpy_de_pydeseq2.csv"
+    elif method_name == "pertpy_de_pydeseq2_shrunk":
+        return de_dir / "pertpy_de_pydeseq2_shrunk.csv"
     
     return None
 
@@ -1664,6 +1844,72 @@ def _anndata_to_de_dict(adata) -> Dict[str, Any]:
     return stream_result_dict
 
 
+def _anndata_to_de_dict_raw(adata) -> Dict[str, Any]:
+    """Convert AnnData with DE results to dictionary format, using RAW (unshrunken) LFCs.
+    
+    This is identical to _anndata_to_de_dict but uses 'logfoldchange_raw' layer
+    instead of 'logfoldchange' for effect sizes. This allows comparison of
+    raw LFCs between crispyx and PyDESeq2 (before any shrinkage).
+    
+    Parameters
+    ----------
+    adata : AnnData
+        AnnData object containing DE results in layers (crispyx format)
+        
+    Returns
+    -------
+    Dict[str, Any]
+        Dictionary mapping perturbation names to SimpleNamespace objects with
+        genes, effect_size (raw), statistic, and pvalue attributes
+    """
+    from types import SimpleNamespace
+    
+    def _extract_row(matrix, idx: int) -> np.ndarray | None:
+        """Extract row from matrix (sparse or dense) as 1D dense array."""
+        if matrix is None:
+            return None
+        if idx >= matrix.shape[0]:
+            return None
+        try:
+            row = matrix[idx, :]
+            return np.asarray(row).flatten()
+        except Exception:
+            return None
+    
+    stream_result_dict = {}
+    
+    if "pvalue" in adata.layers and "perturbation" in adata.obs.columns:
+        perturbations = adata.obs["perturbation"].tolist()
+        for idx, group in enumerate(perturbations):
+            # Determine which statistic layer to use
+            if "z_score" in adata.layers:
+                statistic_values = _extract_row(adata.layers["z_score"], idx)
+            elif "statistic" in adata.layers:
+                statistic_values = _extract_row(adata.layers["statistic"], idx)
+            else:
+                statistic_values = None
+            
+            # Use RAW logfoldchange (before shrinkage) for effect sizes
+            if "logfoldchange_raw" in adata.layers:
+                effect_size_values = _extract_row(adata.layers["logfoldchange_raw"], idx)
+            elif "logfoldchange" in adata.layers:
+                # Fallback to shrunken if raw not available
+                effect_size_values = _extract_row(adata.layers["logfoldchange"], idx)
+            elif adata.X is not None:
+                effect_size_values = _extract_row(adata.X, idx)
+            else:
+                effect_size_values = None
+            
+            stream_result_dict[group] = SimpleNamespace(
+                genes=adata.var_names.to_numpy(),
+                effect_size=effect_size_values,
+                statistic=statistic_values,
+                pvalue=_extract_row(adata.layers["pvalue"], idx),
+            )
+    
+    return stream_result_dict
+
+
 def _streaming_de_to_frame(result: Mapping[str, Any]) -> pd.DataFrame:
     """Convert a streaming differential expression mapping to a tidy DataFrame."""
 
@@ -1982,6 +2228,8 @@ def _get_method_category(method_name: str) -> tuple[str, str, int]:
         return ("DE: NB GLM", "nb_glm", 30)
     elif "_de_glm" in method_name:  # edger
         return ("DE: NB GLM", "edger", 32)
+    elif "_de_pydeseq2_shrunk" in method_name:
+        return ("DE: NB GLM", "pydeseq2_shrunk", 34)
     elif "_de_pydeseq2" in method_name:
         return ("DE: NB GLM", "pydeseq2", 33)
     else:
@@ -2008,6 +2256,9 @@ def _format_method_name(method: str) -> str:
     # Check for specific tool names first
     if "edger_" in method.lower():
         return "NB-GLM"
+    # Check for shrunk PyDESeq2 before regular PyDESeq2
+    if "pertpy_" in method.lower() and "pydeseq2_shrunk" in method.lower():
+        return "NB-GLM (lfcShrink)"
     if "pertpy_" in method.lower() and "pydeseq2" in method.lower():
         return "NB-GLM"
     
@@ -2476,8 +2727,10 @@ def _generate_improved_markdown(
     return md
 
 
-def evaluate_benchmarks(output_dir: Path) -> None:
-    """Evaluate benchmark results and generate report."""
+def _evaluate_benchmarks_legacy(output_dir: Path) -> None:
+    """Legacy evaluate benchmark results function - replaced by generate_results.evaluate_benchmarks."""
+    # This function is deprecated and retained for reference only.
+    # Use the new evaluate_benchmarks from .generate_results module instead.
     from .comparison import compute_de_comparison_metrics
     
     results_dir = output_dir / ".benchmark_cache"
@@ -2543,7 +2796,9 @@ def evaluate_benchmarks(output_dir: Path) -> None:
         ("crispyx_de_nb_glm_joint", "crispyx_de_nb_glm", "de"),
         # DE GLM - joint vs external tools
         ("crispyx_de_nb_glm_joint", "edger_de_glm", "de"),
-        ("crispyx_de_nb_glm_joint", "pertpy_de_pydeseq2", "de"),
+        ("crispyx_de_nb_glm_joint", "pertpy_de_pydeseq2", "de_raw"),  # Raw LFC comparison (standard)
+        # DE GLM - joint vs PyDESeq2 with lfcShrink applied
+        ("crispyx_de_nb_glm_joint", "pertpy_de_pydeseq2_shrunk", "de_lfcshrink"),
         # DE GLM - external tool comparison
         ("edger_de_glm", "pertpy_de_pydeseq2", "de"),
         # DE Tests
@@ -2552,8 +2807,20 @@ def evaluate_benchmarks(output_dir: Path) -> None:
     ]
     
     # Helper to load DE result DataFrame
-    def _load_de_result(method_name: str, result_path_val: str) -> Optional[pd.DataFrame]:
-        """Load and standardize a DE result from file."""
+    def _load_de_result(method_name: str, result_path_val: str, use_raw_lfc: bool = False) -> Optional[pd.DataFrame]:
+        """Load and standardize a DE result from file.
+        
+        Parameters
+        ----------
+        method_name : str
+            Name of the method (for error messages)
+        result_path_val : str
+            Relative path to the result file
+        use_raw_lfc : bool
+            If True and the file is h5ad, use logfoldchange_raw layer instead of
+            logfoldchange for effect sizes. This is for fair comparison of raw
+            (unshrunken) LFCs between crispyx and PyDESeq2.
+        """
         if pd.isna(result_path_val):
             return None
         
@@ -2565,7 +2832,11 @@ def evaluate_benchmarks(output_dir: Path) -> None:
             if str(result_path).endswith('.h5ad'):
                 import anndata as ad
                 adata = ad.read_h5ad(str(result_path))
-                result_dict = _anndata_to_de_dict(adata)
+                # Use raw LFC extractor if requested
+                if use_raw_lfc:
+                    result_dict = _anndata_to_de_dict_raw(adata)
+                else:
+                    result_dict = _anndata_to_de_dict(adata)
                 return _streaming_de_to_frame(result_dict)
             else:
                 result_df = pd.read_csv(result_path)
@@ -2647,6 +2918,38 @@ def evaluate_benchmarks(output_dir: Path) -> None:
                 metrics = compute_de_comparison_metrics(method_a_df, method_b_df)
                 # Create new dict to avoid type errors
                 acc = {"comparison": f"{method_a_name} vs {method_b_name}"}
+                acc.update(metrics)
+                accuracy_results.append(acc)
+            
+            elif comp_type == "de_raw":
+                # Load DE results with RAW (unshrunken) LFCs for fair comparison
+                # This compares crispyx raw LFCs with PyDESeq2 raw LFCs (before shrinkage)
+                method_a_df = _load_de_result(method_a_name, method_a_path_val, use_raw_lfc=True)
+                method_b_df = _load_de_result(method_b_name, method_b_path_val, use_raw_lfc=True)
+                
+                if method_a_df is None or method_b_df is None:
+                    print(f"Skipping comparison {method_a_name} vs {method_b_name}: could not load results")
+                    continue
+                
+                # Compute metrics - no suffix needed, raw is the standard comparison
+                metrics = compute_de_comparison_metrics(method_a_df, method_b_df)
+                acc = {"comparison": f"{method_a_name} vs {method_b_name}"}
+                acc.update(metrics)
+                accuracy_results.append(acc)
+            
+            elif comp_type == "de_lfcshrink":
+                # Load DE results comparing shrunken LFCs
+                # crispyx uses its shrinkage, PyDESeq2 uses lfcShrink (apeGLM)
+                method_a_df = _load_de_result(method_a_name, method_a_path_val, use_raw_lfc=False)
+                method_b_df = _load_de_result(method_b_name, method_b_path_val, use_raw_lfc=False)
+                
+                if method_a_df is None or method_b_df is None:
+                    print(f"Skipping comparison {method_a_name} vs {method_b_name} (lfcShrink): could not load results")
+                    continue
+                
+                # Compute metrics with (lfcShrink) suffix to indicate shrinkage comparison
+                metrics = compute_de_comparison_metrics(method_a_df, method_b_df)
+                acc = {"comparison": f"{method_a_name} vs {method_b_name} (lfcShrink)"}
                 acc.update(metrics)
                 accuracy_results.append(acc)
                 
@@ -2808,6 +3111,34 @@ def _summarise_runner_result(result: Any, context: Dict[str, Any]) -> Dict[str, 
     return {"error": "Invalid result format"}
 
 
+def _check_cgroups_available() -> bool:
+    """Check if cgroups v2 memory control is available via systemd-run.
+    
+    Returns True if systemd-run --scope --user with MemoryMax works.
+    """
+    try:
+        result = subprocess.run(
+            ["systemd-run", "--scope", "--user", "--property=MemoryMax=1G", "true"],
+            capture_output=True,
+            timeout=5,
+        )
+        return result.returncode == 0
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return False
+
+
+# Cache the cgroups availability check
+_CGROUPS_AVAILABLE: bool | None = None
+
+
+def _is_cgroups_available() -> bool:
+    """Check cgroups availability with caching."""
+    global _CGROUPS_AVAILABLE
+    if _CGROUPS_AVAILABLE is None:
+        _CGROUPS_AVAILABLE = _check_cgroups_available()
+    return _CGROUPS_AVAILABLE
+
+
 def _worker(
     queue: mp.Queue,
     method: BenchmarkMethod,
@@ -2815,6 +3146,7 @@ def _worker(
     memory_limit: int | None,
     time_limit: int | None,
     n_threads: int = 1,
+    use_cgroups_memory: bool = False,
 ) -> None:
     """Execute ``method`` with optional resource limits and report the outcome.
     
@@ -2886,7 +3218,11 @@ def _worker(
     # Set thread limits for BLAS/OpenMP to control parallelism
     set_thread_env_vars(n_threads)
 
-    _apply_resource_limit(memory_limit, resource.RLIMIT_AS, "virtual memory")
+    # Apply resource limits
+    # Skip RLIMIT_AS if cgroups memory control is being used externally,
+    # as RLIMIT_AS limits virtual address space (including memmaps) not RSS
+    if not use_cgroups_memory:
+        _apply_resource_limit(memory_limit, resource.RLIMIT_AS, "virtual memory")
     _apply_resource_limit(time_limit, resource.RLIMIT_CPU, "CPU time")
 
     # Start background memory sampling thread for average memory calculation
@@ -2986,6 +3322,11 @@ def _run_with_limits(
     if n_threads is None or n_threads <= 0:
         n_threads = 1
     
+    # Check if cgroups memory control is available
+    # Use cgroups for crispyx methods that may use memmaps (joint NB-GLM)
+    # to avoid RLIMIT_AS issues with virtual address space limits
+    use_cgroups = _is_cgroups_available() and 'crispyx' in method.name.lower()
+    
     # Special handling for edgeR: run directly without multiprocessing to avoid R/fork issues
     # Still need to set environment variables for this process
     if 'edger_direct' in method.name.lower():
@@ -3063,7 +3404,7 @@ def _run_with_limits(
     queue = mp_context.Queue()
     process = mp_context.Process(
         target=_worker,
-        args=(queue, method, context, memory_limit, time_limit, n_threads),
+        args=(queue, method, context, memory_limit, time_limit, n_threads, use_cgroups),
         name=f"benchmark-{method.name}",
     )
     process.start()
@@ -3318,7 +3659,7 @@ def create_benchmark_suite(
         ),
         "crispyx_de_nb_glm": BenchmarkMethod(
             name="crispyx_de_nb_glm",
-            description="Negative binomial GLM differential expression (independent)",
+            description="Negative binomial GLM differential expression (independent, no shrinkage)",
             function=nb_glm_test,
             kwargs={
                 "path": dataset_path,
@@ -3327,12 +3668,28 @@ def create_benchmark_suite(
                 "data_name": "de_nb_glm",
                 "n_jobs": n_cores,
                 "fit_method": "independent",
+                "lfc_shrinkage_type": "none",  # No shrinkage - base method
+                "size_factor_method": "deseq2",  # Use DESeq2-style size factors for better PyDESeq2 alignment
+                "scale_size_factors": False,  # Match PyDESeq2's unscaled behavior
             },
             summary=_summarise_de_mapping,
         ),
+        "crispyx_de_nb_glm_shrunk": BenchmarkMethod(
+            name="crispyx_de_nb_glm_shrunk",
+            description="LFC shrinkage on independent NB-GLM results (apeglm)",
+            function=shrink_lfc,
+            kwargs={
+                "path": de_dir / "crispyx_de_nb_glm.h5ad",  # Input from base method
+                "shrinkage_type": "apeglm",
+                "output_dir": de_dir,
+                "data_name": "de_nb_glm_shrunk",
+            },
+            summary=_summarise_de_mapping,
+            depends_on="crispyx_de_nb_glm",
+        ),
         "crispyx_de_nb_glm_joint": BenchmarkMethod(
             name="crispyx_de_nb_glm_joint",
-            description="Negative binomial GLM differential expression (joint model with shared dispersion)",
+            description="Negative binomial GLM differential expression (joint model, no shrinkage)",
             function=nb_glm_test,
             kwargs={
                 "path": dataset_path,
@@ -3341,9 +3698,24 @@ def create_benchmark_suite(
                 "data_name": "de_nb_glm_joint",
                 "n_jobs": n_cores,
                 "fit_method": "joint",
-                "lfc_shrinkage_type": "normal",  # Enable LFC shrinkage for better correlation with PyDESeq2
+                "lfc_shrinkage_type": "none",  # No shrinkage - base method
+                "size_factor_method": "deseq2",  # Use DESeq2-style size factors for better PyDESeq2 alignment
+                "scale_size_factors": False,  # Match PyDESeq2's unscaled behavior
             },
             summary=_summarise_de_mapping,
+        ),
+        "crispyx_de_nb_glm_joint_shrunk": BenchmarkMethod(
+            name="crispyx_de_nb_glm_joint_shrunk",
+            description="LFC shrinkage on joint NB-GLM results (apeglm)",
+            function=shrink_lfc,
+            kwargs={
+                "path": de_dir / "crispyx_de_nb_glm_joint_nb_glm.h5ad",  # Input from base method (resolve_output_path adds _nb_glm suffix)
+                "shrinkage_type": "apeglm",
+                "output_dir": de_dir,
+                "data_name": "de_nb_glm_joint_shrunk",
+            },
+            summary=_summarise_de_mapping,
+            depends_on="crispyx_de_nb_glm_joint",
         ),
         "scanpy_qc_filtered": BenchmarkMethod(
             name="scanpy_qc_filtered",
@@ -3409,6 +3781,19 @@ def create_benchmark_suite(
                 "perturbation_column": shared_kwargs["perturbation_column"],
                 "control_label": shared_kwargs["control_label"],
                 "backend": "pydeseq2",
+                "output_dir": de_dir,
+                "n_jobs": n_cores,
+            },
+            summary=_summarise_runner_result,
+        ),
+        "pertpy_de_pydeseq2_shrunk": BenchmarkMethod(
+            name="pertpy_de_pydeseq2_shrunk",
+            description="Differential expression using PyDESeq2 with apeGLM LFC shrinkage",
+            function=run_pydeseq2_shrunk,
+            kwargs={
+                "dataset_path": dataset_path,
+                "perturbation_column": shared_kwargs["perturbation_column"],
+                "control_label": shared_kwargs["control_label"],
                 "output_dir": de_dir,
                 "n_jobs": n_cores,
             },
@@ -3860,6 +4245,52 @@ def _run_single_benchmark(
         ordered_methods = sorted(available_methods.values(), key=_method_sort_key)
         selected_names = [method.name for method in ordered_methods]
 
+    # Sort methods topologically to respect dependencies
+    # Methods with depends_on must run after their dependency
+    def _topological_sort_methods(names: list[str], methods: Dict[str, BenchmarkMethod]) -> list[str]:
+        """Sort method names so dependencies run before dependents."""
+        # Build dependency graph
+        in_degree = {name: 0 for name in names}
+        dependents = {name: [] for name in names}
+        
+        for name in names:
+            method = methods.get(name)
+            if method and method.depends_on:
+                dep = method.depends_on
+                if dep in names:
+                    in_degree[name] += 1
+                    dependents[dep].append(name)
+                elif dep not in methods:
+                    # Dependency not in available methods - warn but continue
+                    pass
+        
+        # Kahn's algorithm for topological sort
+        queue = [name for name in names if in_degree[name] == 0]
+        sorted_names = []
+        
+        while queue:
+            # Sort queue to maintain deterministic order
+            queue.sort(key=lambda n: names.index(n))
+            current = queue.pop(0)
+            sorted_names.append(current)
+            
+            for dependent in dependents[current]:
+                in_degree[dependent] -= 1
+                if in_degree[dependent] == 0:
+                    queue.append(dependent)
+        
+        # Check for cycles (shouldn't happen with proper config)
+        if len(sorted_names) != len(names):
+            # Some methods couldn't be sorted - return original order with warning
+            missing = set(names) - set(sorted_names)
+            import warnings
+            warnings.warn(f"Dependency cycle detected for methods: {missing}. Using original order.")
+            return names
+        
+        return sorted_names
+    
+    selected_names = _topological_sort_methods(selected_names, available_methods)
+
     rows = []
     
     # Calculate memory limit in bytes
@@ -3904,7 +4335,7 @@ def _run_single_benchmark(
                     if memory is not None:
                         if stats_str:
                             stats_str += ", "
-                        stats_str += f"{memory:.1f}GB"
+                        stats_str += f"{memory:.1f}MB"
                     
                     if stats_str:
                         print(f"  ⏭️  Skipping {method.name} (cached: {stats_str})")
@@ -3915,7 +4346,7 @@ def _run_single_benchmark(
                 if show_progress:
                     postfix_dict = {"status": "cached"}
                     if memory is not None:
-                        postfix_dict["memory"] = f"{memory:.1f}GB"
+                        postfix_dict["memory"] = f"{memory:.1f}MB"
                     if runtime is not None:
                         postfix_dict["time"] = f"{runtime:.1f}s"
                     method_iterator.set_postfix(postfix_dict, refresh=False)  # type: ignore
