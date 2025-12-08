@@ -210,6 +210,9 @@ __marimo__/
 .vscode/
 
 tutorial_outputs/
-benchmarking/results/
+benchmarking/results/.*
+benchmarking/results/*.h5ad
+benchmarking/results/*.csv
+benchmarking/results/*.json
 data/
 yida\ wang/
