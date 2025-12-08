@@ -210,9 +210,11 @@ __marimo__/
 .vscode/
 
 tutorial_outputs/
-benchmarking/results/.*
-benchmarking/results/*.h5ad
-benchmarking/results/*.csv
-benchmarking/results/*.json
+/benchmarking/**/.*
+benchmarking/**/*.h5ad
+benchmarking/**/*.csv
+benchmarking/results/**.json
+benchmarking/results/Adamson_subset_fixed
 data/
 yida\ wang/
+
