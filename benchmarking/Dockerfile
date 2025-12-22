@@ -20,6 +20,8 @@ ENV LC_ALL=C.UTF-8
 # Set Python environment variables
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONDONTWRITEBYTECODE=1
+# Add /workspace to PYTHONPATH so benchmarking module is importable
+ENV PYTHONPATH=/workspace:$PYTHONPATH
 
 # Install system dependencies for R and Python packages
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -95,8 +97,10 @@ RUN pip install --no-cache-dir -e /workspace
 # Copy benchmarking code
 COPY benchmarking/ /workspace/benchmarking/
 
-# Copy worker entrypoint to /app directory
-RUN mkdir -p /app && cp /workspace/benchmarking/tools/docker_worker.py /app/docker_worker.py
+# Copy worker entrypoint and dependencies to /app directory
+RUN mkdir -p /app \
+    && cp /workspace/benchmarking/tools/docker_worker.py /app/docker_worker.py \
+    && cp /workspace/benchmarking/tools/memory.py /app/memory.py
 
 # Set working directory for benchmark execution
 WORKDIR /workspace

@@ -1,7 +1,7 @@
 {
   "adaptive_qc": true,
   "adaptive_qc_mode": "conservative",
-  "average_runtime_seconds": 31.664051605737768,
+  "average_runtime_seconds": 23.525815804023296,
   "categories": [],
   "dependency_errors": [],
   "error_count": 0,

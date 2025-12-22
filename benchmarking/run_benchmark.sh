@@ -45,7 +45,7 @@ show_usage() {
     echo "  --use-docker           Run benchmarks in Docker container"
     echo "  --docker-image IMAGE   Docker image to use (default: crispyx-benchmark:latest)"
     echo "  --build-docker         Build Docker image before running"
-    echo "  --force-rerun          Force re-run all methods (ignore cache)"
+    echo "  --force                Force re-run all methods (ignore cache)"
     echo "  --clean                Delete output directory before running"
     echo "  -h, --help             Show this help message"
     echo ""
@@ -78,8 +78,8 @@ while [[ $# -gt 0 ]]; do
             EXTRA_ARGS+=("--build-docker")
             shift
             ;;
-        --force-rerun)
-            EXTRA_ARGS+=("--force-rerun")
+        --force)
+            EXTRA_ARGS+=("--force")
             shift
             ;;
         --clean)

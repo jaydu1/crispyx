@@ -2,6 +2,15 @@
 
 Scripts for profiling crispyx streaming methods against reference implementations (Scanpy, Pertpy, edgeR, PyDESeq2).
 
+## v0.4.0 Changes
+
+**NB-GLM now uses L-BFGS-B optimization only:**
+- Removed IRLS optimizer option - L-BFGS-B provides better performance and PyDESeq2 compatibility
+- `size_factor_scope` defaults to `"global"` for memory efficiency
+- Removed `joint_optimizer`, `use_sparse`, `use_numba` parameters
+
+**No benchmark config changes required** - the new defaults work automatically.
+
 ## Quick Start
 
 ### Native Mode (Default)
@@ -134,13 +143,13 @@ Run benchmarks on one or more datasets, with optional Docker support.
 ./run_benchmark.sh config/*.yaml
 
 # Force re-run (ignore cache)
-./run_benchmark.sh --force-rerun config/Adamson.yaml
+./run_benchmark.sh --force config/Adamson.yaml
 
 # Clean output directory before running
 ./run_benchmark.sh --clean config/Adamson.yaml
 
 # Combined Docker options
-./run_benchmark.sh --use-docker --build-docker --force-rerun config/*.yaml
+./run_benchmark.sh --use-docker --build-docker --force config/*.yaml
 ```
 
 **Options**:
@@ -149,7 +158,7 @@ Run benchmarks on one or more datasets, with optional Docker support.
 | `--use-docker` | Run benchmarks in Docker containers |
 | `--docker-image IMAGE` | Docker image to use (default: `crispyx-benchmark:latest`) |
 | `--build-docker` | Build Docker image before running |
-| `--force-rerun` | Force re-run all methods (ignore cache) |
+| `--force` | Force re-run all methods (ignore cache) |
 | `--clean` | Delete output directory before running |
 | `-h, --help` | Show help message |
 
@@ -433,12 +442,38 @@ docker-compose run dev
 Control caching behavior to re-run benchmarks:
 
 ```bash
-# Force re-run all methods (ignore cache)
-./run_benchmark.sh --force-rerun config/Adamson.yaml
+# Force re-run all methods (clears cache and disables skip_existing)
+./run_benchmark.sh --force config/Adamson.yaml
+
+# Re-run specific failed methods only (keeps other cached results)
+python -m benchmarking.tools.run_benchmarks \
+  --config config/Adamson.yaml \
+  --methods crispyx_de_nb_glm --no-skip-existing
+
+# Skip methods with existing outputs (default behavior)
+./run_benchmark.sh config/Adamson.yaml
+
+# Force re-run but keep existing outputs (only clears cache metadata)
+./run_benchmark.sh --force --skip-existing config/Adamson.yaml
 
 # Delete entire output directory and start fresh
 ./run_benchmark.sh --clean config/Adamson.yaml
+
+# Regenerate reports from cached results without re-running
+python -m benchmarking.tools.run_benchmarks \
+  --config config/Adamson.yaml --regenerate-report
 ```
+
+**Incremental Benchmark Options**:
+| Flag | Description |
+|------|-------------|
+| `--force` | Clear cache and re-run all methods |
+| `--skip-existing` | Skip methods with existing output files (default: True) |
+| `--no-skip-existing` | Force re-run specified methods even if output exists |
+| `--methods X Y` | Only run specified methods (use with `--no-skip-existing` to retry failed methods) |
+| `--regenerate-report` | Skip execution, only regenerate reports from cache |
+
+**Cached results are automatically loaded** when running with `--methods` to specify a subset - other methods' results are loaded from cache and merged into the final report.
 
 ---
 

@@ -13,6 +13,46 @@ A lightweight toolkit for streaming CRISPR screen analysis that processes large 
 
 ## Migration Notes
 
+### v0.4.0 (Breaking Changes)
+
+**API Simplification & Default Changes:**
+
+This release simplifies the crispyx codebase by removing legacy optimization paths and standardizing defaults:
+
+1. **Default Parameter Changes:**
+   - `size_factor_scope` now defaults to `"global"` (was `"per_comparison"`) for better memory efficiency
+   - `use_control_cache=True` is now the default for NB-GLM tests
+
+2. **Removed Parameters (Breaking):**
+   - `optimization_method` removed from `NBGLMFitter` - L-BFGS-B is now the only optimizer
+   - `use_sparse`, `use_numba`, `joint_optimizer` removed from `nb_glm_test()` - these were only used by the removed IRLS path
+
+3. **Removed Functions (Breaking):**
+   - `estimate_joint_model_streaming()` removed - use `estimate_joint_model_lbfgsb()` instead
+   - Sparsity utility functions inlined: `compute_sparsity()`, `should_use_sparse_ops()`, `sparse_row_sums()`, `sparse_col_sums()`, `sparse_mean()`
+
+4. **Code Reorganization:**
+   - Numba kernels extracted to `crispyx/_kernels.py` for better modularity
+   - `glm.py` reduced from ~7000 to ~5400 lines
+
+**Migration Guide:**
+
+```python
+# Before (v0.3.x):
+from crispyx.glm import NBGLMFitter
+fitter = NBGLMFitter(design, optimization_method="irls")
+
+# After (v0.4.0):
+from crispyx.glm import NBGLMFitter
+fitter = NBGLMFitter(design)  # L-BFGS-B only
+
+# Before (v0.3.x):
+result = nb_glm_test(path, joint_optimizer="lbfgsb", use_sparse=True)
+
+# After (v0.4.0):
+result = nb_glm_test(path)  # L-BFGS-B is default, sparse params removed
+```
+
 ### v0.3.0+ (November 2025)
 
 **Breaking Changes: File Naming Standardization**

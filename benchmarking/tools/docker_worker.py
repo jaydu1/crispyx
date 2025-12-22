@@ -52,8 +52,15 @@ if str(WORKSPACE) not in sys.path:
 if str(WORKSPACE / "src") not in sys.path:
     sys.path.insert(0, str(WORKSPACE / "src"))
 
-# Import MemoryTracker from the shared memory module
-from benchmarking.tools.memory import MemoryTracker
+# Import MemoryTracker - handle both running from /app and from /workspace
+_script_dir = Path(__file__).parent
+if _script_dir.name == "app":
+    # Running from /app: import memory.py directly (copied alongside docker_worker.py)
+    sys.path.insert(0, str(_script_dir))
+    from memory import MemoryTracker
+else:
+    # Running from /workspace: import from benchmarking package
+    from benchmarking.tools.memory import MemoryTracker
 
 
 def _set_thread_env_vars(n_threads: int) -> None:
@@ -68,6 +75,15 @@ def _set_thread_env_vars(n_threads: int) -> None:
 
 def _import_function(module_name: str, function_name: str):
     """Dynamically import a function from a module."""
+    # Handle module path differences between host and container
+    # On host, modules might be src.crispyx.xxx, but in container they're crispyx.xxx
+    original_name = module_name
+    if module_name.startswith("src."):
+        module_name = module_name[4:]  # Strip "src." prefix
+    
+    # Debug: print what we're trying to import
+    print(f"DEBUG: Importing module '{original_name}' -> '{module_name}' function '{function_name}'", file=sys.stderr)
+    print(f"DEBUG: sys.path[:5] = {sys.path[:5]}", file=sys.stderr)
     module = import_module(module_name)
     return getattr(module, function_name)
 

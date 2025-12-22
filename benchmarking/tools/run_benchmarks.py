@@ -41,7 +41,8 @@ import anndata as ad
 from tqdm import tqdm
 
 # Ensure the local package is importable when the project has not been installed.
-REPO_ROOT = Path(__file__).resolve().parents[1]
+# Path: benchmarking/tools/run_benchmarks.py -> parents[2] = project root
+REPO_ROOT = Path(__file__).resolve().parents[2]
 SRC_PATH = REPO_ROOT / "src"
 if str(SRC_PATH) not in sys.path:
     sys.path.insert(0, str(SRC_PATH))
@@ -82,6 +83,34 @@ from crispyx.qc import quality_control_summary
 # ============================================================================
 # Increment this version when the cache format changes to force re-computation
 CACHE_VERSION = "1.0.0"
+
+
+# ============================================================================
+# Numba Warm-up for Fair Benchmarking
+# ============================================================================
+
+def _warmup_numba_jit():
+    """Trigger Numba JIT compilation before timed benchmarking.
+    
+    This ensures fair comparison by excluding one-time compilation overhead
+    from benchmark timings. The warm-up calls a minimal subset of Numba
+    functions used by nb_glm_test with tiny test data.
+    """
+    import numpy as np
+    from crispyx.glm import (
+        _nb_map_grid_search_numba,
+        _nb_ll_for_alpha,
+    )
+    
+    # Create minimal test data (10 cells, 5 genes)
+    Y_test = np.random.randint(0, 10, size=(10, 5)).astype(np.float64)
+    mu_test = np.ones((10, 5), dtype=np.float64) * 2.0
+    log_trend_test = np.zeros(5, dtype=np.float64)
+    log_alpha_grid = np.linspace(-8, 2, 5)  # 5 grid points
+    prior_var = 0.25
+    
+    # Trigger JIT compilation
+    _nb_map_grid_search_numba(Y_test, mu_test, log_trend_test, log_alpha_grid, prior_var)
 
 
 # ============================================================================
@@ -833,6 +862,8 @@ def run_nb_glm_integrated(
     size_factor_method: str = "deseq2",
     scale_size_factors: bool = False,
     gene_name_column: str | None = None,  # Accept but pass to nb_glm_test
+    use_control_cache: bool = True,  # Enable control cache for independent mode
+    size_factor_scope: str = "global",  # Use global size factors for memory efficiency
 ) -> Dict[str, Any]:
     """Run NB-GLM followed by LFC shrinkage, saving both base and shrunk results.
     
@@ -865,6 +896,12 @@ def run_nb_glm_integrated(
         Whether to scale size factors
     gene_name_column
         Column name for gene names (passed to nb_glm_test)
+    use_control_cache
+        If True, precompute control cell statistics once and reuse across
+        all perturbation comparisons. Only applies to independent mode.
+    size_factor_scope
+        Scope for size factor computation: "global" or "per_comparison".
+        "global" is more memory efficient; "per_comparison" matches PyDESeq2.
         
     Returns
     -------
@@ -881,6 +918,7 @@ def run_nb_glm_integrated(
     # Cast string parameters to their literal types
     size_factor_method_lit = cast(Literal["sparse", "deseq2"], size_factor_method)
     shrinkage_type_lit = cast(Literal["normal", "apeglm"], shrinkage_type)
+    size_factor_scope_lit = cast(Literal["global", "per_comparison"], size_factor_scope)
     
     # Step 1: Run NB-GLM base fitting
     t_base_start = time.perf_counter()
@@ -896,6 +934,8 @@ def run_nb_glm_integrated(
         size_factor_method=size_factor_method_lit,
         scale_size_factors=scale_size_factors,
         gene_name_column=gene_name_column,
+        use_control_cache=use_control_cache,
+        size_factor_scope=size_factor_scope_lit,
     )
     t_base_end = time.perf_counter()
     base_seconds = t_base_end - t_base_start
@@ -3364,7 +3404,7 @@ class DockerRunner:
         self.image_name = image_name
         self.memory_limit_gb = memory_limit_gb
         self.n_cores = n_cores
-        self.workspace_root = workspace_root or REPO_ROOT.parent
+        self.workspace_root = workspace_root or REPO_ROOT
         self.quiet = quiet
         
         # Validate Docker is available
@@ -3683,6 +3723,10 @@ def _worker(
     if not use_cgroups_memory:
         _apply_resource_limit(memory_limit, resource.RLIMIT_AS, "virtual memory")
     _apply_resource_limit(time_limit, resource.RLIMIT_CPU, "CPU time")
+
+    # Note: Numba JIT compilation is cached to disk (cache=True in decorators).
+    # First run after code changes may be slower, but subsequent runs use cache.
+    # No explicit warm-up needed - the cache handles this automatically.
 
     # Use MemoryTracker for memory measurement
     tracker = MemoryTracker(sample_interval=0.1)
@@ -4117,6 +4161,8 @@ def create_benchmark_suite(
                 "shrinkage_type": "apeglm",
                 "size_factor_method": "deseq2",
                 "scale_size_factors": False,
+                "use_control_cache": True,  # Enable memory-optimized control caching
+                "size_factor_scope": "global",  # Use global size factors for efficiency
             },
             summary=_summarise_runner_result,
         ),
@@ -4133,6 +4179,8 @@ def create_benchmark_suite(
                 "shrinkage_type": "apeglm",
                 "size_factor_method": "deseq2",
                 "scale_size_factors": False,
+                "use_control_cache": True,  # Not used for joint but included for consistency
+                "size_factor_scope": "global",  # Use global size factors for efficiency
             },
             summary=_summarise_runner_result,
         ),
@@ -4315,9 +4363,22 @@ def parse_args() -> argparse.Namespace:
         help="Force re-run all methods by clearing the .benchmark_cache directory",
     )
     parser.add_argument(
-        "--clear-results",
+        "--clear-results", "--clean",
         action="store_true",
+        dest="clear_results",
         help="Clear the entire output directory before running benchmarks",
+    )
+    parser.add_argument(
+        "--regenerate-report",
+        action="store_true",
+        help="Skip benchmark execution and only regenerate reports from existing cache",
+    )
+    parser.add_argument(
+        "--skip-existing",
+        dest="skip_existing",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Skip methods with existing output files (default: True). Use --no-skip-existing to force re-run of specified methods.",
     )
     return parser.parse_args()
 
@@ -4746,7 +4807,7 @@ def _run_single_benchmark(
             image_name=config.docker_image,
             memory_limit_gb=config.resource_limits.memory_limit,
             n_cores=config.n_cores or 8,
-            workspace_root=REPO_ROOT.parent,
+            workspace_root=REPO_ROOT,
             quiet=config.quiet,
         )
         # Ensure Docker image is available
@@ -4812,9 +4873,9 @@ def _run_single_benchmark(
                         postfix_dict["time"] = f"{runtime:.1f}s"
                     method_iterator.set_postfix(postfix_dict, refresh=False)  # type: ignore
             else:
-                # No cache, but output exists - create minimal row and save to cache
+                # No cache, but output exists - create minimal row with basic metadata
                 if not config.quiet:
-                    print(f"  ⏭️  Skipping {method.name} (output exists)")
+                    print(f"  ⏭️  Skipping {method.name} (output exists, recovering metadata)")
                 
                 existing_path = _get_expected_output_path(method.name, config.output_dir)
                 row = {
@@ -4826,17 +4887,56 @@ def _run_single_benchmark(
                     "result_path": _normalise_path(existing_path, context) if existing_path else None,
                 }
                 
-                # Save to cache so future runs can find result_path for comparisons
-                _save_method_result(method.name, row, config.output_dir)
+                # Try to extract metadata and performance stats from the output file
+                if existing_path and existing_path.exists():
+                    try:
+                        if existing_path.suffix == ".h5ad":
+                            import anndata as ad
+                            adata_meta = ad.read_h5ad(existing_path, backed='r')
+                            row["genes"] = adata_meta.n_vars
+                            row["cells"] = adata_meta.n_obs
+                            
+                            # Try to extract performance stats from uns if available
+                            if hasattr(adata_meta, 'uns'):
+                                uns = adata_meta.uns
+                                # Check for de_results groups
+                                if 'de_results' in uns:
+                                    row["groups"] = len(uns.get('de_results', {}))
+                                # Check for benchmark metadata stored in uns
+                                if 'benchmark_metadata' in uns:
+                                    meta = uns['benchmark_metadata']
+                                    if 'elapsed_seconds' in meta:
+                                        row["elapsed_seconds"] = float(meta['elapsed_seconds'])
+                                    if 'peak_memory_mb' in meta:
+                                        row["peak_memory_mb"] = float(meta['peak_memory_mb'])
+                                # Also check for timing info stored directly
+                                for key in ['elapsed_seconds', 'runtime_seconds', 'total_seconds']:
+                                    if key in uns and row.get("elapsed_seconds") is None:
+                                        row["elapsed_seconds"] = float(uns[key])
+                                for key in ['peak_memory_mb', 'max_memory_mb', 'memory_mb']:
+                                    if key in uns and row.get("peak_memory_mb") is None:
+                                        row["peak_memory_mb"] = float(uns[key])
+                            
+                            adata_meta.file.close()
+                        elif existing_path.suffix == ".csv":
+                            df_meta = pd.read_csv(existing_path, nrows=0)
+                            row["columns"] = list(df_meta.columns)
+                    except Exception:
+                        pass  # Silently ignore metadata extraction errors
                 
                 rows.append(row)
                 
-                # Update progress bar for skipped items
+                # Save minimal cache entry to avoid repeated "no metrics" warnings
+                _save_method_result(method.name, row, config.output_dir)
+                
+                # Update progress bar for skipped items (show recovered stats if available)
                 if show_progress:
+                    mem_str = f"{row['peak_memory_mb']:.0f}MB" if row.get('peak_memory_mb') else "--"
+                    time_str = f"{row['elapsed_seconds']:.1f}s" if row.get('elapsed_seconds') else "--"
                     method_iterator.set_postfix(  # type: ignore
                         status="skipped",
-                        memory="--",
-                        time="--",
+                        memory=mem_str,
+                        time=time_str,
                         refresh=False
                     )
             continue
@@ -4886,10 +4986,31 @@ def _run_single_benchmark(
     cached_results = _load_cached_results(config.output_dir)
     executed_methods = {row["method"] for row in rows}
     
+    # Track statistics for merge summary
+    cached_count = 0
+    skipped_count = sum(1 for r in rows if r.get("status") == "skipped_existing" or 
+                        (r.get("status") == "success" and r.get("method") not in 
+                         {m.name for m in available_methods.values() if m.name in selected_names}))
+    executed_count = sum(1 for r in rows if r.get("status") not in ("skipped_existing", None) and 
+                         r.get("method") in selected_names)
+    
     # Add cached results for methods that weren't executed this run
     for cached_row in cached_results:
-        if cached_row.get("method") not in executed_methods:
+        method_name = cached_row.get("method")
+        if method_name not in executed_methods:
             rows.append(cached_row)
+            cached_count += 1
+    
+    # Display merge summary if we loaded cached results
+    if not config.quiet and (cached_count > 0 or skipped_count > 0):
+        print(f"\n📊 Benchmark Result Summary:")
+        if executed_count > 0:
+            print(f"   ✅ Newly executed: {executed_count} method(s)")
+        if skipped_count > 0:
+            print(f"   ⏭️  Skipped (output exists): {skipped_count} method(s)")
+        if cached_count > 0:
+            print(f"   💾 Loaded from cache: {cached_count} method(s)")
+        print(f"   📋 Total results: {len(rows)} method(s)")
     
     # Create metadata dict
     metadata = {
@@ -4946,6 +5067,10 @@ def main() -> None:
             if args.methods is not None:
                 config.methods_to_run = args.methods
             
+            # Allow CLI to override skip_existing
+            if hasattr(args, 'skip_existing') and args.skip_existing is not None:
+                config.skip_existing = args.skip_existing
+            
             # Handle Docker flags from CLI (CLI takes precedence)
             if hasattr(args, 'use_docker') and args.use_docker:
                 config.use_docker = True
@@ -4974,6 +5099,9 @@ def main() -> None:
         else:
             memory_limit = 0
             
+        # Determine skip_existing from CLI (default True if not specified)
+        skip_existing_value = args.skip_existing if args.skip_existing is not None else True
+        
         # Create single config from CLI args
         configs = [BenchmarkConfig(
             dataset_path=dataset_path,
@@ -4991,6 +5119,7 @@ def main() -> None:
             chunk_size=args.chunk_size if hasattr(args, 'chunk_size') else None,
             use_docker=args.use_docker if hasattr(args, 'use_docker') else False,
             docker_image=args.docker_image if hasattr(args, 'docker_image') else "crispyx-benchmark:latest",
+            skip_existing=skip_existing_value,
         )]
     
     # Handle --build-docker flag
@@ -5011,6 +5140,7 @@ def main() -> None:
                 shutil.rmtree(config.output_dir)
     
     # Handle --force flag (clear cache to force re-run of all methods)
+    # Also sets skip_existing=False for all configs to ensure methods are re-run
     if hasattr(args, 'force') and args.force:
         for config in configs:
             cache_dir = config.output_dir / ".benchmark_cache"
@@ -5018,6 +5148,27 @@ def main() -> None:
                 import shutil
                 print(f"Clearing benchmark cache: {cache_dir}")
                 shutil.rmtree(cache_dir)
+            # When force is specified, disable skip_existing unless explicitly set
+            if args.skip_existing is None:
+                config.skip_existing = False
+    
+    # Handle --regenerate-report flag (skip execution, only regenerate reports)
+    if hasattr(args, 'regenerate_report') and args.regenerate_report:
+        for i, config in enumerate(configs):
+            if len(configs) > 1:
+                print(f"\n{'='*60}")
+                print(f"Dataset {i+1}/{len(configs)}: {config.dataset_name}")
+                print(f"{'='*60}")
+            
+            cache_dir = config.output_dir / ".benchmark_cache"
+            if not cache_dir.exists():
+                print(f"Warning: No cache found at {cache_dir}, skipping {config.dataset_name}")
+                continue
+            
+            print(f"Regenerating reports from cache: {config.output_dir}")
+            evaluate_benchmarks(config.output_dir)
+            print(f"  Report: {config.output_dir / 'benchmark_report.md'}")
+        return
     
     # Run benchmarks for each configuration
     for i, config in enumerate(configs):

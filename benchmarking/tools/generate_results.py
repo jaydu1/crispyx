@@ -303,6 +303,40 @@ def _load_cached_results(output_dir: Path) -> List[Dict[str, Any]]:
     return cached_results
 
 
+def _has_valid_result(row: pd.Series, output_dir: Path) -> bool:
+    """Check if a method row has valid results that can be loaded.
+    
+    Returns True if:
+    - status is "success", OR
+    - status is "skipped_existing" and result file exists
+    
+    This allows cached/skipped methods to be included in reports and visualizations.
+    
+    Parameters
+    ----------
+    row : pd.Series
+        Row from the benchmark results DataFrame
+    output_dir : Path
+        Output directory for the dataset
+        
+    Returns
+    -------
+    bool
+        True if the method has valid results that can be loaded
+    """
+    status = row.get("status")
+    if status == "success":
+        return True
+    if status == "skipped_existing":
+        # Check if result file exists
+        method_name = row.get("method")
+        result_path_val = row.get("result_path")
+        resolved_path = _resolve_result_path(method_name, result_path_val, output_dir)
+        if resolved_path is not None and resolved_path.exists():
+            return True
+    return False
+
+
 def _load_cache_config(output_dir: Path) -> Optional[Dict[str, Any]]:
     """Load cache configuration.
     
@@ -861,6 +895,7 @@ def _generate_improved_markdown(
                 rows = []
                 for comp in comps:
                     comparison = comp["comparison"]
+                    comp_type = comp.get("comp_type", "de")
                     parts = comparison.split(" vs ")
                     method_a_raw = parts[0]
                     method_b_raw = parts[1]
@@ -879,10 +914,13 @@ def _generate_improved_markdown(
                         "crispyx method": method_a,
                     }
                     if is_nb_glm:
-                        # Use tick mark for lfcShrink columns
-                        row["lfcShrink"] = "✓" if _get_shrinkage_type(method_a_raw) else ""
+                        # Only show lfcShrink tick for de_lfcshrink comparisons
+                        is_shrunk_comp = (comp_type == "de_lfcshrink")
+                        row["lfcShrink"] = "✓" if is_shrunk_comp else ""
                         row["compared to"] = method_b
-                        row["lfcShrink (ref)"] = "✓" if _get_shrinkage_type(method_b_raw) else ""
+                        # Reference tool lfcShrink: edgeR never has shrinkage, PyDESeq2 only in de_lfcshrink
+                        ref_has_shrink = is_shrunk_comp and "pertpy" in method_b_raw.lower()
+                        row["lfcShrink (ref)"] = "✓" if ref_has_shrink else ""
                     else:
                         row["compared to"] = method_b
                     row.update({
@@ -1003,6 +1041,7 @@ def _generate_improved_markdown(
                     rows = []
                     for acc in accs:
                         comparison = acc["comparison"]
+                        comp_type = acc.get("comp_type", "de")
                         parts = comparison.split(" vs ")
                         method_a_raw = parts[0]
                         method_b_raw = parts[1]
@@ -1026,10 +1065,13 @@ def _generate_improved_markdown(
                             "crispyx method": method_a,
                         }
                         if is_nb_glm:
-                            # Use tick mark for lfcShrink columns
-                            row["lfcShrink"] = "✓" if _get_shrinkage_type(method_a_raw) else ""
+                            # Only show lfcShrink tick for de_lfcshrink comparisons
+                            is_shrunk_comp = (comp_type == "de_lfcshrink")
+                            row["lfcShrink"] = "✓" if is_shrunk_comp else ""
                             row["compared to"] = method_b
-                            row["lfcShrink (ref)"] = "✓" if _get_shrinkage_type(method_b_raw) else ""
+                            # Reference tool lfcShrink: edgeR never has shrinkage, PyDESeq2 only in de_lfcshrink
+                            ref_has_shrink = is_shrunk_comp and "pertpy" in method_b_raw.lower()
+                            row["lfcShrink (ref)"] = "✓" if ref_has_shrink else ""
                         else:
                             row["compared to"] = method_b
                         row.update({
@@ -1112,9 +1154,15 @@ def _generate_improved_markdown(
             rows = []
             for acc in accuracy_results:
                 comparison = acc["comparison"]
+                comp_type = acc.get("comp_type", "de")
                 parts = comparison.split(" vs ")
                 method_a_raw = parts[0]
                 method_b_raw = parts[1]
+                
+                # Only include crispyx comparisons in this table
+                if not _is_crispyx_method(method_a_raw):
+                    continue
+                
                 method_a = _format_method_name(method_a_raw)
                 method_b = _format_full_method_name(method_b_raw)
                 
@@ -1140,9 +1188,12 @@ def _generate_improved_markdown(
                     else:
                         return "❌"
                 
-                # Use tick for lfcShrink columns
-                shrink_a = "✓" if _get_shrinkage_type(method_a_raw) else ""
-                shrink_b = "✓" if _get_shrinkage_type(method_b_raw) else ""
+                # Only show lfcShrink tick for de_lfcshrink comparisons
+                is_shrunk_comp = (comp_type == "de_lfcshrink")
+                shrink_a = "✓" if is_shrunk_comp else ""
+                # Reference tool lfcShrink: edgeR never has shrinkage, PyDESeq2 only in de_lfcshrink
+                ref_has_shrink = is_shrunk_comp and "pertpy" in method_b_raw.lower()
+                shrink_b = "✓" if ref_has_shrink else ""
                 
                 rows.append({
                     "crispyx method": method_a,
@@ -1303,9 +1354,12 @@ def evaluate_benchmarks(output_dir: Path) -> None:
     # Explicitly collect all DE methods for heatmaps (base results)
     for method_name in ALL_DE_METHODS_FOR_HEATMAP:
         method_res = df[df["method"] == method_name]
-        if method_res.empty or method_res.iloc[0]["status"] != "success":
+        if method_res.empty:
             continue
-        result_path_val = method_res.iloc[0].get("result_path")
+        row = method_res.iloc[0]
+        if not _has_valid_result(row, output_dir):
+            continue
+        result_path_val = row.get("result_path")
         # Now _load_de_result handles fallback, so we can always try to load
         if method_name not in de_results_for_heatmaps:
             method_df = _load_de_result(method_name, result_path_val)
@@ -1315,9 +1369,12 @@ def evaluate_benchmarks(output_dir: Path) -> None:
     # Also collect shrunk results for heatmaps (stored with _shrunk suffix)
     for method_name in METHODS_WITH_SHRUNK_OUTPUT:
         method_res = df[df["method"] == method_name]
-        if method_res.empty or method_res.iloc[0]["status"] != "success":
+        if method_res.empty:
             continue
-        shrunk_path_val = method_res.iloc[0].get("shrunk_result_path")
+        row = method_res.iloc[0]
+        if not _has_valid_result(row, output_dir):
+            continue
+        shrunk_path_val = row.get("shrunk_result_path")
         if pd.isna(shrunk_path_val) or shrunk_path_val is None:
             continue
         shrunk_method_name = f"{method_name}_shrunk"
@@ -1358,20 +1415,34 @@ def evaluate_benchmarks(output_dir: Path) -> None:
         
         if method_a_res.empty or method_b_res.empty:
             continue
-            
-        if method_a_res.iloc[0]["status"] != "success" or method_b_res.iloc[0]["status"] != "success":
-            continue
-            
+        
         a_row = method_a_res.iloc[0]
         b_row = method_b_res.iloc[0]
         
-        a_time = a_row.get("elapsed_seconds", np.nan)
-        b_time = b_row.get("elapsed_seconds", np.nan)
+        # Check if both methods have valid results (success or skipped_existing with file)
+        if not _has_valid_result(a_row, output_dir) or not _has_valid_result(b_row, output_dir):
+            continue
+        
+        # For de comparisons (non-shrunk), use base_seconds if available
+        # For de_lfcshrink comparisons (shrunk), use full elapsed_seconds
+        if comp_type == "de" and "NB GLM" in _get_method_category(method_a_name)[0]:
+            # Use base_seconds for NB-GLM base comparisons
+            a_time = a_row.get("base_seconds", np.nan)
+            if pd.isna(a_time):
+                a_time = a_row.get("elapsed_seconds", np.nan)
+            b_time = b_row.get("base_seconds", np.nan)
+            if pd.isna(b_time):
+                b_time = b_row.get("elapsed_seconds", np.nan)
+        else:
+            a_time = a_row.get("elapsed_seconds", np.nan)
+            b_time = b_row.get("elapsed_seconds", np.nan)
+        
         a_mem = a_row.get("peak_memory_mb", np.nan)
         b_mem = b_row.get("peak_memory_mb", np.nan)
         
         comp = {
             "comparison": f"{method_a_name} vs {method_b_name}",
+            "comp_type": comp_type,  # Store comparison type for display
             "method_a_time_s": a_time,
             "method_b_time_s": b_time,
             "time_diff_s": a_time - b_time if _is_scalar_notna(a_time) and _is_scalar_notna(b_time) else None,
@@ -1409,6 +1480,7 @@ def evaluate_benchmarks(output_dir: Path) -> None:
             if comp_type == "qc":
                 acc = {
                     "comparison": f"{method_a_name} vs {method_b_name}",
+                    "comp_type": comp_type,
                     "cells_diff": float(method_a_res.iloc[0]["cells_kept"] - method_b_res.iloc[0]["cells_kept"]),
                     "genes_diff": float(method_a_res.iloc[0]["genes_kept"] - method_b_res.iloc[0]["genes_kept"]),
                 }
@@ -1428,7 +1500,7 @@ def evaluate_benchmarks(output_dir: Path) -> None:
                     continue
                 
                 metrics = compute_de_comparison_metrics(method_a_df, method_b_df)
-                acc = {"comparison": f"{method_a_name} vs {method_b_name}"}
+                acc = {"comparison": f"{method_a_name} vs {method_b_name}", "comp_type": comp_type}
                 acc.update(metrics)
                 accuracy_results.append(acc)
             
@@ -1441,7 +1513,7 @@ def evaluate_benchmarks(output_dir: Path) -> None:
                     continue
                 
                 metrics = compute_de_comparison_metrics(method_a_df, method_b_df)
-                acc = {"comparison": f"{method_a_name} vs {method_b_name}"}
+                acc = {"comparison": f"{method_a_name} vs {method_b_name}", "comp_type": comp_type}
                 acc.update(metrics)
                 accuracy_results.append(acc)
             
@@ -1454,7 +1526,7 @@ def evaluate_benchmarks(output_dir: Path) -> None:
                     continue
                 
                 metrics = compute_de_comparison_metrics(method_a_df, method_b_df)
-                acc = {"comparison": f"{method_a_name} vs {method_b_name} (lfcShrink)"}
+                acc = {"comparison": f"{method_a_name} vs {method_b_name}", "comp_type": comp_type}
                 acc.update(metrics)
                 accuracy_results.append(acc)
                 
