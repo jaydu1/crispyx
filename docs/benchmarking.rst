@@ -37,14 +37,14 @@ for further details.
 Available NB-GLM benchmark methods
 ----------------------------------
 
-The benchmark suite includes three NB-GLM variants to compare fitting strategies:
+The benchmark suite includes the following NB-GLM variants:
 
-* ``crispyx_de_nb_glm``: Independent fitting (each perturbation fit separately)
-* ``crispyx_de_nb_glm_joint``: Joint fitting with shared intercept from control cells
-* ``crispyx_de_nb_glm_joint_shared_disp``: Joint fitting with shared intercept AND shared dispersion
+* ``crispyx_de_nb_glm``: Standard NB-GLM differential expression
+* ``crispyx_de_nb_glm_shrunk``: NB-GLM with apeGLM LFC shrinkage (recommended)
 
-These allow systematic comparison of accuracy and runtime trade-offs between
-fitting strategies on your dataset.
+The shrinkage variant applies adaptive Cauchy prior shrinkage to log-fold changes,
+which improves accuracy by preserving large effects while shrinking uncertain 
+estimates toward zero.
 
 Latest Adamson_subset benchmark
 -------------------------------

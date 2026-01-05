@@ -99,55 +99,94 @@ returned :class:`cx.AnnData` wrapper stores previews of the results in
 ``.uns`` so printing ``adata.uns["rank_genes_groups"]`` shows the top genes
 per perturbation while ``.load()`` retrieves the full tables on demand.
 
-NB-GLM fitting methods
-~~~~~~~~~~~~~~~~~~~~~~
+NB-GLM options
+~~~~~~~~~~~~~~
 
-The negative binomial GLM (``method="nb_glm"``) supports two fitting strategies
-via the ``fit_method`` parameter:
+The negative binomial GLM (``method="nb_glm"``) supports several options:
 
-* ``fit_method="independent"`` (default): Each perturbation is fit separately
-  against the control population. This is faster and suitable when you have
-  few perturbations or expect heterogeneous effects.
+* **LFC shrinkage**: For improved accuracy, apply adaptive Cauchy prior 
+  shrinkage to log-fold changes using ``shrink_lfc()`` after running 
+  ``nb_glm_test()``. This preserves large effects while shrinking 
+  small/uncertain effects toward zero.
 
-* ``fit_method="joint"``: Estimates a global intercept (baseline expression)
-  from control cells, then fits perturbation effects relative to this shared
-  baseline. This provides more stable estimates when you have many perturbations
-  and expect similar baseline expression across conditions.
-
-Additionally, the ``share_dispersion`` parameter controls dispersion estimation:
-
-* ``share_dispersion=False`` (default): Dispersion is estimated separately for
-  each perturbation comparison.
-
-* ``share_dispersion=True``: Dispersion is estimated once using all cells
-  (similar to PyDESeq2's approach). This is more stable when sample sizes are
-  small or when you expect homogeneous dispersion across perturbations.
+* **Dispersion sharing** (``share_dispersion=True``): Estimate dispersion once 
+  using all cells (similar to PyDESeq2's approach). This provides more stable 
+  estimates when sample sizes are small or when you expect homogeneous 
+  dispersion across perturbations.
 
 .. code-block:: python
 
-   # Independent fitting (default, faster)
+   # Basic NB-GLM (faster, per-perturbation dispersion)
    adata_de = cx.tl.rank_genes_groups(
        adata_ro,
        perturbation_column="perturbation",
        method="nb_glm",
    )
 
-   # Joint fitting with shared intercept
+   # NB-GLM with shared dispersion
    adata_de = cx.tl.rank_genes_groups(
        adata_ro,
        perturbation_column="perturbation",
        method="nb_glm",
-       fit_method="joint",
-   )
-
-   # Joint fitting with shared intercept AND shared dispersion
-   adata_de = cx.tl.rank_genes_groups(
-       adata_ro,
-       perturbation_column="perturbation",
-       method="nb_glm",
-       fit_method="joint",
        share_dispersion=True,
    )
+
+LFC shrinkage
+~~~~~~~~~~~~~
+
+For more accurate log-fold change estimates, apply apeGLM shrinkage after
+running the NB-GLM test. This two-step workflow matches DESeq2/PyDESeq2
+best practices:
+
+.. code-block:: python
+
+   # Step 1: Run NB-GLM test
+   result = cx.nb_glm_test(
+       adata_ro,
+       perturbation_column="perturbation",
+   )
+   
+   # Step 2: Apply LFC shrinkage
+   shrunk = cx.shrink_lfc(
+       result.result_path,
+       prior_scale_mode="global",  # or "per_comparison"
+   )
+
+The ``prior_scale_mode`` parameter controls how the shrinkage prior is estimated:
+
+* ``"global"`` (default): Estimate a single prior scale from all comparisons.
+  Recommended for CRISPR screens with many perturbations.
+* ``"per_comparison"``: Estimate prior scale separately for each perturbation.
+  May be more accurate when effect sizes vary substantially across perturbations.
+
+You can also use ``cx.tl.shrink_lfc()`` for API consistency with other tools:
+
+.. code-block:: python
+
+   shrunk = cx.tl.shrink_lfc(
+       result.result_path,
+       prior_scale_mode="global",
+   )
+
+Resume and checkpointing
+~~~~~~~~~~~~~~~~~~~~~~~~
+
+Long-running differential expression analyses can be resumed after interruption
+using the ``resume`` and ``checkpoint_interval`` parameters:
+
+.. code-block:: python
+
+   # Enable checkpointing during long runs
+   result = cx.nb_glm_test(
+       adata_ro,
+       perturbation_column="perturbation",
+       resume=True,
+       checkpoint_interval=10,  # Save progress every 10 perturbations
+   )
+
+If interrupted, simply re-run the same command - completed perturbations will
+be skipped automatically. The checkpoint file ``<output>_progress.json`` is
+written atomically to prevent corruption.
 
 Benchmarking
 ------------

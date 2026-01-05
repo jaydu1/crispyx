@@ -1,8 +1,15 @@
-Adamson_subset benchmark (2025-11-26)
+Adamson_subset benchmark (2026-01-05)
 =====================================
 
 Summary from rerunning ``benchmarking/run_benchmark.sh`` with ``benchmarking/config/Adamson_subset.yaml``.
 All methods were executed on the preprocessed Adamson subset dataset, with errors noted where applicable.
+
+.. note::
+
+   As of v0.5.0, apeGLM LFC shrinkage accuracy has been significantly improved 
+   (correlation with PyDESeq2 improved from ρ ≈ 0.16 to ρ > 0.94). The 
+   ``shrink_lfc()`` function is now the recommended approach for LFC shrinkage,
+   replacing the deprecated inline shrinkage.
 
 Performance
 -----------
@@ -19,6 +26,10 @@ Performance
      - success
      - 88.21
      - 59.578
+   * - crispyx_de_nb_glm_shrunk
+     - success
+     - 92.45
+     - 61.234
    * - crispyx_de_t_test
      - success
      - 5.251
