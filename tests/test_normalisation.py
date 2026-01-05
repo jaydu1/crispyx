@@ -20,7 +20,7 @@ import scipy.sparse as sp
 import anndata as ad
 import scanpy as sc
 import h5py
-from scipy.stats import norm, rankdata
+from scipy.stats import norm, rankdata, t as t_dist
 
 from crispyx.data import ensure_gene_symbol_column
 from crispyx.de import _tie_correction, t_test, wilcoxon_test
@@ -120,7 +120,11 @@ def _assert_t_test_matches_scanpy(path, adata, tmp_path):
         else:
             var = np.zeros_like(mean)
         effect = mean - ctrl_mean
-        se = np.sqrt(ctrl_var / ctrl_data.shape[0] + var / pert_data.shape[0])
+        n_ctrl = ctrl_data.shape[0]
+        n_pert = pert_data.shape[0]
+        var_term_ctrl = ctrl_var / n_ctrl
+        var_term_pert = var / n_pert
+        se = np.sqrt(var_term_ctrl + var_term_pert)
         raw_pert_X = adata[mask].X
         pert_expr = np.asarray(_to_dense(raw_pert_X) > 0).sum(axis=0).ravel()
         total_expr = ctrl_expr + pert_expr
@@ -128,13 +132,23 @@ def _assert_t_test_matches_scanpy(path, adata, tmp_path):
         z = np.zeros_like(effect)
         pvalue = np.ones_like(effect)
         z[valid] = effect[valid] / se[valid]
-        pvalue[valid] = 2 * norm.sf(np.abs(z[valid]))
+        # Welch-Satterthwaite degrees of freedom for Welch's t-test
+        numerator = (var_term_ctrl + var_term_pert) ** 2
+        denominator = np.zeros_like(numerator)
+        if n_ctrl > 1:
+            denominator += (var_term_ctrl ** 2) / (n_ctrl - 1)
+        if n_pert > 1:
+            denominator += (var_term_pert ** 2) / (n_pert - 1)
+        df_welch = np.where(denominator > 0, numerator / denominator, 1e6)
+        df_welch = np.clip(df_welch, 1.0, None)
+        pvalue[valid] = 2 * t_dist.sf(np.abs(z[valid]), df_welch[valid])
 
         # Use looser tolerance due to float32 intermediate values in crispyx
         # (matches scanpy's approach for memory efficiency)
         np.testing.assert_allclose(result.effect_size, effect, rtol=1e-4, atol=1e-5)
         np.testing.assert_allclose(result.statistic, z, rtol=1e-3, atol=0.1)
-        np.testing.assert_allclose(result.pvalue, pvalue, rtol=1e-4, atol=1e-8)
+        # p-values need slightly looser tolerance for Welch df calculations with float32 intermediates
+        np.testing.assert_allclose(result.pvalue, pvalue, rtol=1e-3, atol=1e-6)
         assert result.result_path == output_path
 
 

@@ -26,6 +26,7 @@ from crispyx import (
     quality_control_summary,
     t_test,
     wilcoxon_test,
+    nb_glm_test,
 )
 
 
@@ -393,3 +394,168 @@ def test_scanpy_style_namespaces_match_direct(tmp_path):
     wilcoxon_wrapped.close()
     qc_wrapped.close()
     qc_direct.filtered.close()
+
+
+def test_nb_glm_resume_checkpoint(tmp_path):
+    """Test that resume=True correctly skips completed perturbations."""
+    # Create a dataset with multiple perturbations
+    rng = np.random.default_rng(42)
+    n_cells = 60
+    n_genes = 8
+    perturbations = np.array(["ctrl"] * 20 + ["KO1"] * 20 + ["KO2"] * 20)
+    counts = rng.poisson(10, size=(n_cells, n_genes))
+    obs = pd.DataFrame({"perturbation": perturbations})
+    obs.index = [f"cell_{i}" for i in range(n_cells)]
+    var = pd.DataFrame(index=[f"gene{j}" for j in range(n_genes)])
+    adata = ad.AnnData(counts, obs=obs, var=var)
+    path = tmp_path / "resume_test.h5ad"
+    adata.write(path)
+
+    # Run the first time
+    result1 = nb_glm_test(
+        path,
+        perturbation_column="perturbation",
+        control_label="ctrl",
+        checkpoint_interval=1,
+        output_dir=tmp_path,
+        data_name="resume",
+    )
+    assert result1.groups == ["KO1", "KO2"]
+    output_path1 = result1.result_path
+
+    # Checkpoint should be cleaned up on successful completion
+    checkpoint_path = output_path1.with_suffix(".progress.json")
+    assert not checkpoint_path.exists()
+
+    # Run again with resume=True - should succeed quickly (no work to do)
+    result2 = nb_glm_test(
+        path,
+        perturbation_column="perturbation",
+        control_label="ctrl",
+        resume=True,
+        checkpoint_interval=1,
+        output_dir=tmp_path,
+        data_name="resume",
+    )
+    # Results should be identical
+    np.testing.assert_allclose(result1.statistics, result2.statistics)
+    np.testing.assert_allclose(result1.pvalues, result2.pvalues)
+
+
+def test_wilcoxon_resume_checkpoint(tmp_path):
+    """Test that wilcoxon_test resume=True works correctly."""
+    rng = np.random.default_rng(123)
+    n_cells = 40
+    n_genes = 10
+    perturbations = np.array(["ctrl"] * 20 + ["KO1"] * 20)
+    # Log-normalized data for wilcoxon (must be sparse)
+    x = rng.normal(5, 1, size=(n_cells, n_genes))
+    obs = pd.DataFrame({"perturbation": perturbations})
+    obs.index = [f"cell_{i}" for i in range(n_cells)]
+    var = pd.DataFrame(index=[f"gene{j}" for j in range(n_genes)])
+    adata = ad.AnnData(sp.csr_matrix(x), obs=obs, var=var)
+    path = tmp_path / "wilcoxon_resume.h5ad"
+    adata.write(path)
+
+    result1 = wilcoxon_test(
+        path,
+        perturbation_column="perturbation",
+        control_label="ctrl",
+        checkpoint_interval=2,
+        output_dir=tmp_path,
+        data_name="wilcox_resume",
+    )
+
+    # Run again with resume - should work
+    result2 = wilcoxon_test(
+        path,
+        perturbation_column="perturbation",
+        control_label="ctrl",
+        resume=True,
+        checkpoint_interval=2,
+        output_dir=tmp_path,
+        data_name="wilcox_resume",
+    )
+    np.testing.assert_allclose(result1.statistics, result2.statistics)
+
+
+def test_empty_perturbation_group_error(tmp_path):
+    """Test that empty perturbation groups raise helpful errors."""
+    x = np.array([[1, 2], [3, 4]], dtype=float)
+    obs = pd.DataFrame({"perturbation": ["ctrl", "ctrl"]})
+    obs.index = ["cell_0", "cell_1"]
+    var = pd.DataFrame(index=["gene0", "gene1"])
+    adata = ad.AnnData(x, obs=obs, var=var)
+    path = tmp_path / "empty_pert.h5ad"
+    adata.write(path)
+
+    # Request a perturbation that doesn't exist
+    try:
+        wilcoxon_test(
+            path,
+            perturbation_column="perturbation",
+            control_label="ctrl",
+            perturbations=["nonexistent"],
+        )
+        raise AssertionError("Expected ValueError for nonexistent perturbation")
+    except ValueError as e:
+        assert "nonexistent" in str(e).lower() or "no cells" in str(e).lower()
+
+
+def test_single_cell_perturbation(tmp_path):
+    """Test handling of perturbations with very few cells."""
+    rng = np.random.default_rng(456)
+    # ctrl: 10 cells, KO1: 1 cell
+    perturbations = np.array(["ctrl"] * 10 + ["KO1"])
+    x = rng.normal(5, 1, size=(11, 5))
+    obs = pd.DataFrame({"perturbation": perturbations})
+    obs.index = [f"cell_{i}" for i in range(11)]
+    var = pd.DataFrame(index=[f"gene{j}" for j in range(5)])
+    adata = ad.AnnData(sp.csr_matrix(x), obs=obs, var=var)
+    path = tmp_path / "single_cell.h5ad"
+    adata.write(path)
+
+    # Should still run, even with single cell perturbation
+    result = wilcoxon_test(
+        path,
+        perturbation_column="perturbation",
+        control_label="ctrl",
+        output_dir=tmp_path,
+        data_name="single",
+    )
+    assert result.groups == ["KO1"]
+    # Results may have NaN or inf, but shouldn't crash
+    assert result.pvalues.shape == (1, 5)
+
+
+def test_all_zero_gene(tmp_path):
+    """Test handling of genes with all-zero counts."""
+    rng = np.random.default_rng(789)
+    n_cells = 30
+    perturbations = np.array(["ctrl"] * 15 + ["KO1"] * 15)
+    counts = rng.poisson(5, size=(n_cells, 4))
+    # Make one gene all zeros
+    counts[:, 2] = 0
+    obs = pd.DataFrame({"perturbation": perturbations})
+    obs.index = [f"cell_{i}" for i in range(n_cells)]
+    var = pd.DataFrame(index=["gene0", "gene1", "zero_gene", "gene3"])
+    adata = ad.AnnData(counts, obs=obs, var=var)
+    path = tmp_path / "zero_gene.h5ad"
+    adata.write(path)
+
+    result = nb_glm_test(
+        path,
+        perturbation_column="perturbation",
+        control_label="ctrl",
+        min_cells_expressed=0,
+        output_dir=tmp_path,
+        data_name="zero",
+    )
+    # All-zero gene should have p-value=1 or NaN, but not crash
+    assert result.pvalues.shape == (1, 4)
+    # The zero gene should not have a significant p-value (should be clearly non-significant)
+    # We use a relaxed threshold since numerical precision may produce values slightly below 1.0
+    zero_gene_pval = result.pvalues[0, 2]
+    assert zero_gene_pval >= 0.5 or not np.isfinite(zero_gene_pval), (
+        f"Zero gene p-value {zero_gene_pval} is unexpectedly low (should be non-significant)"
+    )

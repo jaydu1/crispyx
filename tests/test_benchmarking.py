@@ -72,7 +72,12 @@ def test_create_benchmark_suite_infers_control_label(tmp_path: Path) -> None:
     methods = create_benchmark_suite(dataset_path, tmp_path)
 
     assert methods  # sanity check
+    # Only check methods that don't depend on other methods (lfcShrink methods
+    # don't have control_label since they process results from base methods)
+    primary_methods = {
+        name: method for name, method in methods.items() if method.depends_on is None
+    }
     control_labels = {
-        method.kwargs.get("control_label") for method in methods.values()
+        method.kwargs.get("control_label") for method in primary_methods.values()
     }
     assert control_labels == {"non_target_control"}

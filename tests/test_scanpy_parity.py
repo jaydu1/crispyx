@@ -15,7 +15,7 @@ import numpy as np
 import pandas as pd
 import pytest
 import scipy.sparse as sp
-from scipy.stats import norm, rankdata
+from scipy.stats import norm, rankdata, t as t_dist
 import scanpy as sc
 
 from crispyx import (
@@ -261,14 +261,25 @@ def test_differential_expression_matches_scanpy(subset_dataset, tmp_path):
         if n_cells > 1:
             group_var = group_log.var(axis=0, ddof=1)
         effect = group_mean - control_mean
-        se = np.sqrt(control_var / max(control_n, 1) + group_var / max(n_cells, 1))
+        var_term_ctrl = control_var / max(control_n, 1)
+        var_term_pert = group_var / max(n_cells, 1)
+        se = np.sqrt(var_term_ctrl + var_term_pert)
         expr_group = np.count_nonzero(raw[mask], axis=0)
         total_expr = expr_control + expr_group
         valid = (se > 0) & (total_expr >= 0)
         z = np.zeros_like(effect)
         p = np.ones_like(effect)
         z[valid] = effect[valid] / se[valid]
-        p[valid] = 2 * norm.sf(np.abs(z[valid]))
+        # Welch-Satterthwaite degrees of freedom for Welch's t-test
+        numerator = (var_term_ctrl + var_term_pert) ** 2
+        denominator = np.zeros_like(numerator)
+        if control_n > 1:
+            denominator += (var_term_ctrl ** 2) / (control_n - 1)
+        if n_cells > 1:
+            denominator += (var_term_pert ** 2) / (n_cells - 1)
+        df_welch = np.where(denominator > 0, numerator / denominator, 1e6)
+        df_welch = np.clip(df_welch, 1.0, None)
+        p[valid] = 2 * t_dist.sf(np.abs(z[valid]), df_welch[valid])
         expected_wald[label] = effect
         expected_wald_z[label] = z
         expected_wald_p[label] = p
@@ -402,3 +413,17 @@ def test_differential_expression_matches_scanpy(subset_dataset, tmp_path):
             atol=2e-3,
             rtol=5e-3,
         )
+
+        # Verify high correlation (>0.98) for accuracy guarantee
+        valid_mask = np.isfinite(result.statistic) & np.isfinite(scores_expected)
+        if valid_mask.sum() > 10:
+            corr_z = np.corrcoef(result.statistic[valid_mask], scores_expected[valid_mask])[0, 1]
+            assert corr_z > 0.98, f"Wilcoxon z-score correlation {corr_z:.4f} < 0.98 for {label}"
+        
+        valid_mask = np.isfinite(result.pvalue) & np.isfinite(pvals_expected)
+        if valid_mask.sum() > 10:
+            # Use -log10(p) for correlation to handle small p-values better
+            log_pval_result = -np.log10(np.clip(result.pvalue[valid_mask], 1e-300, 1))
+            log_pval_expected = -np.log10(np.clip(pvals_expected[valid_mask], 1e-300, 1))
+            corr_p = np.corrcoef(log_pval_result, log_pval_expected)[0, 1]
+            assert corr_p > 0.98, f"Wilcoxon log-pval correlation {corr_p:.4f} < 0.98 for {label}"

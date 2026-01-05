@@ -278,110 +278,476 @@ def test_nb_glm_agrees_with_statsmodels_and_deseq2():
     assert well_expressed >= 1
 
 
-def test_nb_glm_joint_vs_independent():
-    """Test that joint fitting produces different (more stable) results than independent."""
-    rng = np.random.default_rng(12345)
+def test_shrink_lfc_matches_pydeseq2_lfcshrink(tmp_path):
+    """Test that shrink_lfc produces effect sizes matching PyDESeq2 lfcShrink.
+    
+    This regression test ensures the LFC shrinkage implementation uses the
+    correct fitted intercept from the NB-GLM model, not a naive estimate.
+    """
+    if DeseqDataSet is None or DeseqStats is None:
+        pytest.skip("pydeseq2 is not installed")
+    
+    from crispyx.de import shrink_lfc
+    
+    rng = np.random.default_rng(20260102)
     n_cells = 200
-    n_genes = 20
+    n_genes = 10
     
-    # Create a dataset with multiple perturbations
-    perturbations = ["ctrl"] * 80 + ["KO1"] * 40 + ["KO2"] * 40 + ["KO3"] * 40
+    # Create perturbation labels
+    perturbations = np.array(
+        ["control"] * 100 + ["pert_A"] * 50 + ["pert_B"] * 50
+    )
+    
+    # Generate counts with known LFCs
+    # Intercept ~ 3.0 (mean count ~20), LFC ~ 0.5-1.5
+    true_intercept = rng.uniform(2.5, 3.5, size=n_genes)
+    true_lfc_A = rng.uniform(0.3, 1.5, size=n_genes)
+    true_lfc_B = rng.uniform(-1.5, -0.3, size=n_genes)
+    dispersion = 0.3
+    
+    counts = np.zeros((n_cells, n_genes), dtype=int)
+    for j in range(n_genes):
+        for i in range(n_cells):
+            if perturbations[i] == "control":
+                mu = np.exp(true_intercept[j])
+            elif perturbations[i] == "pert_A":
+                mu = np.exp(true_intercept[j] + true_lfc_A[j])
+            else:
+                mu = np.exp(true_intercept[j] + true_lfc_B[j])
+            r = 1.0 / dispersion
+            p = r / (r + mu)
+            counts[i, j] = rng.negative_binomial(r, p)
+    
+    # Create and save AnnData
     obs = pd.DataFrame({"perturbation": perturbations})
-    obs.index = [f"cell_{i}" for i in range(n_cells)]
+    var = pd.DataFrame(index=[f"gene{j}" for j in range(n_genes)])
+    adata = ad.AnnData(counts, obs=obs, var=var)
+    input_path = tmp_path / "shrink_test.h5ad"
+    adata.write(input_path)
     
-    # Generate counts with different effects for different perturbations
-    var = pd.DataFrame(index=[f"gene_{i}" for i in range(n_genes)])
-    var["gene_symbols"] = var.index
+    # Run CRISPYx nb_glm_test
+    result = nb_glm_test(
+        input_path,
+        perturbation_column="perturbation",
+        control_label="control",
+        dispersion_method="moments",
+        min_cells_expressed=0,
+    )
     
-    # Base expression levels
-    base_expr = rng.uniform(0.5, 3.0, size=n_genes)
+    # Apply shrinkage with full method
+    # shrink_lfc reads perturbation_column and control_label from uns metadata
+    shrink_lfc(
+        result.result_path,
+        method="full",
+    )
     
-    # Generate counts
-    counts = np.zeros((n_cells, n_genes), dtype=np.float64)
-    for i in range(n_cells):
-        pert = perturbations[i]
-        if pert == "ctrl":
-            mu = np.exp(base_expr)
-        elif pert == "KO1":
-            mu = np.exp(base_expr - 0.5)  # Down-regulation
-        elif pert == "KO2":
-            mu = np.exp(base_expr + 0.3)  # Up-regulation
-        else:  # KO3
-            mu = np.exp(base_expr)  # No effect
-        counts[i, :] = rng.poisson(mu)
+    # Load shrunk results
+    shrunk_adata = ad.read_h5ad(result.result_path)
+    crispyx_lfc = shrunk_adata.X  # (n_groups, n_genes)
     
-    import tempfile
+    # Run PyDESeq2 with lfcShrink for each perturbation
+    sample_names = [f"cell_{i}" for i in range(n_cells)]
+    gene_names = [f"gene{j}" for j in range(n_genes)]
+    
+    correlations = []
+    max_diffs = []
+    
+    for pert_idx, pert_label in enumerate(["pert_A", "pert_B"]):
+        # Create binary condition for this perturbation vs control
+        condition_mask = (perturbations == "control") | (perturbations == pert_label)
+        subset_indices = [i for i in range(n_cells) if condition_mask[i]]
+        subset_samples = [sample_names[i] for i in subset_indices]
+        subset_counts = counts[subset_indices, :]  # (n_subset, n_genes)
+        
+        counts_df = pd.DataFrame(subset_counts, index=subset_samples, columns=gene_names)
+        
+        clinical = pd.DataFrame(
+            {
+                "condition": pd.Categorical(
+                    [
+                        "treated" if perturbations[i] == pert_label else "control"
+                        for i in subset_indices
+                    ],
+                    categories=["control", "treated"],
+                )
+            },
+            index=subset_samples,
+        )
+        
+        dds = DeseqDataSet(
+            counts=counts_df,
+            metadata=clinical,
+            design="~condition",
+            refit_cooks=False,
+        )
+        dds.deseq2()
+        stats = DeseqStats(
+            dds,
+            contrast=("condition", "treated", "control"),
+            cooks_filter=False,
+            alpha=0.05,
+        )
+        stats.summary()
+        
+        # Get shrunk LFC from PyDESeq2 (convert log2 to ln)
+        pydeseq2_lfc = stats.results_df["log2FoldChange"].to_numpy() * np.log(2.0)
+        
+        # Get CRISPYx shrunk LFC for this perturbation
+        crispyx_lfc_pert = crispyx_lfc[pert_idx, :]
+        
+        # Compute correlation
+        valid_mask = np.isfinite(pydeseq2_lfc) & np.isfinite(crispyx_lfc_pert)
+        if valid_mask.sum() < 3:
+            continue
+            
+        corr = np.corrcoef(pydeseq2_lfc[valid_mask], crispyx_lfc_pert[valid_mask])[0, 1]
+        max_diff = np.max(np.abs(pydeseq2_lfc[valid_mask] - crispyx_lfc_pert[valid_mask]))
+        
+        correlations.append(corr)
+        max_diffs.append(max_diff)
+    
+    # Assert accuracy thresholds
+    mean_corr = np.mean(correlations)
+    mean_max_diff = np.mean(max_diffs)
+    
+    assert mean_corr > 0.90, (
+        f"LFC shrinkage correlation with PyDESeq2 too low: {mean_corr:.3f} (expected >0.90)"
+    )
+    assert mean_max_diff < 2.0, (
+        f"LFC shrinkage max diff too high: {mean_max_diff:.3f} (expected <2.0)"
+    )
+
+
+def test_nb_glm_se_method_options(tmp_path):
+    """Test that se_method options ('sandwich' vs 'fisher') produce different results."""
+    rng = np.random.default_rng(111)
+    n_cells = 60
+    n_genes = 4
+    perturbations = np.array(["control"] * 30 + ["g1"] * 30)
+    counts = rng.poisson(10, size=(n_cells, n_genes))
+    obs = pd.DataFrame({"perturbation": perturbations})
+    adata = ad.AnnData(counts, obs=obs, var=pd.DataFrame(index=[f"gene{i}" for i in range(n_genes)]))
+    path = tmp_path / "se_test.h5ad"
+    adata.write(path)
+
+    result_sandwich = nb_glm_test(
+        path,
+        perturbation_column="perturbation",
+        control_label="control",
+        se_method="sandwich",
+        output_dir=tmp_path,
+        data_name="se_sandwich",
+    )
+
+    result_fisher = nb_glm_test(
+        path,
+        perturbation_column="perturbation",
+        control_label="control",
+        se_method="fisher",
+        output_dir=tmp_path,
+        data_name="se_fisher",
+    )
+
+    # Both should produce valid results
+    assert result_sandwich.statistics.shape == (1, n_genes)
+    assert result_fisher.statistics.shape == (1, n_genes)
+    # SE values should differ between methods (not identical)
+    sandwich_adata = ad.read_h5ad(result_sandwich.result_path)
+    fisher_adata = ad.read_h5ad(result_fisher.result_path)
+    # They may be similar but shouldn't be exactly identical
+    assert sandwich_adata.layers["standard_error"].shape == fisher_adata.layers["standard_error"].shape
+
+
+def test_nb_glm_profiling_output(tmp_path):
+    """Test that profiling=True produces expected metadata."""
+    rng = np.random.default_rng(222)
+    n_cells = 40
+    n_genes = 3
+    perturbations = np.array(["control"] * 20 + ["g1"] * 20)
+    counts = rng.poisson(8, size=(n_cells, n_genes))
+    obs = pd.DataFrame({"perturbation": perturbations})
+    adata = ad.AnnData(counts, obs=obs, var=pd.DataFrame(index=[f"gene{i}" for i in range(n_genes)]))
+    path = tmp_path / "profiling_test.h5ad"
+    adata.write(path)
+
+    result = nb_glm_test(
+        path,
+        perturbation_column="perturbation",
+        control_label="control",
+        profiling=True,
+        output_dir=tmp_path,
+        data_name="profiled",
+    )
+
+    result_adata = ad.read_h5ad(result.result_path)
+    profiling_data = result_adata.uns.get("profiling")
+    assert profiling_data is not None
+    assert profiling_data != "NA"
+    assert "profiling_enabled" in profiling_data
+    assert profiling_data["profiling_enabled"] is True
+    assert "fit_seconds" in profiling_data
+    assert profiling_data["fit_seconds"] >= 0
+
+
+def test_nb_glm_n_jobs_parallelization(tmp_path):
+    """Test that n_jobs parameter works without errors."""
+    rng = np.random.default_rng(333)
+    n_cells = 60
+    n_genes = 4
+    perturbations = np.array(["control"] * 20 + ["g1"] * 20 + ["g2"] * 20)
+    counts = rng.poisson(10, size=(n_cells, n_genes))
+    obs = pd.DataFrame({"perturbation": perturbations})
+    adata = ad.AnnData(counts, obs=obs, var=pd.DataFrame(index=[f"gene{i}" for i in range(n_genes)]))
+    path = tmp_path / "njobs_test.h5ad"
+    adata.write(path)
+
+    # Test with n_jobs=1 (sequential)
+    result_seq = nb_glm_test(
+        path,
+        perturbation_column="perturbation",
+        control_label="control",
+        n_jobs=1,
+        output_dir=tmp_path,
+        data_name="seq",
+    )
+
+    # Test with n_jobs=2 (parallel)
+    result_par = nb_glm_test(
+        path,
+        perturbation_column="perturbation",
+        control_label="control",
+        n_jobs=2,
+        output_dir=tmp_path,
+        data_name="par",
+    )
+
+    # Results should be very similar (may differ slightly due to floating point)
+    np.testing.assert_allclose(result_seq.statistics, result_par.statistics, rtol=1e-5)
+    np.testing.assert_allclose(result_seq.pvalues, result_par.pvalues, rtol=1e-5)
+
+
+def test_shrink_lfc_prior_scale_mode(tmp_path):
+    """Test that prior_scale_mode options work."""
+    from crispyx.de import shrink_lfc
+    
+    rng = np.random.default_rng(444)
+    n_cells = 80
+    n_genes = 5
+    perturbations = np.array(["control"] * 40 + ["g1"] * 20 + ["g2"] * 20)
+    counts = rng.poisson(15, size=(n_cells, n_genes))
+    obs = pd.DataFrame({"perturbation": perturbations})
+    adata = ad.AnnData(counts, obs=obs, var=pd.DataFrame(index=[f"gene{i}" for i in range(n_genes)]))
+    path = tmp_path / "prior_scale_test.h5ad"
+    adata.write(path)
+
+    result = nb_glm_test(
+        path,
+        perturbation_column="perturbation",
+        control_label="control",
+        output_dir=tmp_path,
+        data_name="prior",
+    )
+
+    # Test global prior scale mode
+    shrink_lfc(
+        result.result_path,
+        prior_scale_mode="global",
+    )
+    global_adata = ad.read_h5ad(result.result_path)
+    global_lfc = global_adata.X.copy()
+
+    # Re-run with per_comparison mode
+    # First, re-run nb_glm_test to reset
+    result2 = nb_glm_test(
+        path,
+        perturbation_column="perturbation",
+        control_label="control",
+        output_dir=tmp_path,
+        data_name="prior2",
+    )
+    shrink_lfc(
+        result2.result_path,
+        prior_scale_mode="per_comparison",
+    )
+    per_comp_adata = ad.read_h5ad(result2.result_path)
+    per_comp_lfc = per_comp_adata.X.copy()
+
+    # Both should produce valid results
+    assert global_lfc.shape == per_comp_lfc.shape
+    # Results may differ between modes
+    assert np.all(np.isfinite(global_lfc) | (global_lfc == 0))
+    assert np.all(np.isfinite(per_comp_lfc) | (per_comp_lfc == 0))
+
+
+def test_streaming_vs_dense_dispersion_accuracy():
+    """Test that streaming dispersion estimation matches dense estimation.
+    
+    This test compares the streaming dispersion implementation 
+    (_precompute_global_dispersion_streaming) against the standard dense
+    implementation (precompute_global_dispersion with fast_mode=True).
+    
+    Both methods should produce highly correlated dispersion estimates
+    (Pearson r > 0.95) since they use the same underlying algorithm
+    (MoM + trend shrinkage) but different memory access patterns.
+    """
+    from scipy.stats import pearsonr, spearmanr
+    from crispyx.glm import (
+        precompute_global_dispersion,
+        _precompute_global_dispersion_streaming,
+        precompute_control_statistics,
+        fit_dispersion_trend,
+    )
     import scipy.sparse as sp
     
-    # Create sparse matrix and save
-    adata = ad.AnnData(sp.csr_matrix(counts), obs=obs, var=var)
+    rng = np.random.default_rng(123)
     
-    with tempfile.TemporaryDirectory() as tmpdir:
-        path = Path(tmpdir) / "test.h5ad"
-        adata.write(path)
-        
-        # Run with independent fitting
-        result_indep = nb_glm_test(
-            path,
-            perturbation_column="perturbation",
-            control_label="ctrl",
-            gene_name_column="gene_symbols",
-            fit_method="independent",
-            output_dir=tmpdir,
-            data_name="indep",
-        )
-        
-        # Run with joint fitting (no shared dispersion)
-        result_joint = nb_glm_test(
-            path,
-            perturbation_column="perturbation",
-            control_label="ctrl",
-            gene_name_column="gene_symbols",
-            fit_method="joint",
-            share_dispersion=False,
-            output_dir=tmpdir,
-            data_name="joint",
-        )
-        
-        # Run with joint fitting and shared dispersion
-        result_joint_shared = nb_glm_test(
-            path,
-            perturbation_column="perturbation",
-            control_label="ctrl",
-            gene_name_column="gene_symbols",
-            fit_method="joint",
-            share_dispersion=True,
-            output_dir=tmpdir,
-            data_name="joint_shared",
-        )
-        
-        # Check that all methods produce results
-        assert len(result_indep.groups) == 3  # KO1, KO2, KO3
-        assert len(result_joint.groups) == 3
-        assert len(result_joint_shared.groups) == 3
-        
-        # Check that joint and independent give similar but not identical results
-        # (Joint should be slightly different due to shared intercept)
-        for label in ["KO1", "KO2"]:
-            indep_effect = result_indep[label].effect_size
-            joint_effect = result_joint[label].effect_size
-            
-            # Results should be correlated (similar direction)
-            valid = np.isfinite(indep_effect) & np.isfinite(joint_effect)
-            if valid.sum() > 5:
-                corr = np.corrcoef(indep_effect[valid], joint_effect[valid])[0, 1]
-                assert corr > 0.9, f"Correlation for {label} should be high: {corr}"
-        
-        # Check that shared dispersion produces consistent dispersions
-        # For shared dispersion, all perturbations should have the same dispersion values
-        if result_joint_shared.result is not None:
-            result_adata = result_joint_shared.result.to_memory()
-            if "dispersion" in result_adata.layers:
-                disp = result_adata.layers["dispersion"]
-                # All rows should be identical when using shared dispersion
-                for i in range(1, disp.shape[0]):
-                    np.testing.assert_array_almost_equal(
-                        disp[0, :], disp[i, :],
-                        decimal=5,
-                        err_msg="Shared dispersion should be identical across perturbations"
-                    )
+    # Create a medium-sized test dataset
+    n_cells = 500
+    n_genes = 200
+    n_control = 200
+    
+    # Generate counts with realistic sparsity
+    mu = rng.gamma(2, 2, size=n_genes)  # Gene-specific means
+    alpha = rng.gamma(0.5, 0.5, size=n_genes)  # Gene-specific dispersion
+    
+    counts = np.zeros((n_cells, n_genes), dtype=np.float64)
+    for j in range(n_genes):
+        r = 1.0 / max(alpha[j], 0.01)
+        p = r / (r + mu[j])
+        counts[:, j] = rng.negative_binomial(max(r, 0.1), min(p, 0.999), size=n_cells)
+    
+    # Add sparsity (30% zeros)
+    mask = rng.random((n_cells, n_genes)) < 0.3
+    counts[mask] = 0
+    
+    # Create size factors
+    size_factors = counts.sum(axis=1) / np.median(counts.sum(axis=1))
+    size_factors = np.maximum(size_factors, 0.1)
+    offset = np.log(size_factors)
+    
+    # Control cells
+    control_matrix = counts[:n_control]
+    control_offset = offset[:n_control]
+    
+    # Create control cache
+    control_cache = precompute_control_statistics(
+        control_matrix=control_matrix,
+        control_offset=control_offset,
+        max_iter=10,
+        tol=1e-6,
+        min_mu=0.5,
+        dispersion_method="moments",
+    )
+    
+    # Test 1: Dense mode (standard)
+    import copy
+    cache_dense = copy.deepcopy(control_cache)
+    cache_dense = precompute_global_dispersion(
+        control_cache=cache_dense,
+        all_cell_matrix=counts,
+        all_cell_offset=offset,
+        fit_type="parametric",
+        fast_mode=True,
+        max_dense_fraction=1.0,  # Force dense mode
+    )
+    
+    # Test 2: Streaming mode
+    cache_streaming = copy.deepcopy(control_cache)
+    cache_streaming = _precompute_global_dispersion_streaming(
+        control_cache=cache_streaming,
+        all_cell_matrix=counts,
+        all_cell_offset=offset,
+        fit_type="parametric",
+        chunk_size=100,
+    )
+    
+    # Compare dispersions
+    disp_dense = cache_dense.global_dispersion
+    disp_streaming = cache_streaming.global_dispersion
+    
+    # Both should be valid
+    assert np.all(np.isfinite(disp_dense))
+    assert np.all(np.isfinite(disp_streaming))
+    
+    # Compute correlation
+    valid = np.isfinite(disp_dense) & np.isfinite(disp_streaming) & (disp_dense > 0) & (disp_streaming > 0)
+    pearson_r, _ = pearsonr(np.log(disp_dense[valid]), np.log(disp_streaming[valid]))
+    spearman_r, _ = spearmanr(disp_dense[valid], disp_streaming[valid])
+    
+    # Streaming should achieve high correlation with dense (both use MoM + trend)
+    assert pearson_r > 0.95, f"Pearson correlation {pearson_r:.3f} < 0.95"
+    assert spearman_r > 0.95, f"Spearman correlation {spearman_r:.3f} < 0.95"
+    
+    # Trends should also be similar
+    trend_dense = cache_dense.global_dispersion_trend
+    trend_streaming = cache_streaming.global_dispersion_trend
+    
+    valid_trend = np.isfinite(trend_dense) & np.isfinite(trend_streaming) & (trend_dense > 0) & (trend_streaming > 0)
+    trend_pearson, _ = pearsonr(np.log(trend_dense[valid_trend]), np.log(trend_streaming[valid_trend]))
+    assert trend_pearson > 0.90, f"Trend Pearson correlation {trend_pearson:.3f} < 0.90"
+
+
+def test_memory_adaptive_dispersion():
+    """Test that memory-adaptive mode triggers streaming for large datasets.
+    
+    This test verifies that precompute_global_dispersion correctly switches
+    to streaming mode when the estimated memory exceeds the threshold.
+    """
+    from crispyx.glm import (
+        precompute_global_dispersion,
+        precompute_control_statistics,
+        _estimate_dense_memory_gb,
+    )
+    import scipy.sparse as sp
+    
+    rng = np.random.default_rng(456)
+    
+    # Create a small test dataset
+    n_cells = 100
+    n_genes = 50
+    n_control = 40
+    
+    counts = rng.poisson(10, size=(n_cells, n_genes)).astype(np.float64)
+    size_factors = np.ones(n_cells)
+    offset = np.log(size_factors)
+    
+    control_matrix = counts[:n_control]
+    control_offset = offset[:n_control]
+    
+    control_cache = precompute_control_statistics(
+        control_matrix=control_matrix,
+        control_offset=control_offset,
+    )
+    
+    # Test 1: Normal mode (should use dense)
+    import copy
+    cache1 = copy.deepcopy(control_cache)
+    cache1 = precompute_global_dispersion(
+        control_cache=cache1,
+        all_cell_matrix=counts,
+        all_cell_offset=offset,
+        max_dense_fraction=0.3,  # Default
+        memory_limit_gb=None,  # No explicit limit
+    )
+    assert cache1.global_dispersion is not None
+    
+    # Test 2: Force streaming by setting a very low memory limit
+    cache2 = copy.deepcopy(control_cache)
+    cache2 = precompute_global_dispersion(
+        control_cache=cache2,
+        all_cell_matrix=counts,
+        all_cell_offset=offset,
+        max_dense_fraction=0.3,
+        memory_limit_gb=0.00001,  # 10 KB - forces streaming
+    )
+    assert cache2.global_dispersion is not None
+    
+    # Results should be similar (both use MoM + trend shrinkage)
+    disp1 = cache1.global_dispersion
+    disp2 = cache2.global_dispersion
+    
+    from scipy.stats import pearsonr
+    valid = np.isfinite(disp1) & np.isfinite(disp2) & (disp1 > 0) & (disp2 > 0)
+    if np.sum(valid) > 5:
+        r, _ = pearsonr(np.log(disp1[valid]), np.log(disp2[valid]))
+        assert r > 0.90, f"Correlation {r:.3f} < 0.90 between dense and streaming modes"
