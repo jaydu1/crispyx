@@ -2,11 +2,17 @@
 
 from __future__ import annotations
 
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Iterable
 
 import anndata as ad
 import numpy as np
+
+try:
+    __version__ = version("crispyx")
+except PackageNotFoundError:
+    __version__ = "0.0.0.dev"
 
 from .data import (
     AnnData,
@@ -23,6 +29,12 @@ from .de import (
     shrink_lfc,
     t_test,
     wilcoxon_test,
+)
+from .profiling import (
+    Profiler,
+    MemoryProfiler,
+    TimingProfiler,
+    plot_benchmark_comparison,
 )
 from .pseudobulk import (
     compute_average_log_expression,
@@ -432,12 +444,67 @@ class _ToolsNamespace:
             "Choose from 'wilcoxon', 't-test', or 'nb_glm'."
         )
 
+    def shrink_lfc(
+        self,
+        data: str | Path | ad.AnnData,
+        *,
+        output_dir: str | Path | None = None,
+        data_name: str | None = None,
+        method: str = "stats",
+        prior_scale_mode: str = "global",
+        min_mu: float = 0.0,
+        n_jobs: int = -1,
+        batch_size: int = 128,
+        profiling: bool = False,
+    ):
+        """Apply apeGLM LFC shrinkage to NB-GLM results.
+
+        Parameters
+        ----------
+        data
+            Path to h5ad file from ``nb_glm_test()`` or a backed AnnData object.
+        output_dir
+            Directory for output. Defaults to input file's directory.
+        data_name
+            Custom name for output file.
+        method
+            Shrinkage computation method: "stats" (faster) or "full".
+        prior_scale_mode
+            Prior estimation scope: "global" or "per_comparison".
+        min_mu
+            Minimum mean for numerical stability.
+        n_jobs
+            Number of parallel workers. -1 uses all cores.
+        batch_size
+            Number of genes per batch.
+        profiling
+            Enable timing/memory profiling.
+
+        Returns
+        -------
+        RankGenesGroupsResult
+            Shrunk differential expression results.
+        """
+        path = _resolve_backed_path(data)
+        return shrink_lfc(
+            path,
+            output_dir=output_dir,
+            data_name=data_name,
+            method=method,
+            prior_scale_mode=prior_scale_mode,
+            min_mu=min_mu,
+            n_jobs=n_jobs,
+            batch_size=batch_size,
+            profiling=profiling,
+        )
+
 
 pp = _PreprocessingNamespace()
 pb = _PseudobulkNamespace()
 tl = _ToolsNamespace()
 
 __all__ = [
+    "__version__",
     "pp",
     "pb",
     "tl",
@@ -458,4 +525,9 @@ __all__ = [
     "read_backed",
     "resolve_control_label",
     "resolve_output_path",
+    # Profiling utilities
+    "Profiler",
+    "MemoryProfiler",
+    "TimingProfiler",
+    "plot_benchmark_comparison",
 ]
