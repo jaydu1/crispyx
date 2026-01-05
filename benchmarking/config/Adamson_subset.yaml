@@ -1,7 +1,7 @@
 # Benchmark Configuration for Adamson_subset
 # Subset of Adamson dataset for testing and development
 
-dataset_path: "data/Adamson_subset.h5ad"
+dataset_path: "/data/Adamson_subset.h5ad"
 output_dir: "benchmarking/results/Adamson_subset"
 
 # Dataset column configuration
@@ -33,6 +33,15 @@ adaptive_qc_mode: conservative  # or 'aggressive'
 # Methods to run (null = run all available methods)
 # Scanpy comparisons are now optimized to load data only once and cache results
 methods_to_run: null
+
+# Optional methods to include (methods that are excluded by default but can be enabled)
+# These are useful for specific validation tasks but not needed for standard benchmarks
+# Methods with _pydeseq2 suffix are designed to match PyDESeq2's exact behavior for parity testing
+optional_methods:
+  - crispyx_de_lfcshrink            # Standalone lfcShrink (method='full') for shrinkage benchmarking
+  - crispyx_de_nb_glm_pydeseq2      # NB-GLM with PyDESeq2-parity settings (fisher SE, per-comparison SF/disp)
+  - crispyx_de_lfcshrink_pydeseq2   # lfcShrink with PyDESeq2-parity base for parity testing
+  - pertpy_de_lfcshrink             # PyDESeq2 standalone lfcShrink for comparison
 
 # Progress and output options
 show_progress: true
