@@ -8,77 +8,9 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 
-from .generate_results import SHRINKAGE_METADATA, LFCSHRINK_METHODS
-
-# Order for methods in overlap heatmaps
-# Ordered by: t-test, Wilcoxon, NB-GLM (base), NB-GLM (shrunk)
-# Note: Shrunk results are loaded from shrunk_result_path and stored with _shrunk suffix
-HEATMAP_METHOD_ORDER = [
-    # t-test
-    "crispyx_de_t_test",
-    "scanpy_de_t_test",
-    # Wilcoxon
-    "crispyx_de_wilcoxon",
-    "scanpy_de_wilcoxon",
-    # NB-GLM (no shrinkage) - edgeR first as reference
-    "edger_de_glm",
-    "crispyx_de_nb_glm",
-    "pertpy_de_pydeseq2",
-    # NB-GLM (joint, no shrinkage)
-    "crispyx_de_nb_glm_joint",
-    # NB-GLM (with shrinkage)
-    "crispyx_de_nb_glm_shrunk",
-    "crispyx_de_nb_glm_joint_shrunk",
-    "pertpy_de_pydeseq2_shrunk",
-]
-
-
-def _format_heatmap_method_name(name: str) -> str:
-    """Format method name for heatmap display with shrinkage indicator.
-    
-    Parameters
-    ----------
-    name : str
-        Internal method name (e.g., 'crispyx_de_nb_glm_joint' or 'crispyx_de_nb_glm_shrunk')
-        
-    Returns
-    -------
-    str
-        Display name with package prefix and (lfcShrink) suffix if uses shrinkage
-    """
-    # Handle shrunk method names (these have _shrunk suffix for heatmap purposes)
-    if name == "pertpy_de_pydeseq2_shrunk":
-        return "PyDESeq2 (lfcShrink)"
-    elif name == "crispyx_de_nb_glm_joint_shrunk":
-        return "crispyx NB-GLM (joint, lfcShrink)"
-    elif name == "crispyx_de_nb_glm_shrunk":
-        return "crispyx NB-GLM (lfcShrink)"
-    # Handle base method names
-    elif name == "pertpy_de_pydeseq2":
-        return "PyDESeq2"
-    elif name == "crispyx_de_nb_glm_joint":
-        return "crispyx NB-GLM (joint)"
-    elif name == "crispyx_de_nb_glm":
-        return "crispyx NB-GLM"
-    elif name == "edger_de_glm":
-        return "edgeR NB-GLM"
-    elif name == "crispyx_de_t_test":
-        return "crispyx t-test"
-    elif name == "scanpy_de_t_test":
-        return "scanpy t-test"
-    elif name == "crispyx_de_wilcoxon":
-        return "crispyx Wilcoxon"
-    elif name == "scanpy_de_wilcoxon":
-        return "scanpy Wilcoxon"
-    
-    # Generic formatting for other methods
-    display_name = name.replace("crispyx_", "crispyx ").replace("scanpy_", "scanpy ")
-    display_name = display_name.replace("pertpy_", "pertpy ").replace("edger_", "edgeR ")
-    display_name = display_name.replace("de_", "").replace("_", " ")
-    if uses_shrinkage:
-        display_name = f"{display_name}{shrink_suffix}"
-    
-    return display_name
+# Import from centralized modules
+from .constants import SHRINKAGE_METADATA, LFCSHRINK_METHODS, HEATMAP_METHOD_ORDER
+from .formatting import format_heatmap_method_name as _format_heatmap_method_name
 
 
 def _order_heatmap_methods(methods: list[str]) -> list[str]:
@@ -248,6 +180,9 @@ def generate_overlap_heatmaps(
     - benchmark_effect_top_{k}_overlap.png for each k
     - benchmark_pvalue_top_{k}_overlap.png for each k
     
+    Uses batch computation to compute all matrices in a single pass over the data,
+    significantly improving performance for large datasets.
+    
     Parameters
     ----------
     de_results : Dict[str, pd.DataFrame]
@@ -263,7 +198,7 @@ def generate_overlap_heatmaps(
     Dict[str, Path]
         Dictionary mapping heatmap names to their file paths
     """
-    from .comparison import compute_pairwise_overlap_matrix
+    from .comparison import compute_pairwise_overlap_matrices_batch
     
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -272,21 +207,50 @@ def generate_overlap_heatmaps(
     ordered_methods = _order_heatmap_methods(list(de_results.keys()))
     ordered_de_results = {m: de_results[m] for m in ordered_methods if m in de_results}
     
+    # Filter for p-value heatmaps (exclude lfcShrink methods)
+    pvalue_filtered_results = {
+        m: v for m, v in ordered_de_results.items() 
+        if "lfcshrink" not in m.lower() and not m.endswith("_shrunk")
+    }
+    pvalue_filtered_methods = [m for m in ordered_methods if m in pvalue_filtered_results]
+    
     generated_files = {}
     
+    # Compute all effect-size matrices in one batch
+    effect_matrices = compute_pairwise_overlap_matrices_batch(
+        ordered_de_results,
+        k_values=k_values,
+        metrics=("effect",),
+    )
+    
+    # Compute all p-value matrices in one batch (with filtered results)
+    pvalue_matrices = compute_pairwise_overlap_matrices_batch(
+        pvalue_filtered_results,
+        k_values=k_values,
+        metrics=("pvalue",),
+    )
+    
+    # Generate heatmap images from pre-computed matrices
     for k in k_values:
         for metric in ("effect", "pvalue"):
-            matrix, effective_k = compute_pairwise_overlap_matrix(
-                ordered_de_results,
-                top_k=k,
-                metric=metric,
-            )
+            key = f"{metric}_top_{k}"
+            
+            if metric == "effect":
+                if key not in effect_matrices:
+                    continue
+                matrix, effective_k = effect_matrices[key]
+                method_order = ordered_methods
+            else:
+                if key not in pvalue_matrices:
+                    continue
+                matrix, effective_k = pvalue_matrices[key]
+                method_order = pvalue_filtered_methods
             
             if matrix.empty:
                 continue
             
             # Reorder matrix rows/columns to match method order
-            ordered_names = [m for m in ordered_methods if m in matrix.columns]
+            ordered_names = [m for m in method_order if m in matrix.columns]
             matrix = matrix.loc[ordered_names, ordered_names]
             
             metric_label = "Effect Size" if metric == "effect" else "P-value"

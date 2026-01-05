@@ -1,14 +1,21 @@
 # Dockerfile for CRISPYx Benchmarking
 # Provides reproducible environment with Python, R, and all dependencies
 # 
-# Build: docker build -t crispyx-benchmark benchmarking/
+# Build: DOCKER_BUILDKIT=1 docker build -t crispyx-benchmark -f benchmarking/Dockerfile .
 # Run:   docker run --rm -v $(pwd):/workspace crispyx-benchmark --help
+#
+# For faster rebuilds when only changing crispyx code (not dependencies):
+#   DOCKER_BUILDKIT=1 docker build -t crispyx-benchmark -f benchmarking/Dockerfile .
+# The source code layers are at the end, so dependency layers stay cached.
+
+# Enable BuildKit cache mounts for faster rebuilds
+# syntax=docker/dockerfile:1.4
 
 FROM python:3.11-slim-bookworm
 
 LABEL org.opencontainers.image.title="CRISPYx Benchmark"
 LABEL org.opencontainers.image.description="Reproducible benchmarking environment for CRISPR screen analysis"
-LABEL org.opencontainers.image.source="https://github.com/your-org/Streamlining-CRISPR-Screen-Analysis"
+LABEL org.opencontainers.image.source="https://github.com/jaydu1/Streamlining-CRISPR-Screen-Analysis"
 
 # Prevent interactive prompts during package installation
 ENV DEBIAN_FRONTEND=noninteractive
@@ -21,7 +28,7 @@ ENV LC_ALL=C.UTF-8
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONDONTWRITEBYTECODE=1
 # Add /workspace to PYTHONPATH so benchmarking module is importable
-ENV PYTHONPATH=/workspace:$PYTHONPATH
+ENV PYTHONPATH=/workspace
 
 # Install system dependencies for R and Python packages
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -54,22 +61,27 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Install Bioconductor and R packages
 # Pin versions for reproducibility
 # Note: R 4.2 from Debian bookworm requires Bioconductor 3.16
-RUN R -e "install.packages('BiocManager', repos='https://cloud.r-project.org/')" \
+# Use BuildKit cache mount to cache R packages across builds
+RUN --mount=type=cache,target=/root/.cache/R \
+    --mount=type=cache,target=/tmp/downloaded_packages \
+    R -e "install.packages('BiocManager', repos='https://cloud.r-project.org/')" \
     && R -e "BiocManager::install(version='3.16', ask=FALSE)" \
     && R -e "BiocManager::install(c('edgeR', 'DESeq2', 'apeglm'), ask=FALSE, update=FALSE)" \
-    && R -e "install.packages('RhpcBLASctl', repos='https://cloud.r-project.org/')" \
-    # Cleanup R package cache
-    && rm -rf /tmp/downloaded_packages /tmp/Rtmp*
+    && R -e "install.packages('RhpcBLASctl', repos='https://cloud.r-project.org/')"
 
 # Create workspace directory
 WORKDIR /workspace
 
-# Install Python dependencies
-# Copy only requirements first for better layer caching
-COPY pyproject.toml /workspace/
+# ============================================================================
+# DEPENDENCY INSTALLATION (cached layers - rarely change)
+# ============================================================================
+# These layers are intentionally placed BEFORE any COPY commands to maximize
+# cache hit rate. Dependencies only reinstall when the RUN commands change.
 
 # Install core dependencies first (for caching)
-RUN pip install --no-cache-dir \
+# Use BuildKit cache mount to cache pip downloads across builds
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install \
     "numpy>=1.23" \
     "scipy>=1.10,<=1.12.0" \
     "pandas>=1.5" \
@@ -79,8 +91,10 @@ RUN pip install --no-cache-dir \
     "scanpy>=1.9.2" \
     "statsmodels>=0.14"
 
-# Install DE/benchmark dependencies
-RUN pip install --no-cache-dir \
+# Install DE/benchmark dependencies (including pertpy with ott-jax)
+# This layer is slow but only rebuilds when dependency versions change
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install \
     "pydeseq2>=0.4" \
     "pertpy>=0.4" \
     rpy2 \
@@ -89,18 +103,26 @@ RUN pip install --no-cache-dir \
     "tqdm>=4.65" \
     filelock
 
-# Copy source code and install crispyx
-COPY src/ /workspace/src/
+# ============================================================================
+# SOURCE CODE INSTALLATION (frequently changing layers - at the end)
+# ============================================================================
+# Copy source code LAST so that code changes don't invalidate dependency cache
+
+# Copy pyproject.toml and source code
 COPY pyproject.toml /workspace/
-RUN pip install --no-cache-dir -e /workspace
+COPY src/ /workspace/src/
+
+# Install crispyx in editable mode (fast - dependencies already installed)
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install --no-deps -e /workspace
 
 # Copy benchmarking code
 COPY benchmarking/ /workspace/benchmarking/
 
-# Copy worker entrypoint and dependencies to /app directory
+# Copy worker entrypoint and profiling module to /app directory
 RUN mkdir -p /app \
     && cp /workspace/benchmarking/tools/docker_worker.py /app/docker_worker.py \
-    && cp /workspace/benchmarking/tools/memory.py /app/memory.py
+    && cp /workspace/benchmarking/tools/profiling.py /app/profiling.py
 
 # Set working directory for benchmark execution
 WORKDIR /workspace

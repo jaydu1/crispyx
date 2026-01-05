@@ -14,351 +14,259 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional
 import numpy as np
 import pandas as pd
 
+# Import from centralized modules
+from .constants import (
+    SHRINKAGE_METADATA,
+    LFCSHRINK_METHODS,
+    NB_GLM_METHODS,
+    ALL_DE_METHODS_FOR_HEATMAP,
+    METHODS_WITH_SHRUNK_OUTPUT,
+    METHOD_DISPLAY_NAMES,
+    DE_METHOD_DISPLAY_ORDER,
+    CATEGORY_DISPLAY_ORDER,
+    STANDARD_DE_COLUMNS,
+)
+from .cache import (
+    load_method_result,
+    load_cached_results,
+    save_method_result,
+    load_cache_config,
+    get_expected_output_path,
+    resolve_result_path,
+    is_scalar_na,
+    has_valid_result,
+)
+from .formatting import (
+    is_scalar_notna,
+    format_method_name,
+    get_method_package,
+    format_full_method_name,
+    is_crispyx_method,
+    get_shrinkage_type,
+    get_method_sort_key,
+    get_category_sort_key,
+    get_method_category,
+    get_performance_emoji,
+    get_accuracy_emoji,
+    format_mean_std,
+    format_pct,
+    format_diff,
+    frame_to_markdown_table,
+    standardise_de_dataframe,
+)
+
 
 # ============================================================================
-# Helper functions for safe NA checking
+# Shrinkage Quality Utilities
 # ============================================================================
 
-def _is_scalar_na(value: Any) -> bool:
-    """Check if a value is NA/NaN, handling arrays properly.
+def _compute_shrinkage_quality_standalone(
+    shrunk_result_path: Path,
+    method_name: str,
+) -> Optional[Dict[str, Any]]:
+    """Compute shrinkage quality metrics from a standalone lfcShrink result file.
     
-    Returns True only if value is None or a scalar NA.
-    Returns False for arrays (they're not NA even if they contain NAs).
-    """
-    if value is None:
-        return True
-    if isinstance(value, np.ndarray):
-        return False  # Arrays are not scalar NA
-    if isinstance(value, (list, dict)):
-        return False  # Collections are not scalar NA
-    try:
-        return pd.isna(value)
-    except (ValueError, TypeError):
-        return False
-
-
-def _is_scalar_notna(value: Any) -> bool:
-    """Check if a value is not NA/NaN, handling arrays properly.
-    
-    Returns True if value is not None and is not a scalar NA.
-    Also returns True for arrays (they're considered "not NA" even if they contain NAs).
-    """
-    return not _is_scalar_na(value)
-
-
-# ============================================================================
-# Shrinkage Metadata Constants
-# ============================================================================
-
-# Mapping of method names to their LFC shrinkage type
-# Note: With integrated shrinkage, base methods now produce both base and shrunk outputs.
-# The shrunk output paths are stored in 'shrunk_result_path' column.
-# This dict is kept for compatibility but shrinkage is now integrated into base methods.
-SHRINKAGE_METADATA: Dict[str, str] = {
-    # Base methods that produce shrunk outputs via integrated shrinkage
-    "crispyx_de_nb_glm": "apeglm",          # uses lfc_shrinkage_type="apeglm" for shrunk output
-    "crispyx_de_nb_glm_joint": "apeglm",    # uses lfc_shrinkage_type="apeglm" for shrunk output
-    "pertpy_de_pydeseq2": "apeglm",         # uses lfcShrink(type="apeglm") for shrunk output
-}
-
-# Set of methods that produce LFC shrinkage outputs (derived from SHRINKAGE_METADATA)
-LFCSHRINK_METHODS = set(SHRINKAGE_METADATA.keys())
-
-# All NB-GLM methods for explicit heatmap collection (base methods)
-NB_GLM_METHODS = [
-    "crispyx_de_nb_glm",
-    "crispyx_de_nb_glm_joint",
-    "edger_de_glm",
-    "pertpy_de_pydeseq2",
-]
-
-# All DE methods for heatmap collection (includes t-test, Wilcoxon, and NB-GLM)
-ALL_DE_METHODS_FOR_HEATMAP = [
-    # t-test
-    "crispyx_de_t_test",
-    "scanpy_de_t_test",
-    # Wilcoxon
-    "crispyx_de_wilcoxon",
-    "scanpy_de_wilcoxon",
-    # NB-GLM
-    "crispyx_de_nb_glm",
-    "crispyx_de_nb_glm_joint",
-    "edger_de_glm",
-    "pertpy_de_pydeseq2",
-]
-
-# Methods that produce shrunk outputs (for heatmap collection)
-# These will be loaded from shrunk_result_path and added with _shrunk suffix
-METHODS_WITH_SHRUNK_OUTPUT = [
-    "crispyx_de_nb_glm",
-    "crispyx_de_nb_glm_joint",
-    "pertpy_de_pydeseq2",
-]
-
-# Standard DE result columns
-_STANDARD_DE_COLUMNS = ["perturbation", "gene", "effect_size", "statistic", "pvalue"]
-
-# Order for DE method display in tables: t-test, Wilcoxon, NB-GLM, NB-GLM (joint)
-DE_METHOD_DISPLAY_ORDER = [
-    "t-test",
-    "Wilcoxon", 
-    "NB-GLM",
-    "NB-GLM (joint)",
-]
-
-# Order for category subsections in Performance and Accuracy
-CATEGORY_DISPLAY_ORDER = [
-    "Preprocessing / QC",
-    "DE: t-test",
-    "DE: Wilcoxon",
-    "DE: NB GLM",
-    "Other",
-]
-
-
-def _get_method_sort_key(method_name: str) -> int:
-    """Get sort key for a method name based on DE_METHOD_DISPLAY_ORDER."""
-    for i, order_name in enumerate(DE_METHOD_DISPLAY_ORDER):
-        if order_name in method_name:
-            return i
-    return len(DE_METHOD_DISPLAY_ORDER)  # Unknown methods go last
-
-
-def _get_category_sort_key(category: str) -> int:
-    """Get sort key for a category based on CATEGORY_DISPLAY_ORDER."""
-    try:
-        return CATEGORY_DISPLAY_ORDER.index(category)
-    except ValueError:
-        return len(CATEGORY_DISPLAY_ORDER)  # Unknown categories go last
-
-
-# ============================================================================
-# Path Resolution Utilities
-# ============================================================================
-
-def _get_expected_output_path(method_name: str, output_dir: Path) -> Optional[Path]:
-    """Get the expected output path for a benchmark method.
-    
-    This is a fallback when result_path is not cached.
+    This function extracts both raw and shrunk LFC values from the same h5ad file,
+    using the 'logfoldchange_raw' layer for raw values and 'X' (or 'logfoldchange')
+    for shrunk values. This allows computing shrinkage quality even when the base
+    NB-GLM method failed or was not run.
     
     Parameters
     ----------
+    shrunk_result_path : Path
+        Path to lfcShrink result h5ad file (must contain 'logfoldchange_raw' layer)
     method_name : str
-        Name of the benchmark method
-    output_dir : Path
-        Output directory for the dataset
-        
-    Returns
-    -------
-    Optional[Path]
-        Expected output file path, or None if cannot be determined
-    """
-    # Phase-based directories
-    preprocessing_dir = output_dir / "preprocessing"
-    de_dir = output_dir / "de"
-    
-    # crispyx methods
-    if method_name == "crispyx_qc_filtered":
-        return preprocessing_dir / "crispyx_qc_filtered.h5ad"
-    elif method_name == "crispyx_pb_avg_log":
-        return preprocessing_dir / "crispyx_pb_avg_log.h5ad"
-    elif method_name == "crispyx_pb_pseudobulk":
-        return preprocessing_dir / "crispyx_pb_pseudobulk.h5ad"
-    elif method_name == "crispyx_de_t_test":
-        return de_dir / "crispyx_de_t_test.h5ad"
-    elif method_name == "crispyx_de_wilcoxon":
-        return de_dir / "crispyx_de_wilcoxon.h5ad"
-    elif method_name == "crispyx_de_nb_glm":
-        return de_dir / "crispyx_de_nb_glm.h5ad"
-    elif method_name == "crispyx_de_nb_glm_joint":
-        return de_dir / "crispyx_de_nb_glm_joint_nb_glm.h5ad"
-    
-    # Scanpy methods
-    elif method_name == "scanpy_qc_filtered":
-        return preprocessing_dir / "scanpy_qc_filtered.h5ad"
-    elif method_name == "scanpy_de_t_test":
-        return de_dir / "scanpy_de_t_test.h5ad"
-    elif method_name == "scanpy_de_wilcoxon":
-        return de_dir / "scanpy_de_wilcoxon.h5ad"
-    
-    # Reference tool CSV outputs
-    elif method_name == "edger_de_glm":
-        return de_dir / "edger_de_glm.csv"
-    elif method_name == "pertpy_de_pydeseq2":
-        return de_dir / "pertpy_de_pydeseq2.csv"
-    
-    return None
-
-
-def _resolve_result_path(
-    method_name: str, 
-    result_path_val: Optional[str], 
-    output_dir: Path
-) -> Optional[Path]:
-    """Resolve the result path with fallback to expected path.
-    
-    Parameters
-    ----------
-    method_name : str
-        Name of the benchmark method
-    result_path_val : Optional[str]
-        Cached result_path value (may be None or NaN)
-    output_dir : Path
-        Output directory for the dataset
-        
-    Returns
-    -------
-    Optional[Path]
-        Resolved path to result file, or None if not found
-    """
-    # First try using the cached result_path
-    if result_path_val is not None and not _is_scalar_na(result_path_val):
-        # First try as an absolute path or path relative to workspace root
-        result_path = Path(result_path_val)
-        if result_path.exists():
-            return result_path
-        
-        # Try as relative path from output_dir 
-        result_path = output_dir / str(result_path_val)
-        if result_path.exists():
-            return result_path
-        
-        # Try extracting just the filename and looking in expected locations
-        filename = Path(result_path_val).name
-        for subdir in ["de", "qc", "pb", "preprocessing"]:
-            potential_path = output_dir / subdir / filename
-            if potential_path.exists():
-                return potential_path
-    
-    # Fallback to expected output path
-    expected_path = _get_expected_output_path(method_name, output_dir)
-    if expected_path is not None and expected_path.exists():
-        return expected_path
-    
-    return None
-
-
-# ============================================================================
-# Cache Loading Utilities
-# ============================================================================
-
-def _load_method_result(method_name: str, output_dir: Path) -> Optional[Dict[str, Any]]:
-    """Load individual method benchmark result from cache.
-    
-    Parameters
-    ----------
-    method_name : str
-        Name of the benchmark method
-    output_dir : Path
-        Output directory for the dataset
+        Name of the method for labeling
         
     Returns
     -------
     Optional[Dict[str, Any]]
-        Cached result dictionary, or None if cache doesn't exist or is corrupted
+        Dictionary with shrinkage quality metrics, or None if computation fails
     """
-    cache_file = output_dir / ".benchmark_cache" / f"{method_name}.json"
-    
-    if not cache_file.exists():
-        return None
+    import anndata as ad
     
     try:
-        with open(cache_file) as fh:
-            return json.load(fh)
-    except (json.JSONDecodeError, OSError):
+        if not str(shrunk_result_path).endswith('.h5ad'):
+            return None
+            
+        adata = ad.read_h5ad(str(shrunk_result_path))
+        
+        # Check for required layers - lfcShrink results store raw LFC in logfoldchange_raw
+        if 'logfoldchange_raw' not in adata.layers:
+            return None
+        
+        all_ratios = []
+        all_inflation_counts = []
+        all_total_counts = []
+        
+        for pert_idx in range(adata.n_obs):
+            # Get raw LFC from logfoldchange_raw layer
+            raw_lfc = adata.layers['logfoldchange_raw'][pert_idx, :]
+            if hasattr(raw_lfc, 'toarray'):
+                raw_lfc = raw_lfc.toarray().flatten()
+            else:
+                raw_lfc = np.asarray(raw_lfc).flatten()
+            
+            # Get shrunk LFC from X (effect_size) or logfoldchange layer
+            if 'logfoldchange' in adata.layers:
+                shrunk_lfc = adata.layers['logfoldchange'][pert_idx, :]
+            else:
+                shrunk_lfc = adata.X[pert_idx, :]
+            if hasattr(shrunk_lfc, 'toarray'):
+                shrunk_lfc = shrunk_lfc.toarray().flatten()
+            else:
+                shrunk_lfc = np.asarray(shrunk_lfc).flatten()
+            
+            # Compute ratio for genes with |raw| > 0.1
+            valid_mask = np.isfinite(raw_lfc) & np.isfinite(shrunk_lfc) & (np.abs(raw_lfc) > 0.1)
+            if valid_mask.sum() == 0:
+                continue
+            
+            ratio = np.abs(shrunk_lfc[valid_mask]) / np.abs(raw_lfc[valid_mask])
+            all_ratios.extend(ratio.tolist())
+            all_inflation_counts.append((ratio > 1.0).sum())
+            all_total_counts.append(len(ratio))
+        
+        if not all_ratios:
+            return None
+        
+        ratios = np.array(all_ratios)
+        total_inflation = sum(all_inflation_counts)
+        total_genes = sum(all_total_counts)
+        
+        return {
+            "method": method_name,
+            "pct_inflated": 100.0 * total_inflation / total_genes if total_genes > 0 else 0,
+            "max_inflation": float(ratios.max()) if len(ratios) > 0 else 1.0,
+            "median_ratio": float(np.median(ratios)) if len(ratios) > 0 else 1.0,
+            "genes_analyzed": total_genes,
+        }
+        
+    except Exception as e:
         return None
 
 
-def _load_cached_results(output_dir: Path) -> List[Dict[str, Any]]:
-    """Load all cached benchmark results.
+def _compute_shrinkage_quality(
+    raw_result_path: Path,
+    shrunk_result_path: Path,
+    method_name: str,
+    output_dir: Path,
+) -> Optional[Dict[str, Any]]:
+    """Compute shrinkage quality metrics for a method.
+    
+    Compares raw vs shrunk LFC values to detect aberrant shrinkage where
+    |shrunk| > |raw| (LFC magnitude increases instead of decreasing).
     
     Parameters
     ----------
+    raw_result_path : Path
+        Path to raw (unshrunk) DE results
+    shrunk_result_path : Path
+        Path to shrunk DE results
+    method_name : str
+        Name of the method for labeling
     output_dir : Path
-        Output directory for the dataset
-        
-    Returns
-    -------
-    List[Dict[str, Any]]
-        List of cached result dictionaries
-    """
-    cache_dir = output_dir / ".benchmark_cache"
-    if not cache_dir.exists():
-        return []
-    
-    cached_results = []
-    for cache_file in cache_dir.glob("*.json"):
-        if cache_file.name == "config.json":
-            continue
-        try:
-            with open(cache_file) as fh:
-                data = json.load(fh)
-                if "summary" in data:
-                    summary = data.pop("summary")
-                    data.update(summary)
-                cached_results.append(data)
-        except (json.JSONDecodeError, OSError):
-            continue
-    
-    return cached_results
-
-
-def _has_valid_result(row: pd.Series, output_dir: Path) -> bool:
-    """Check if a method row has valid results that can be loaded.
-    
-    Returns True if:
-    - status is "success", OR
-    - status is "skipped_existing" and result file exists
-    
-    This allows cached/skipped methods to be included in reports and visualizations.
-    
-    Parameters
-    ----------
-    row : pd.Series
-        Row from the benchmark results DataFrame
-    output_dir : Path
-        Output directory for the dataset
-        
-    Returns
-    -------
-    bool
-        True if the method has valid results that can be loaded
-    """
-    status = row.get("status")
-    if status == "success":
-        return True
-    if status == "skipped_existing":
-        # Check if result file exists
-        method_name = row.get("method")
-        result_path_val = row.get("result_path")
-        resolved_path = _resolve_result_path(method_name, result_path_val, output_dir)
-        if resolved_path is not None and resolved_path.exists():
-            return True
-    return False
-
-
-def _load_cache_config(output_dir: Path) -> Optional[Dict[str, Any]]:
-    """Load cache configuration.
-    
-    Parameters
-    ----------
-    output_dir : Path
-        Output directory for the dataset
+        Output directory
         
     Returns
     -------
     Optional[Dict[str, Any]]
-        Cached config, or None if doesn't exist or is corrupted
+        Dictionary with shrinkage quality metrics, or None if computation fails
     """
-    config_file = output_dir / ".benchmark_cache" / "config.json"
-    
-    if not config_file.exists():
-        return None
+    import anndata as ad
     
     try:
-        with open(config_file) as fh:
-            return json.load(fh)
-    except (json.JSONDecodeError, OSError):
+        # Load raw and shrunk results
+        if str(raw_result_path).endswith('.h5ad'):
+            raw_adata = ad.read_h5ad(str(raw_result_path))
+            shrunk_adata = ad.read_h5ad(str(shrunk_result_path))
+            
+            # For h5ad files, extract LFC from layers or X
+            all_ratios = []
+            all_inflation_counts = []
+            all_total_counts = []
+            
+            for pert_idx, pert in enumerate(raw_adata.obs['perturbation']):
+                # Get raw LFC
+                if 'logfoldchange' in raw_adata.layers:
+                    raw_lfc = raw_adata.layers['logfoldchange'][pert_idx, :]
+                    if hasattr(raw_lfc, 'toarray'):
+                        raw_lfc = raw_lfc.toarray().flatten()
+                else:
+                    continue
+                
+                # Get shrunk LFC
+                shrunk_lfc = shrunk_adata.X[pert_idx, :]
+                if hasattr(shrunk_lfc, 'toarray'):
+                    shrunk_lfc = shrunk_lfc.toarray().flatten()
+                
+                # Compute ratio for genes with |raw| > 0.1
+                valid_mask = np.abs(raw_lfc) > 0.1
+                if valid_mask.sum() == 0:
+                    continue
+                
+                ratio = np.abs(shrunk_lfc[valid_mask]) / np.abs(raw_lfc[valid_mask])
+                all_ratios.extend(ratio.tolist())
+                all_inflation_counts.append((ratio > 1.0).sum())
+                all_total_counts.append(len(ratio))
+            
+            if not all_ratios:
+                return None
+            
+            ratios = np.array(all_ratios)
+            total_inflation = sum(all_inflation_counts)
+            total_genes = sum(all_total_counts)
+            
+            return {
+                "method": method_name,
+                "pct_inflated": 100.0 * total_inflation / total_genes if total_genes > 0 else 0,
+                "max_inflation": float(ratios.max()) if len(ratios) > 0 else 1.0,
+                "median_ratio": float(np.median(ratios)) if len(ratios) > 0 else 1.0,
+                "genes_analyzed": total_genes,
+            }
+        
+        elif str(raw_result_path).endswith('.csv') and str(shrunk_result_path).endswith('.csv'):
+            # For CSV files (pertpy)
+            raw_df = pd.read_csv(raw_result_path)
+            shrunk_df = pd.read_csv(shrunk_result_path)
+            
+            # Standardize column names
+            raw_df = raw_df.rename(columns={"log2FoldChange": "log_fc", "log_fc": "log_fc"})
+            shrunk_df = shrunk_df.rename(columns={"log2FoldChange": "log_fc", "log_fc": "log_fc"})
+            
+            if 'log_fc' not in raw_df.columns or 'log_fc' not in shrunk_df.columns:
+                return None
+            if 'gene' not in raw_df.columns or 'gene' not in shrunk_df.columns:
+                return None
+            if 'perturbation' not in raw_df.columns or 'perturbation' not in shrunk_df.columns:
+                return None
+            
+            # Merge on gene and perturbation
+            merged = raw_df.merge(
+                shrunk_df[['gene', 'perturbation', 'log_fc']],
+                on=['gene', 'perturbation'],
+                suffixes=('_raw', '_shrunk')
+            )
+            
+            # Filter for |raw| > 0.1
+            merged = merged[np.abs(merged['log_fc_raw']) > 0.1]
+            if len(merged) == 0:
+                return None
+            
+            # Compute ratio
+            ratio = np.abs(merged['log_fc_shrunk']) / np.abs(merged['log_fc_raw'])
+            
+            return {
+                "method": method_name,
+                "pct_inflated": 100.0 * (ratio > 1.0).sum() / len(ratio),
+                "max_inflation": float(ratio.max()),
+                "median_ratio": float(ratio.median()),
+                "genes_analyzed": len(ratio),
+            }
+        
+        return None
+        
+    except Exception as e:
         return None
 
 
@@ -523,13 +431,13 @@ def _streaming_de_to_frame(result: Mapping[str, Any]) -> pd.DataFrame:
         frames.append(frame)
     if frames:
         return pd.concat(frames, ignore_index=True)
-    return pd.DataFrame(columns=_STANDARD_DE_COLUMNS)
+    return pd.DataFrame(columns=STANDARD_DE_COLUMNS)
 
 
-def _standardise_de_dataframe(df: Optional[pd.DataFrame]) -> pd.DataFrame:
+def standardise_de_dataframe(df: Optional[pd.DataFrame]) -> pd.DataFrame:
     """Return ``df`` with standard differential expression column names."""
     if df is None or df.empty:
-        return pd.DataFrame(columns=_STANDARD_DE_COLUMNS)
+        return pd.DataFrame(columns=STANDARD_DE_COLUMNS)
 
     result = df.copy()
     lower_to_original = {col.lower(): col for col in result.columns}
@@ -561,207 +469,17 @@ def _standardise_de_dataframe(df: Optional[pd.DataFrame]) -> pd.DataFrame:
 
     result = result.rename(columns=rename)
 
-    for column in _STANDARD_DE_COLUMNS:
+    for column in STANDARD_DE_COLUMNS:
         if column not in result.columns:
             result[column] = pd.NA
 
-    result = result[_STANDARD_DE_COLUMNS]
+    result = result[STANDARD_DE_COLUMNS]
     result["perturbation"] = result["perturbation"].astype(str).str.strip()
     result["gene"] = result["gene"].astype(str).str.strip()
     result["effect_size"] = pd.to_numeric(result["effect_size"], errors="coerce")
     result["statistic"] = pd.to_numeric(result["statistic"], errors="coerce")
     result["pvalue"] = pd.to_numeric(result["pvalue"], errors="coerce")
     return result
-
-
-# ============================================================================
-# Formatting Helpers
-# ============================================================================
-
-def _get_performance_emoji(pct: Optional[float], is_lower_better: bool = True) -> str:
-    """Return emoji indicator for performance comparison."""
-    if pct is None or _is_scalar_na(pct):
-        return ""
-    
-    if is_lower_better:
-        if pct < 90:
-            return "✅"
-        elif pct > 110:
-            return "❌"
-        else:
-            return "⚠️"
-    else:
-        if pct > 110:
-            return "✅"
-        elif pct < 90:
-            return "❌"
-        else:
-            return "⚠️"
-
-
-def _get_accuracy_emoji(corr: Optional[float]) -> str:
-    """Return emoji indicator for accuracy/correlation."""
-    if corr is None or _is_scalar_na(corr):
-        return ""
-    
-    if corr >= 0.95:
-        return "✅"
-    elif corr >= 0.8:
-        return "⚠️"
-    else:
-        return "❌"
-
-
-def _format_mean_std(mean: Optional[float], std: Optional[float]) -> str:
-    """Format mean ± std as a two-line string for markdown tables."""
-    if mean is None or _is_scalar_na(mean):
-        return "-"
-    
-    if std is None or _is_scalar_na(std) or std == 0:
-        return f"{mean:.3f}"
-    
-    return f"{mean:.3f}<br><small>±{std:.3f}</small>"
-
-
-def _get_method_category(method_name: str) -> tuple[str, str, int]:
-    """Get category and test type for a method."""
-    if not isinstance(method_name, str):
-        return ("other", "unknown", 99)
-    
-    if "_qc_" in method_name or method_name.endswith("_qc_filtered"):
-        return ("Preprocessing / QC", "qc", 0)
-    elif "_pb_avg" in method_name:
-        return ("Preprocessing / QC", "pseudobulk_avg", 1)
-    elif "_pb_pseudobulk" in method_name:
-        return ("Preprocessing / QC", "pseudobulk", 2)
-    elif "_de_t_test" in method_name:
-        return ("DE: t-test", "t_test", 10)
-    elif "_de_wilcoxon" in method_name:
-        return ("DE: Wilcoxon", "wilcoxon", 20)
-    elif "_de_nb_glm_joint" in method_name:
-        return ("DE: NB GLM", "nb_glm_joint", 31)
-    elif "_de_nb_glm" in method_name:
-        return ("DE: NB GLM", "nb_glm", 30)
-    elif "_de_glm" in method_name:
-        return ("DE: NB GLM", "edger", 32)
-    elif "_de_pydeseq2_shrunk" in method_name:
-        return ("DE: NB GLM", "pydeseq2_shrunk", 34)
-    elif "_de_pydeseq2" in method_name:
-        return ("DE: NB GLM", "pydeseq2", 33)
-    else:
-        return ("Other", "unknown", 99)
-
-
-def _format_pct(value: Optional[float], decimals: int = 1) -> str:
-    """Format percentage value."""
-    if value is None or _is_scalar_na(value):
-        return "-"
-    return f"{value:.{decimals}f}%"
-
-
-def _format_diff(value: Optional[float], unit: str = "s", decimals: int = 1) -> str:
-    """Format difference value with sign."""
-    if value is None or _is_scalar_na(value):
-        return "-"
-    sign = "+" if value > 0 else ""
-    return f"{sign}{value:.{decimals}f}{unit}"
-
-
-def _format_method_name(method: str) -> str:
-    """Format method name for display with proper capitalization.
-    
-    Note: shrinkage status is indicated via the lfcShrink column, not in method name.
-    """
-    if "edger_" in method.lower():
-        return "NB-GLM"
-    if "pertpy_" in method.lower() and "pydeseq2" in method.lower():
-        return "NB-GLM"
-    
-    name = method.replace("crispyx_", "").replace("scanpy_", "").replace("pertpy_", "").replace("edger_", "")
-    name = name.replace("_", " ")
-    
-    # Order matters: match longer patterns first to avoid partial matches
-    replacements = {
-        "de t test": "t-test",
-        "de wilcoxon": "Wilcoxon",
-        "de nb glm joint shrunk": "NB-GLM (joint)",  # shrunk suffix stripped
-        "de nb glm joint": "NB-GLM (joint)",
-        "de nb glm shrunk": "NB-GLM",               # shrunk suffix stripped
-        "de nb glm": "NB-GLM",
-        "de glm": "NB-GLM",
-        "de pydeseq2 shrunk": "NB-GLM",              # shrunk suffix stripped
-        "de pydeseq2": "NB-GLM",
-        "qc filtered": "QC filter",
-        "pb avg log": "pseudobulk (avg log)",
-        "pb avg": "pseudobulk (avg)",
-        "pb pseudobulk": "pseudobulk",
-    }
-    
-    for old, new in replacements.items():
-        if old in name:
-            name = name.replace(old, new)
-            break
-    
-    return name
-
-
-def _get_method_package(method: str) -> str:
-    """Get the package name for a method."""
-    if method.startswith("crispyx_"):
-        return "crispyx"
-    elif method.startswith("scanpy_"):
-        return "scanpy"
-    elif method.startswith("edger_"):
-        return "edgeR"
-    elif method.startswith("pertpy_"):
-        return "pertpy"
-    return ""
-
-
-def _format_full_method_name(method: str) -> str:
-    """Format full method name including package."""
-    package = _get_method_package(method)
-    name = _format_method_name(method)
-    if package:
-        return f"{package} {name}"
-    return name
-
-
-def _is_crispyx_method(method: str) -> bool:
-    """Check if method is a crispyx method."""
-    return method.startswith("crispyx_")
-
-
-def _get_shrinkage_type(method: str) -> str:
-    """Get the shrinkage type for a method, or empty string if none."""
-    # Strip any suffix like " (lfcShrink)" that may be added in comparison strings
-    clean_method = method.split(" (")[0] if " (" in method else method
-    return SHRINKAGE_METADATA.get(clean_method, "")
-
-
-def _frame_to_markdown_table(table: pd.DataFrame) -> str:
-    """Render ``table`` as a Markdown table suitable for GitHub."""
-    if table.empty:
-        return "| |\n|---|\n"
-
-    formatted = table.copy()
-    numeric_cols = formatted.select_dtypes(include=["number"]).columns
-    if len(numeric_cols) > 0:
-        formatted[numeric_cols] = formatted[numeric_cols].round(3)
-
-    headers = list(formatted.columns)
-    header_row = "| " + " | ".join(str(h) for h in headers) + " |"
-    separator_row = "| " + " | ".join("---" for _ in headers) + " |"
-    data_rows = []
-    for _, row in formatted.iterrows():
-        values = []
-        for value in row:
-            if _is_scalar_na(value):
-                values.append("")
-            else:
-                values.append(str(value))
-        data_rows.append("| " + " | ".join(values) + " |")
-    return "\n".join([header_row, separator_row, *data_rows]) + "\n"
 
 
 # ============================================================================
@@ -773,6 +491,8 @@ def _generate_improved_markdown(
     perf_comp_results: List[Dict[str, Any]],
     accuracy_results: List[Dict[str, Any]],
     overlap_heatmaps: Optional[Dict[str, Path]] = None,
+    shrinkage_quality: Optional[List[Dict[str, Any]]] = None,
+    skipped_comparisons: Optional[List[Dict[str, Any]]] = None,
 ) -> str:
     """Generate improved markdown with categorized tables and emoji indicators."""
     
@@ -785,12 +505,12 @@ def _generate_improved_markdown(
     
     if not perf_df.empty:
         perf_df = perf_df.copy()
-        perf_df["_category"] = perf_df["method"].apply(lambda x: _get_method_category(x)[0])
-        perf_df["_sort_order"] = perf_df["method"].apply(lambda x: _get_method_category(x)[2])
+        perf_df["_category"] = perf_df["method"].apply(lambda x: get_method_category(x)[0])
+        perf_df["_sort_order"] = perf_df["method"].apply(lambda x: get_method_category(x)[2])
         perf_df = perf_df.sort_values("_sort_order")
         
-        perf_df["Package"] = perf_df["method"].apply(_get_method_package)
-        perf_df["Method"] = perf_df["method"].apply(_format_method_name)
+        perf_df["Package"] = perf_df["method"].apply(get_method_package)
+        perf_df["Method"] = perf_df["method"].apply(format_method_name)
         
         categories = perf_df["_category"].unique()
         
@@ -799,27 +519,17 @@ def _generate_improved_markdown(
             
             md += f"### {category}\n\n"
             
-            # Add lfcShrink column for NB GLM category
-            is_nb_glm = "NB GLM" in category
-            
             if "Preprocessing" in category or "QC" in category:
                 cols = ["Package", "Method", "status", "elapsed_seconds", "peak_memory_mb", "cells_kept", "genes_kept"]
             else:
-                if is_nb_glm:
-                    cols = ["Package", "Method", "status", "elapsed_seconds", "peak_memory_mb", "groups", "genes"]
-                else:
-                    cols = ["Package", "Method", "status", "elapsed_seconds", "peak_memory_mb", "groups", "genes"]
+                cols = ["Package", "Method", "status", "elapsed_seconds", "peak_memory_mb", "groups", "genes"]
             
             cols = [c for c in cols if c in cat_df.columns]
             display_df = cat_df[cols].copy()
             
-            # Add lfcShrink column for NB GLM (use tick mark)
-            if is_nb_glm:
-                display_df.insert(2, "lfcShrink", cat_df["method"].apply(lambda m: "✓" if _get_shrinkage_type(m) else ""))
-            
             rename_map = {
                 "status": "Status",
-                "elapsed_seconds": "Time (s)",
+                "elapsed_seconds": "Total (s)",
                 "peak_memory_mb": "Memory (MB)",
                 "cells_kept": "Cells",
                 "genes_kept": "Genes",
@@ -830,7 +540,7 @@ def _generate_improved_markdown(
             
             def _safe_int(x):
                 """Safely convert to int, handling arrays, lists, and NA values."""
-                if _is_scalar_na(x):
+                if is_scalar_na(x):
                     return x
                 if isinstance(x, (int, float, np.integer, np.floating)):
                     return int(x)
@@ -850,7 +560,7 @@ def _generate_improved_markdown(
                 elif col in display_df.select_dtypes(include=["number"]).columns:
                     display_df[col] = display_df[col].round(2)
             
-            md += _frame_to_markdown_table(display_df)
+            md += frame_to_markdown_table(display_df)
             md += "\n\n"
     
     # =========================================================================
@@ -865,7 +575,7 @@ def _generate_improved_markdown(
         for comp in perf_comp_results:
             comparison = comp["comparison"]
             method_a = comparison.split(" vs ")[0]
-            if _is_crispyx_method(method_a):
+            if is_crispyx_method(method_a):
                 crispyx_comps.append(comp)
             else:
                 other_comps.append(comp)
@@ -878,14 +588,14 @@ def _generate_improved_markdown(
             for comp in crispyx_comps:
                 comparison = comp["comparison"]
                 method_a = comparison.split(" vs ")[0]
-                category = _get_method_category(method_a)[0]
+                category = get_method_category(method_a)[0]
                 
                 if category not in comp_by_category:
                     comp_by_category[category] = []
                 comp_by_category[category].append(comp)
             
             # Sort categories by predefined order
-            sorted_categories = sorted(comp_by_category.keys(), key=_get_category_sort_key)
+            sorted_categories = sorted(comp_by_category.keys(), key=get_category_sort_key)
             
             for category in sorted_categories:
                 comps = comp_by_category[category]
@@ -899,43 +609,32 @@ def _generate_improved_markdown(
                     parts = comparison.split(" vs ")
                     method_a_raw = parts[0]
                     method_b_raw = parts[1]
-                    method_a = _format_method_name(method_a_raw)
-                    method_b = _format_full_method_name(method_b_raw)
+                    method_a = format_method_name(method_a_raw)
+                    method_b = format_full_method_name(method_b_raw)
                     
                     time_pct = comp.get("time_pct")
                     mem_pct = comp.get("mem_pct")
                     time_diff = comp.get("time_diff_s")
                     mem_diff = comp.get("mem_diff_mb")
                     
-                    time_emoji = _get_performance_emoji(time_pct, is_lower_better=True)
-                    mem_emoji = _get_performance_emoji(mem_pct, is_lower_better=True)
+                    time_emoji = get_performance_emoji(time_pct, is_lower_better=True)
+                    mem_emoji = get_performance_emoji(mem_pct, is_lower_better=True)
                     
                     row = {
                         "crispyx method": method_a,
-                    }
-                    if is_nb_glm:
-                        # Only show lfcShrink tick for de_lfcshrink comparisons
-                        is_shrunk_comp = (comp_type == "de_lfcshrink")
-                        row["lfcShrink"] = "✓" if is_shrunk_comp else ""
-                        row["compared to"] = method_b
-                        # Reference tool lfcShrink: edgeR never has shrinkage, PyDESeq2 only in de_lfcshrink
-                        ref_has_shrink = is_shrunk_comp and "pertpy" in method_b_raw.lower()
-                        row["lfcShrink (ref)"] = "✓" if ref_has_shrink else ""
-                    else:
-                        row["compared to"] = method_b
-                    row.update({
-                        "Time Δ": _format_diff(time_diff, "s"),
-                        "Time %": _format_pct(time_pct),
+                        "compared to": method_b,
+                        "Time Δ": format_diff(time_diff, "s"),
+                        "Time %": format_pct(time_pct),
                         "": time_emoji,
-                        "Mem Δ": _format_diff(mem_diff, " MB"),
-                        "Mem %": _format_pct(mem_pct),
+                        "Mem Δ": format_diff(mem_diff, " MB"),
+                        "Mem %": format_pct(mem_pct),
                         " ": mem_emoji,
-                    })
+                    }
                     rows.append(row)
                 
-                # Sort rows by method order: t-test, Wilcoxon, NB-GLM, NB-GLM (joint)
-                rows.sort(key=lambda r: (_get_method_sort_key(r["crispyx method"]), r["crispyx method"], r.get("lfcShrink", ""), r["compared to"]))
-                md += _frame_to_markdown_table(pd.DataFrame(rows))
+                # Sort rows by method order: t-test, Wilcoxon, NB-GLM
+                rows.sort(key=lambda r: (get_method_sort_key(r["crispyx method"]), r["crispyx method"], r["compared to"]))
+                md += frame_to_markdown_table(pd.DataFrame(rows))
                 md += "\n\n"
         
         if other_comps:
@@ -946,31 +645,31 @@ def _generate_improved_markdown(
             for comp in other_comps:
                 comparison = comp["comparison"]
                 parts = comparison.split(" vs ")
-                method_a = _format_method_name(parts[0])
-                method_b = _format_method_name(parts[1])
+                method_a = format_method_name(parts[0])
+                method_b = format_method_name(parts[1])
                 
                 time_pct = comp.get("time_pct")
                 mem_pct = comp.get("mem_pct")
                 time_diff = comp.get("time_diff_s")
                 mem_diff = comp.get("mem_diff_mb")
                 
-                time_emoji = _get_performance_emoji(time_pct, is_lower_better=True)
-                mem_emoji = _get_performance_emoji(mem_pct, is_lower_better=True)
+                time_emoji = get_performance_emoji(time_pct, is_lower_better=True)
+                mem_emoji = get_performance_emoji(mem_pct, is_lower_better=True)
                 
                 rows.append({
-                    "package A": _get_method_package(parts[0]),
+                    "package A": get_method_package(parts[0]),
                     "method A": method_a,
-                    "package B": _get_method_package(parts[1]),
+                    "package B": get_method_package(parts[1]),
                     "method B": method_b,
-                    "Time Δ (A-B)": _format_diff(time_diff, "s"),
-                    "Time % (A/B)": _format_pct(time_pct),
+                    "Time Δ (A-B)": format_diff(time_diff, "s"),
+                    "Time % (A/B)": format_pct(time_pct),
                     "": time_emoji,
-                    "Mem Δ (A-B)": _format_diff(mem_diff, " MB"),
-                    "Mem % (A/B)": _format_pct(mem_pct),
+                    "Mem Δ (A-B)": format_diff(mem_diff, " MB"),
+                    "Mem % (A/B)": format_pct(mem_pct),
                     " ": mem_emoji,
                 })
             
-            md += _frame_to_markdown_table(pd.DataFrame(rows))
+            md += frame_to_markdown_table(pd.DataFrame(rows))
             md += "\n\n"
     
     # =========================================================================
@@ -986,7 +685,7 @@ def _generate_improved_markdown(
         for acc in accuracy_results:
             comparison = acc["comparison"]
             method_a = comparison.split(" vs ")[0]
-            if _is_crispyx_method(method_a):
+            if is_crispyx_method(method_a):
                 crispyx_accs.append(acc)
             else:
                 other_accs.append(acc)
@@ -997,14 +696,14 @@ def _generate_improved_markdown(
             for acc in crispyx_accs:
                 comparison = acc["comparison"]
                 method_a = comparison.split(" vs ")[0]
-                category = _get_method_category(method_a)[0]
+                category = get_method_category(method_a)[0]
                 
                 if category not in acc_by_category:
                     acc_by_category[category] = []
                 acc_by_category[category].append(acc)
             
             # Sort categories by predefined order
-            sorted_categories = sorted(acc_by_category.keys(), key=_get_category_sort_key)
+            sorted_categories = sorted(acc_by_category.keys(), key=get_category_sort_key)
             
             for category in sorted_categories:
                 accs = acc_by_category[category]
@@ -1018,8 +717,8 @@ def _generate_improved_markdown(
                     for acc in accs:
                         comparison = acc["comparison"]
                         parts = comparison.split(" vs ")
-                        method_a = _format_method_name(parts[0])
-                        method_b = _format_full_method_name(parts[1])
+                        method_a = format_method_name(parts[0])
+                        method_b = format_full_method_name(parts[1])
                         
                         cells_diff = acc.get("cells_diff", 0)
                         genes_diff = acc.get("genes_diff", 0)
@@ -1030,13 +729,13 @@ def _generate_improved_markdown(
                         rows.append({
                             "crispyx method": method_a,
                             "compared to": method_b,
-                            "Cells Δ": f"{int(cells_diff):+d}" if _is_scalar_notna(cells_diff) else "-",
+                            "Cells Δ": f"{int(cells_diff):+d}" if is_scalar_notna(cells_diff) else "-",
                             "": cells_emoji,
-                            "Genes Δ": f"{int(genes_diff):+d}" if _is_scalar_notna(genes_diff) else "-",
+                            "Genes Δ": f"{int(genes_diff):+d}" if is_scalar_notna(genes_diff) else "-",
                             " ": genes_emoji,
                         })
                     
-                    md += _frame_to_markdown_table(pd.DataFrame(rows))
+                    md += frame_to_markdown_table(pd.DataFrame(rows))
                 else:
                     rows = []
                     for acc in accs:
@@ -1045,8 +744,8 @@ def _generate_improved_markdown(
                         parts = comparison.split(" vs ")
                         method_a_raw = parts[0]
                         method_b_raw = parts[1]
-                        method_a = _format_method_name(method_a_raw)
-                        method_b = _format_full_method_name(method_b_raw)
+                        method_a = format_method_name(method_a_raw)
+                        method_b = format_full_method_name(method_b_raw)
                         
                         effect_p_mean = acc.get("effect_pearson_corr_mean")
                         effect_p_std = acc.get("effect_pearson_corr_std")
@@ -1063,36 +762,25 @@ def _generate_improved_markdown(
                         
                         row = {
                             "crispyx method": method_a,
+                            "compared to": method_b,
+                            "Eff ρ": format_mean_std(effect_p_mean, effect_p_std),
+                            "": get_accuracy_emoji(effect_p_mean),
+                            "Eff ρₛ": format_mean_std(effect_s_mean, effect_s_std),
+                            " ": get_accuracy_emoji(effect_s_mean),
+                            "Stat ρ": format_mean_std(stat_p_mean, stat_p_std),
+                            "  ": get_accuracy_emoji(stat_p_mean),
+                            "Stat ρₛ": format_mean_std(stat_s_mean, stat_s_std),
+                            "   ": get_accuracy_emoji(stat_s_mean),
+                            "log-Pval ρ": format_mean_std(pval_p_mean, pval_p_std),
+                            "    ": get_accuracy_emoji(pval_p_mean),
+                            "log-Pval ρₛ": format_mean_std(pval_s_mean, pval_s_std),
+                            "     ": get_accuracy_emoji(pval_s_mean),
                         }
-                        if is_nb_glm:
-                            # Only show lfcShrink tick for de_lfcshrink comparisons
-                            is_shrunk_comp = (comp_type == "de_lfcshrink")
-                            row["lfcShrink"] = "✓" if is_shrunk_comp else ""
-                            row["compared to"] = method_b
-                            # Reference tool lfcShrink: edgeR never has shrinkage, PyDESeq2 only in de_lfcshrink
-                            ref_has_shrink = is_shrunk_comp and "pertpy" in method_b_raw.lower()
-                            row["lfcShrink (ref)"] = "✓" if ref_has_shrink else ""
-                        else:
-                            row["compared to"] = method_b
-                        row.update({
-                            "Eff ρ": _format_mean_std(effect_p_mean, effect_p_std),
-                            "": _get_accuracy_emoji(effect_p_mean),
-                            "Eff ρₛ": _format_mean_std(effect_s_mean, effect_s_std),
-                            " ": _get_accuracy_emoji(effect_s_mean),
-                            "Stat ρ": _format_mean_std(stat_p_mean, stat_p_std),
-                            "  ": _get_accuracy_emoji(stat_p_mean),
-                            "Stat ρₛ": _format_mean_std(stat_s_mean, stat_s_std),
-                            "   ": _get_accuracy_emoji(stat_s_mean),
-                            "log-Pval ρ": _format_mean_std(pval_p_mean, pval_p_std),
-                            "    ": _get_accuracy_emoji(pval_p_mean),
-                            "log-Pval ρₛ": _format_mean_std(pval_s_mean, pval_s_std),
-                            "     ": _get_accuracy_emoji(pval_s_mean),
-                        })
                         rows.append(row)
                     
-                    # Sort rows by method order: t-test, Wilcoxon, NB-GLM, NB-GLM (joint)
-                    rows.sort(key=lambda r: (_get_method_sort_key(r["crispyx method"]), r["crispyx method"], r.get("lfcShrink", ""), r["compared to"]))
-                    md += _frame_to_markdown_table(pd.DataFrame(rows))
+                    # Sort rows by method order: t-test, Wilcoxon, NB-GLM
+                    rows.sort(key=lambda r: (get_method_sort_key(r["crispyx method"]), r["crispyx method"], r["compared to"]))
+                    md += frame_to_markdown_table(pd.DataFrame(rows))
                 
                 md += "\n\n"
         
@@ -1103,8 +791,8 @@ def _generate_improved_markdown(
             for acc in other_accs:
                 comparison = acc["comparison"]
                 parts = comparison.split(" vs ")
-                method_a = _format_method_name(parts[0])
-                method_b = _format_method_name(parts[1])
+                method_a = format_method_name(parts[0])
+                method_b = format_method_name(parts[1])
                 
                 effect_p_mean = acc.get("effect_pearson_corr_mean")
                 effect_p_std = acc.get("effect_pearson_corr_std")
@@ -1120,25 +808,25 @@ def _generate_improved_markdown(
                 pval_s_std = acc.get("pvalue_log_spearman_corr_std")
                 
                 rows.append({
-                    "package A": _get_method_package(parts[0]),
+                    "package A": get_method_package(parts[0]),
                     "method A": method_a,
-                    "package B": _get_method_package(parts[1]),
+                    "package B": get_method_package(parts[1]),
                     "method B": method_b,
-                    "Eff ρ": _format_mean_std(effect_p_mean, effect_p_std),
-                    "": _get_accuracy_emoji(effect_p_mean),
-                    "Eff ρₛ": _format_mean_std(effect_s_mean, effect_s_std),
-                    " ": _get_accuracy_emoji(effect_s_mean),
-                    "Stat ρ": _format_mean_std(stat_p_mean, stat_p_std),
-                    "  ": _get_accuracy_emoji(stat_p_mean),
-                    "Stat ρₛ": _format_mean_std(stat_s_mean, stat_s_std),
-                    "   ": _get_accuracy_emoji(stat_s_mean),
-                    "log-Pval ρ": _format_mean_std(pval_p_mean, pval_p_std),
-                    "    ": _get_accuracy_emoji(pval_p_mean),
-                    "log-Pval ρₛ": _format_mean_std(pval_s_mean, pval_s_std),
-                    "     ": _get_accuracy_emoji(pval_s_mean),
+                    "Eff ρ": format_mean_std(effect_p_mean, effect_p_std),
+                    "": get_accuracy_emoji(effect_p_mean),
+                    "Eff ρₛ": format_mean_std(effect_s_mean, effect_s_std),
+                    " ": get_accuracy_emoji(effect_s_mean),
+                    "Stat ρ": format_mean_std(stat_p_mean, stat_p_std),
+                    "  ": get_accuracy_emoji(stat_p_mean),
+                    "Stat ρₛ": format_mean_std(stat_s_mean, stat_s_std),
+                    "   ": get_accuracy_emoji(stat_s_mean),
+                    "log-Pval ρ": format_mean_std(pval_p_mean, pval_p_std),
+                    "    ": get_accuracy_emoji(pval_p_mean),
+                    "log-Pval ρₛ": format_mean_std(pval_s_mean, pval_s_std),
+                    "     ": get_accuracy_emoji(pval_s_mean),
                 })
             
-            md += _frame_to_markdown_table(pd.DataFrame(rows))
+            md += frame_to_markdown_table(pd.DataFrame(rows))
             md += "\n\n"
     
     # =========================================================================
@@ -1160,11 +848,31 @@ def _generate_improved_markdown(
                 method_b_raw = parts[1]
                 
                 # Only include crispyx comparisons in this table
-                if not _is_crispyx_method(method_a_raw):
+                if not is_crispyx_method(method_a_raw):
                     continue
                 
-                method_a = _format_method_name(method_a_raw)
-                method_b = _format_full_method_name(method_b_raw)
+                # Skip certain methods based on metric type:
+                # - P-value: exclude crispyx _pydeseq2 variants and lfcShrink (p-values are identical to base)
+                # - Effect size: exclude crispyx _pydeseq2 base without lfcShrink (LFCs are identical to base)
+                # Note: "pertpy_de_pydeseq2" in method_b should NOT be excluded - it's the reference!
+                if metric_type == "pvalue":
+                    # Exclude crispyx pydeseq2 variants from p-value tables (same p-values as base)
+                    # Only check method_a (crispyx side), not method_b (reference tool side)
+                    if "crispyx" in method_a_raw and "pydeseq2" in method_a_raw:
+                        continue
+                    if comp_type == "de_lfcshrink":
+                        continue
+                elif metric_type == "effect":
+                    # Exclude crispyx pydeseq2 base (without lfcShrink) - only keep pydeseq2 with lfcShrink
+                    is_crispyx_pydeseq2_base = (
+                        "crispyx" in method_a_raw and "pydeseq2" in method_a_raw and
+                        comp_type != "de_lfcshrink"
+                    )
+                    if is_crispyx_pydeseq2_base:
+                        continue
+                
+                method_a = format_method_name(method_a_raw)
+                method_b = format_full_method_name(method_b_raw)
                 
                 # Remove "(lfcShrink)" suffix from method_b display name since we have a column for it
                 method_b = method_b.replace(" (lfcShrink)", "")
@@ -1179,7 +887,7 @@ def _generate_improved_markdown(
                     continue
                 
                 def _get_overlap_emoji(val: Optional[float]) -> str:
-                    if val is None or _is_scalar_na(val):
+                    if val is None or is_scalar_na(val):
                         return ""
                     if val >= 0.7:
                         return "✅"
@@ -1188,33 +896,40 @@ def _generate_improved_markdown(
                     else:
                         return "❌"
                 
-                # Only show lfcShrink tick for de_lfcshrink comparisons
-                is_shrunk_comp = (comp_type == "de_lfcshrink")
-                shrink_a = "✓" if is_shrunk_comp else ""
-                # Reference tool lfcShrink: edgeR never has shrinkage, PyDESeq2 only in de_lfcshrink
-                ref_has_shrink = is_shrunk_comp and "pertpy" in method_b_raw.lower()
-                shrink_b = "✓" if ref_has_shrink else ""
-                
                 rows.append({
                     "crispyx method": method_a,
-                    "lfcShrink": shrink_a,
                     "compared to": method_b,
-                    "lfcShrink (ref)": shrink_b,
-                    "Top-50": f"{k50:.3f}" if k50 is not None and _is_scalar_notna(k50) else "-",
+                    "Top-50": f"{k50:.3f}" if k50 is not None and is_scalar_notna(k50) else "-",
                     "": _get_overlap_emoji(k50),
-                    "Top-100": _format_mean_std(k100_mean, k100_std),
+                    "Top-100": format_mean_std(k100_mean, k100_std),
                     " ": _get_overlap_emoji(k100_mean),
-                    "Top-500": _format_mean_std(k500_mean, k500_std),
+                    "Top-500": format_mean_std(k500_mean, k500_std),
                     "  ": _get_overlap_emoji(k500_mean),
                 })
             
             if rows:
-                # Sort rows by method order: t-test, Wilcoxon, NB-GLM, NB-GLM (joint)
-                rows.sort(key=lambda r: (_get_method_sort_key(r["crispyx method"]), r["crispyx method"], r.get("lfcShrink", ""), r["compared to"]))
-                md += _frame_to_markdown_table(pd.DataFrame(rows))
+                # Sort rows by method order: t-test, Wilcoxon, NB-GLM
+                rows.sort(key=lambda r: (get_method_sort_key(r["crispyx method"]), r["crispyx method"], r["compared to"]))
+                md += frame_to_markdown_table(pd.DataFrame(rows))
             else:
                 md += "_No overlap data available._\n"
             md += "\n\n"
+            
+            # Add note about skipped comparisons for P-value section
+            if metric_type == "pvalue" and skipped_comparisons:
+                # Filter for DE comparisons that would have affected this table
+                de_skipped = [
+                    sc for sc in skipped_comparisons 
+                    if sc.get("comp_type") in ("de",) and "crispyx" in sc.get("method_a", "")
+                ]
+                if de_skipped:
+                    md += "_Note: Some methods are missing due to errors:_\n"
+                    for sc in de_skipped:
+                        method_a = format_method_name(sc.get("method_a", ""))
+                        method_b = format_full_method_name(sc.get("method_b", ""))
+                        reason = sc.get("reason", "unknown error")
+                        md += f"- {method_a} vs {method_b}: _{reason}_\n"
+                    md += "\n"
     else:
         md += "_No overlap data available._\n\n"
     
@@ -1229,18 +944,63 @@ def _generate_improved_markdown(
                 md += f"![{label} Top-100 Overlap]({heatmap_key})\n\n"
     
     # =========================================================================
+    # Section 5: Shrinkage Quality
+    # =========================================================================
+    if shrinkage_quality:
+        md += "## 5. Shrinkage Quality\n\n"
+        md += "_Shrinkage should reduce LFC magnitude toward zero. Genes with |shrunk| > |raw| indicate aberrant shrinkage._\n\n"
+        md += "_✅ <1% inflated | ⚠️ 1-10% inflated | ❌ >10% inflated_\n\n"
+        
+        rows = []
+        for sq in shrinkage_quality:
+            pct = sq.get("pct_inflated", 0)
+            max_inf = sq.get("max_inflation", 1.0)
+            median = sq.get("median_ratio", 1.0)
+            genes = sq.get("genes_analyzed", 0)
+            method = sq.get("method", "")
+            
+            # Get emoji for percentage inflated
+            if pct < 1.0:
+                pct_emoji = "✅"
+            elif pct < 10.0:
+                pct_emoji = "⚠️"
+            else:
+                pct_emoji = "❌"
+            
+            rows.append({
+                "Method": format_full_method_name(method),
+                "% Inflated": f"{pct:.1f}%",
+                "": pct_emoji,
+                "Max Inflation": f"{max_inf:.2f}×",
+                "Median Ratio": f"{median:.3f}",
+                "Genes": f"{genes:,}",
+            })
+        
+        if rows:
+            md += frame_to_markdown_table(pd.DataFrame(rows))
+            md += "\n"
+            md += "_Note: A proper apeGLM implementation should have 0% inflated genes. "
+            md += "The 'Median Ratio' shows how much shrinkage is applied on average (lower = more shrinkage)._\n"
+        md += "\n"
+    
+    # =========================================================================
     # Legend
     # =========================================================================
     md += "---\n\n"
     md += "**Legend:**\n"
-    md += "- Performance: ✅ >10% better | ⚠️ within ±10% | ❌ >10% worse\n"
-    md += "- Accuracy: ✅ ρ≥0.95 | ⚠️ 0.8≤ρ<0.95 | ❌ ρ<0.8\n"
-    md += "- Overlap: ✅ ≥0.7 | ⚠️ 0.5-0.7 | ❌ <0.5\n"
+    md += "- **Performance:** ✅ >10% better | ⚠️ within ±10% | ❌ >10% worse\n"
+    md += "- **Accuracy:** ✅ ρ≥0.95 | ⚠️ 0.8≤ρ<0.95 | ❌ ρ<0.8\n"
+    md += "- **Overlap:** ✅ ≥0.7 | ⚠️ 0.5-0.7 | ❌ <0.5\n"
+    md += "- **Shrinkage:** ✅ <1% inflated | ⚠️ 1-10% inflated | ❌ >10% inflated\n\n"
+    md += "**Abbreviations:**\n"
     md += "- ρ = Pearson correlation, ρₛ = Spearman correlation\n"
+    md += "- log-Pval = correlations on -log₁₀(p) transformed values\n"
+    md += "- sf=per = per-comparison size factor estimation (matches PyDESeq2)\n\n"
+    md += "**Notes:**\n"
     md += "- Correlation and overlap values shown as mean±std across perturbations\n"
-    md += "- log-Pval: correlations computed on -log₁₀(p) transformed values\n"
-    md += "- Top-k overlap: fraction of top-k genes shared between methods\n"
-    md += "- lfcShrink column: shrinkage type used (apeglm, ashr, normal) or blank if none\n"
+    md += "- crispyx lfcShrink uses `method='stats'` (Gaussian approximation) which is numerically stable and ~35× faster than `method='full'`.\n"
+    md += "- P-value overlap excludes lfcShrink methods since shrinkage only affects effect sizes, not p-values.\n"
+    md += "- **Warning:** PyDESeq2 may produce aberrant shrinkage when dispersion trend fitting fails. crispyx shrinkage is more robust.\n"
     
     return md
 
@@ -1274,7 +1034,7 @@ def evaluate_benchmarks(output_dir: Path) -> None:
         return
         
     # Load all results
-    results = _load_cached_results(output_dir)
+    results = load_cached_results(output_dir)
     if not results:
         return
         
@@ -1285,11 +1045,16 @@ def evaluate_benchmarks(output_dir: Path) -> None:
         df = df.rename(columns={"max_memory_mb": "peak_memory_mb"})
     
     # Generate Performance Table
+    # Include step-wise profiling columns for NB-GLM methods (2-phase: fit + shrinkage)
     perf_cols = [
         "method", "status", "elapsed_seconds", "spawn_overhead_seconds",
         "import_seconds", "load_seconds", "process_seconds", 
         "de_seconds", "convert_seconds", "save_seconds",
+        # Step-wise timing for NB-GLM methods
+        "base_seconds", "shrinkage_seconds",
+        # Memory metrics (including step-wise for NB-GLM)
         "peak_memory_mb", "avg_memory_mb",
+        "base_peak_memory_mb", "shrinkage_peak_memory_mb",
         "cells_kept", "genes_kept", "groups"
     ]
     perf_df = df[[c for c in perf_cols if c in df.columns]].copy()
@@ -1298,26 +1063,21 @@ def evaluate_benchmarks(output_dir: Path) -> None:
     
     accuracy_results = []
     perf_comp_results = []
+    skipped_comparisons = []  # Track skipped comparisons with reasons
     de_results_for_heatmaps: Dict[str, pd.DataFrame] = {}
     
     # Define comparisons
-    # Note: We only compare like-with-like:
-    # - base crispyx vs base tools (edgeR, PyDESeq2) - uses result_path
-    # - shrunk crispyx vs shrunk tools (PyDESeq2) - uses shrunk_result_path for de_lfcshrink
-    # - shrunk crispyx also vs edgeR (as a reference baseline)
-    # For de_lfcshrink comparisons, the code automatically uses shrunk_result_path
+    # Note: We compare like-with-like:
+    # - base crispyx vs base tools (edgeR, PyDESeq2)
+    # - lfcShrink crispyx vs lfcShrink PyDESeq2 (standalone shrinkage methods)
+    # - lfcShrink crispyx also vs edgeR (as a reference baseline)
     comparisons = [
         ("crispyx_qc_filtered", "scanpy_qc_filtered", "qc"),
-        # DE GLM - base independent vs external tools (base LFCs)
+        # DE GLM - base NB-GLM vs external tools (base LFCs)
         ("crispyx_de_nb_glm", "edger_de_glm", "de"),
         ("crispyx_de_nb_glm", "pertpy_de_pydeseq2", "de"),
-        # DE GLM - shrunk independent vs shrunk PyDESeq2 (uses shrunk_result_path)
-        ("crispyx_de_nb_glm", "pertpy_de_pydeseq2", "de_lfcshrink"),
-        # DE GLM - base joint vs base tools
-        ("crispyx_de_nb_glm_joint", "edger_de_glm", "de"),
-        ("crispyx_de_nb_glm_joint", "pertpy_de_pydeseq2", "de"),
-        # DE GLM - shrunk joint vs shrunk PyDESeq2 (uses shrunk_result_path)
-        ("crispyx_de_nb_glm_joint", "pertpy_de_pydeseq2", "de_lfcshrink"),
+        # DE GLM - standalone lfcShrink vs PyDESeq2 lfcShrink
+        ("crispyx_de_lfcshrink", "pertpy_de_lfcshrink", "de_lfcshrink"),
         # DE GLM - external tool comparison (base)
         ("edger_de_glm", "pertpy_de_pydeseq2", "de"),
         # DE Tests
@@ -1325,13 +1085,26 @@ def evaluate_benchmarks(output_dir: Path) -> None:
         ("crispyx_de_wilcoxon", "scanpy_de_wilcoxon", "de"),
     ]
     
+    # Add conditional comparisons for optional PyDESeq2-parity lfcShrink method (only if it was run)
+    # pydeseq2 variant uses per-comparison size factor/dispersion estimation (matches PyDESeq2 behavior exactly)
+    optional_method_results = df[df["method"] == "crispyx_de_lfcshrink_pydeseq2"]
+    if not optional_method_results.empty:
+        row = optional_method_results.iloc[0]
+        if has_valid_result(row, output_dir):
+            # PyDESeq2-parity lfcShrink vs PyDESeq2 lfcShrink (for parity testing)
+            comparisons.extend([
+                ("crispyx_de_lfcshrink_pydeseq2", "pertpy_de_lfcshrink", "de_lfcshrink"),
+                # Also compare default vs PyDESeq2-parity variants
+                ("crispyx_de_lfcshrink", "crispyx_de_lfcshrink_pydeseq2", "de_lfcshrink"),
+            ])
+    
     def _load_de_result(method_name: str, result_path_val: Optional[str], use_raw_lfc: bool = False) -> Optional[pd.DataFrame]:
         """Load and standardize a DE result from file.
         
-        Uses _resolve_result_path to fallback to expected path if result_path is missing.
+        Uses resolve_result_path to fallback to expected path if result_path is missing.
         """
         # Resolve the path with fallback to expected output path
-        result_path = _resolve_result_path(method_name, result_path_val, output_dir)
+        result_path = resolve_result_path(method_name, result_path_val, output_dir)
         if result_path is None:
             return None
             
@@ -1346,7 +1119,7 @@ def evaluate_benchmarks(output_dir: Path) -> None:
                 return _streaming_de_to_frame(result_dict)
             else:
                 result_df = pd.read_csv(result_path)
-                return _standardise_de_dataframe(result_df)
+                return standardise_de_dataframe(result_df)
         except Exception as e:
             print(f"Warning: Could not load DE result for {method_name}: {e}")
             return None
@@ -1357,7 +1130,7 @@ def evaluate_benchmarks(output_dir: Path) -> None:
         if method_res.empty:
             continue
         row = method_res.iloc[0]
-        if not _has_valid_result(row, output_dir):
+        if not has_valid_result(row, output_dir):
             continue
         result_path_val = row.get("result_path")
         # Now _load_de_result handles fallback, so we can always try to load
@@ -1366,76 +1139,56 @@ def evaluate_benchmarks(output_dir: Path) -> None:
             if method_df is not None:
                 de_results_for_heatmaps[method_name] = method_df
     
-    # Also collect shrunk results for heatmaps (stored with _shrunk suffix)
-    for method_name in METHODS_WITH_SHRUNK_OUTPUT:
-        method_res = df[df["method"] == method_name]
-        if method_res.empty:
-            continue
-        row = method_res.iloc[0]
-        if not _has_valid_result(row, output_dir):
-            continue
-        shrunk_path_val = row.get("shrunk_result_path")
-        if pd.isna(shrunk_path_val) or shrunk_path_val is None:
-            continue
-        shrunk_method_name = f"{method_name}_shrunk"
-        if shrunk_method_name not in de_results_for_heatmaps:
-            # Load shrunk result directly from path
-            # Handle both absolute paths and paths relative to project root
-            shrunk_path_str = str(shrunk_path_val)
-            if shrunk_path_str.startswith("/"):
-                # Absolute path
-                shrunk_path = Path(shrunk_path_str)
-            elif shrunk_path_str.startswith("benchmarking/") or shrunk_path_str.startswith("de/"):
-                # Path relative to project root or output_dir
-                if shrunk_path_str.startswith("de/"):
-                    shrunk_path = output_dir / shrunk_path_str
-                else:
-                    # Path from project root - extract the part after output_dir
-                    shrunk_path = Path(shrunk_path_str)
-            else:
-                shrunk_path = output_dir / shrunk_path_str
-            if shrunk_path.exists():
-                try:
-                    if str(shrunk_path).endswith('.h5ad'):
-                        import anndata as ad
-                        adata = ad.read_h5ad(str(shrunk_path))
-                        result_dict = _anndata_to_de_dict(adata)
-                        method_df = _streaming_de_to_frame(result_dict)
-                    else:
-                        result_df = pd.read_csv(shrunk_path)
-                        method_df = _standardise_de_dataframe(result_df)
-                    if method_df is not None:
-                        de_results_for_heatmaps[shrunk_method_name] = method_df
-                except Exception as e:
-                    print(f"Warning: Could not load shrunk DE result for {shrunk_method_name}: {e}")
+    # Note: With standalone lfcShrink methods, shrunk results are now loaded directly
+    # via ALL_DE_METHODS_FOR_HEATMAP (crispyx_de_lfcshrink, pertpy_de_lfcshrink, etc.)
+    # No need for separate shrunk_result_path handling anymore.
     
     for method_a_name, method_b_name, comp_type in comparisons:
         method_a_res = df[df["method"] == method_a_name]
         method_b_res = df[df["method"] == method_b_name]
         
         if method_a_res.empty or method_b_res.empty:
+            # Track skipped comparison due to missing method
+            missing = []
+            if method_a_res.empty:
+                missing.append(method_a_name)
+            if method_b_res.empty:
+                missing.append(method_b_name)
+            skipped_comparisons.append({
+                "method_a": method_a_name,
+                "method_b": method_b_name,
+                "comp_type": comp_type,
+                "reason": f"method(s) not run: {', '.join(missing)}",
+            })
             continue
         
         a_row = method_a_res.iloc[0]
         b_row = method_b_res.iloc[0]
         
         # Check if both methods have valid results (success or skipped_existing with file)
-        if not _has_valid_result(a_row, output_dir) or not _has_valid_result(b_row, output_dir):
+        if not has_valid_result(a_row, output_dir) or not has_valid_result(b_row, output_dir):
+            # Track skipped comparison due to invalid results
+            error_methods = []
+            if not has_valid_result(a_row, output_dir):
+                a_status = a_row.get("status", "unknown")
+                a_error = a_row.get("error", "")
+                error_methods.append(f"{method_a_name} ({a_status})")
+            if not has_valid_result(b_row, output_dir):
+                b_status = b_row.get("status", "unknown")
+                b_error = b_row.get("error", "")
+                error_methods.append(f"{method_b_name} ({b_status})")
+            skipped_comparisons.append({
+                "method_a": method_a_name,
+                "method_b": method_b_name,
+                "comp_type": comp_type,
+                "reason": f"method error: {', '.join(error_methods)}",
+            })
             continue
         
-        # For de comparisons (non-shrunk), use base_seconds if available
-        # For de_lfcshrink comparisons (shrunk), use full elapsed_seconds
-        if comp_type == "de" and "NB GLM" in _get_method_category(method_a_name)[0]:
-            # Use base_seconds for NB-GLM base comparisons
-            a_time = a_row.get("base_seconds", np.nan)
-            if pd.isna(a_time):
-                a_time = a_row.get("elapsed_seconds", np.nan)
-            b_time = b_row.get("base_seconds", np.nan)
-            if pd.isna(b_time):
-                b_time = b_row.get("elapsed_seconds", np.nan)
-        else:
-            a_time = a_row.get("elapsed_seconds", np.nan)
-            b_time = b_row.get("elapsed_seconds", np.nan)
+        # For all methods, use elapsed_seconds directly
+        # (base NB-GLM and lfcShrink methods are now separate with their own timings)
+        a_time = a_row.get("elapsed_seconds", np.nan)
+        b_time = b_row.get("elapsed_seconds", np.nan)
         
         a_mem = a_row.get("peak_memory_mb", np.nan)
         b_mem = b_row.get("peak_memory_mb", np.nan)
@@ -1445,33 +1198,24 @@ def evaluate_benchmarks(output_dir: Path) -> None:
             "comp_type": comp_type,  # Store comparison type for display
             "method_a_time_s": a_time,
             "method_b_time_s": b_time,
-            "time_diff_s": a_time - b_time if _is_scalar_notna(a_time) and _is_scalar_notna(b_time) else None,
-            "time_pct": (a_time / b_time * 100) if _is_scalar_notna(a_time) and _is_scalar_notna(b_time) and b_time > 0 else None,
+            "time_diff_s": a_time - b_time if is_scalar_notna(a_time) and is_scalar_notna(b_time) else None,
+            "time_pct": (a_time / b_time * 100) if is_scalar_notna(a_time) and is_scalar_notna(b_time) and b_time > 0 else None,
             "method_a_mem_mb": a_mem,
             "method_b_mem_mb": b_mem,
-            "mem_diff_mb": a_mem - b_mem if _is_scalar_notna(a_mem) and _is_scalar_notna(b_mem) else None,
-            "mem_pct": (a_mem / b_mem * 100) if _is_scalar_notna(a_mem) and _is_scalar_notna(b_mem) and b_mem > 0 else None,
+            "mem_diff_mb": a_mem - b_mem if is_scalar_notna(a_mem) and is_scalar_notna(b_mem) else None,
+            "mem_pct": (a_mem / b_mem * 100) if is_scalar_notna(a_mem) and is_scalar_notna(b_mem) and b_mem > 0 else None,
         }
         perf_comp_results.append(comp)
         
         try:
-            # For de_lfcshrink comparisons, use shrunk_result_path if available
-            if comp_type == "de_lfcshrink":
-                method_a_path_val = method_a_res.iloc[0].get("shrunk_result_path", method_a_res.iloc[0].get("result_path"))
-                method_b_path_val = method_b_res.iloc[0].get("shrunk_result_path", method_b_res.iloc[0].get("result_path"))
-                # Handle case where shrunk_result_path is NaN - fall back to result_path
-                if pd.isna(method_a_path_val):
-                    method_a_path_val = method_a_res.iloc[0].get("result_path")
-                if pd.isna(method_b_path_val):
-                    method_b_path_val = method_b_res.iloc[0].get("result_path")
-            else:
-                # Get result_path values from cache (may be None)
-                method_a_path_val = method_a_res.iloc[0].get("result_path")
-                method_b_path_val = method_b_res.iloc[0].get("result_path")
+            # For all comparison types, use result_path directly
+            # (standalone lfcShrink methods now have their own result_path)
+            method_a_path_val = method_a_res.iloc[0].get("result_path")
+            method_b_path_val = method_b_res.iloc[0].get("result_path")
             
-            # Use _resolve_result_path for fallback - don't skip based on cached value alone
-            method_a_resolved = _resolve_result_path(method_a_name, method_a_path_val, output_dir)
-            method_b_resolved = _resolve_result_path(method_b_name, method_b_path_val, output_dir)
+            # Use resolve_result_path for fallback - don't skip based on cached value alone
+            method_a_resolved = resolve_result_path(method_a_name, method_a_path_val, output_dir)
+            method_b_resolved = resolve_result_path(method_b_name, method_b_path_val, output_dir)
             
             if method_a_resolved is None or method_b_resolved is None:
                 print(f"Skipping comparison {method_a_name} vs {method_b_name}: missing result file")
@@ -1545,6 +1289,80 @@ def evaluate_benchmarks(output_dir: Path) -> None:
             )
         except Exception as e:
             print(f"Warning: Could not generate overlap heatmaps: {e}")
+    
+    # Compute shrinkage quality metrics
+    shrinkage_quality: List[Dict[str, Any]] = []
+    
+    # Define pairs of (raw_method, shrunk_method) for shrinkage quality analysis
+    shrinkage_pairs = [
+        # crispyx: base NB-GLM vs lfcShrink
+        ("crispyx_de_nb_glm", "crispyx_de_lfcshrink"),
+        # crispyx PyDESeq2-parity variant
+        ("crispyx_de_nb_glm_pydeseq2", "crispyx_de_lfcshrink_pydeseq2"),
+        # pertpy/PyDESeq2
+        ("pertpy_de_pydeseq2", "pertpy_de_lfcshrink"),
+    ]
+    
+    # Track which shrunk methods we've already processed
+    processed_shrunk_methods = set()
+    
+    for raw_method, shrunk_method in shrinkage_pairs:
+        raw_row = df[df["method"] == raw_method]
+        shrunk_row = df[df["method"] == shrunk_method]
+        
+        if shrunk_row.empty:
+            continue
+        
+        shrunk_path = resolve_result_path(
+            shrunk_method, shrunk_row.iloc[0].get("result_path"), output_dir
+        )
+        
+        if shrunk_path is None:
+            continue
+        
+        # Try paired approach first (raw + shrunk files)
+        sq = None
+        if not raw_row.empty:
+            raw_path = resolve_result_path(
+                raw_method, raw_row.iloc[0].get("result_path"), output_dir
+            )
+            if raw_path is not None:
+                sq = _compute_shrinkage_quality(raw_path, shrunk_path, shrunk_method, output_dir)
+        
+        # Fallback: try standalone computation from shrunk file alone
+        # (lfcShrink h5ad files contain both raw and shrunk LFCs in layers)
+        if sq is None:
+            sq = _compute_shrinkage_quality_standalone(shrunk_path, shrunk_method)
+        
+        if sq is not None:
+            shrinkage_quality.append(sq)
+            processed_shrunk_methods.add(shrunk_method)
+    
+    # Also check for any standalone lfcShrink methods that weren't in pairs
+    standalone_shrink_methods = [
+        "crispyx_de_lfcshrink",
+        "crispyx_de_lfcshrink_pydeseq2",
+        "pertpy_de_lfcshrink",
+    ]
+    
+    for shrunk_method in standalone_shrink_methods:
+        if shrunk_method in processed_shrunk_methods:
+            continue
+        
+        shrunk_row = df[df["method"] == shrunk_method]
+        if shrunk_row.empty:
+            continue
+        
+        shrunk_path = resolve_result_path(
+            shrunk_method, shrunk_row.iloc[0].get("result_path"), output_dir
+        )
+        
+        if shrunk_path is None:
+            continue
+        
+        sq = _compute_shrinkage_quality_standalone(shrunk_path, shrunk_method)
+        if sq is not None:
+            shrinkage_quality.append(sq)
             
     # Save tables with benchmark_ prefix
     perf_df.to_csv(output_dir / "benchmark_performance.csv", index=False)
@@ -1558,6 +1376,8 @@ def evaluate_benchmarks(output_dir: Path) -> None:
         perf_comp_results, 
         accuracy_results,
         overlap_heatmaps,
+        shrinkage_quality,
+        skipped_comparisons,
     )
         
     with open(output_dir / "benchmark_report.md", "w") as f:

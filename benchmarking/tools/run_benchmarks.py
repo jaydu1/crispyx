@@ -56,7 +56,7 @@ from .env_config import (
 )
 from .generate_demo_dataset import write_demo_dataset
 from .generate_results import evaluate_benchmarks
-from .memory import (
+from .profiling import (
     MemoryTracker,
     get_peak_memory_bytes,
     get_peak_memory_mb,
@@ -77,12 +77,8 @@ from crispyx.pseudobulk import (
 )
 from crispyx.qc import quality_control_summary
 
-
-# ============================================================================
-# Cache Version
-# ============================================================================
-# Increment this version when the cache format changes to force re-computation
-CACHE_VERSION = "1.0.0"
+# Import constants from centralized module
+from .constants import CACHE_VERSION, STANDARD_DE_COLUMNS, STATUS_ORDER
 
 
 # ============================================================================
@@ -850,29 +846,29 @@ def run_pydeseq2_integrated(
     }
 
 
-def run_nb_glm_integrated(
+def run_nb_glm_base(
     path: Path,
     *,
     perturbation_column: str,
     control_label: str,
     output_dir: Path,
     n_jobs: int | None = None,
-    joint: bool = False,
-    shrinkage_type: str = "apeglm",
     size_factor_method: str = "deseq2",
     scale_size_factors: bool = False,
-    gene_name_column: str | None = None,  # Accept but pass to nb_glm_test
-    use_control_cache: bool = True,  # Enable control cache for independent mode
-    size_factor_scope: str = "global",  # Use global size factors for memory efficiency
+    gene_name_column: str | None = None,
+    use_control_cache: bool = True,
+    size_factor_scope: str = "global",
+    se_method: str = "sandwich",
+    dispersion_scope: str = "global",
+    data_name: str = "de_nb_glm",
+    profiling: bool = True,
+    memory_limit_gb: float | None = None,
+    max_dense_fraction: float = 0.3,
 ) -> Dict[str, Any]:
-    """Run NB-GLM followed by LFC shrinkage, saving both base and shrunk results.
+    """Run NB-GLM fitting only (no shrinkage).
     
-    This function runs nb_glm_test and shrink_lfc in sequence, tracking timing
-    for each step separately. Both base and shrunk outputs are saved.
-    
-    Step-wise metrics are returned for detailed analysis:
-    - base_seconds, shrinkage_seconds
-    - result_path (base), shrunk_result_path
+    This function runs nb_glm_test without LFC shrinkage, saving the base results.
+    Shrinkage is handled by a separate run_lfcshrink step with depends_on.
     
     Parameters
     ----------
@@ -886,10 +882,6 @@ def run_nb_glm_integrated(
         Directory for output files
     n_jobs
         Number of parallel jobs
-    joint
-        If True, use joint model fitting; if False, use independent fitting
-    shrinkage_type
-        Type of LFC shrinkage ("apeglm" or "normal")
     size_factor_method
         Method for size factor calculation
     scale_size_factors
@@ -898,70 +890,83 @@ def run_nb_glm_integrated(
         Column name for gene names (passed to nb_glm_test)
     use_control_cache
         If True, precompute control cell statistics once and reuse across
-        all perturbation comparisons. Only applies to independent mode.
+        all perturbation comparisons.
     size_factor_scope
         Scope for size factor computation: "global" or "per_comparison".
-        "global" is more memory efficient; "per_comparison" matches PyDESeq2.
+    se_method
+        Method for SE computation: "sandwich" (robust) or "fisher" (PyDESeq2 parity).
+    dispersion_scope
+        Scope for dispersion estimation: "global" or "per_comparison".
+    data_name
+        Base name for output files (e.g., "de_nb_glm" -> crispyx_de_nb_glm.h5ad).
+    profiling
+        If True, enable profiling in nb_glm_test.
+    memory_limit_gb
+        Optional memory limit in GB. Used for adaptive memory management:
+        - Triggers streaming mode for global dispersion if matrix too large
+        - Limits parallel worker count based on estimated memory per worker
+    max_dense_fraction
+        Maximum fraction of available memory to use for dense matrices.
+        Default is 0.3 (30%). Reduces risk of OOM during global dispersion.
         
     Returns
     -------
-    Dict with step-wise metrics and both result paths
+    Dict with result_path, timing, and memory metrics
     """
     import time
     from typing import Literal, cast
     
-    # Determine base data name based on joint flag
-    base_data_name = "de_nb_glm_joint" if joint else "de_nb_glm"
-    shrunk_data_name = "de_nb_glm_joint_shrunk" if joint else "de_nb_glm_shrunk"
-    fit_method = "joint" if joint else "independent"
-    
     # Cast string parameters to their literal types
     size_factor_method_lit = cast(Literal["sparse", "deseq2"], size_factor_method)
-    shrinkage_type_lit = cast(Literal["normal", "apeglm"], shrinkage_type)
     size_factor_scope_lit = cast(Literal["global", "per_comparison"], size_factor_scope)
+    se_method_lit = cast(Literal["sandwich", "fisher"], se_method)
+    dispersion_scope_lit = cast(Literal["global", "per_comparison"], dispersion_scope)
     
-    # Step 1: Run NB-GLM base fitting
+    # Run NB-GLM base fitting with profiling (no shrinkage)
     t_base_start = time.perf_counter()
     base_result = nb_glm_test(
         path=path,
         perturbation_column=perturbation_column,
         control_label=control_label,
         output_dir=output_dir,
-        data_name=base_data_name,
+        data_name=data_name,
         n_jobs=n_jobs,
-        fit_method=fit_method,
-        lfc_shrinkage_type="none",  # No shrinkage in base step
+        lfc_shrinkage_type="none",  # No shrinkage - handled by separate step
         size_factor_method=size_factor_method_lit,
         scale_size_factors=scale_size_factors,
         gene_name_column=gene_name_column,
         use_control_cache=use_control_cache,
         size_factor_scope=size_factor_scope_lit,
+        se_method=se_method_lit,
+        dispersion_scope=dispersion_scope_lit,
+        profiling=profiling,
+        memory_limit_gb=memory_limit_gb,
+        max_dense_fraction=max_dense_fraction,
     )
     t_base_end = time.perf_counter()
-    base_seconds = t_base_end - t_base_start
+    base_seconds_wall = t_base_end - t_base_start
     
     # Get base result path
     base_result_path = getattr(base_result, "result_path", None)
     if base_result_path is None:
         # Construct expected path
-        suffix = "_nb_glm" if joint else ""
-        base_result_path = output_dir / f"crispyx_{base_data_name}{suffix}.h5ad"
+        base_result_path = output_dir / f"crispyx_{data_name}.h5ad"
     
-    # Step 2: Apply LFC shrinkage
-    t_shrink_start = time.perf_counter()
-    shrunk_result = shrink_lfc(
-        path=base_result_path,
-        shrinkage_type=shrinkage_type_lit,
-        output_dir=output_dir,
-        data_name=shrunk_data_name,
-    )
-    t_shrink_end = time.perf_counter()
-    shrinkage_seconds = t_shrink_end - t_shrink_start
+    # Read profiling data from base h5ad
+    base_peak_memory_mb = None
+    if profiling and base_result_path and Path(base_result_path).exists():
+        try:
+            base_adata = ad.read_h5ad(str(base_result_path))
+            prof_data = base_adata.uns.get("profiling")
+            if isinstance(prof_data, dict) and prof_data.get("profiling_enabled"):
+                base_peak_memory_mb = prof_data.get("fit_peak_memory_mb")
+                # Use internal timing if available (more accurate)
+                if "fit_seconds" in prof_data:
+                    base_seconds_wall = prof_data["fit_seconds"]
+        except Exception:
+            pass  # Fall back to wall-clock timing
     
-    # Get shrunk output path from result
-    shrunk_result_path = getattr(shrunk_result, "result_path", None)
-    
-    # Get group/gene counts from base result (same for shrunk)
+    # Get group/gene counts from base result
     n_groups = len(list(base_result.keys())) if hasattr(base_result, "keys") else 0
     n_genes = 0
     if n_groups > 0:
@@ -972,14 +977,361 @@ def run_nb_glm_integrated(
     
     return {
         "result_path": str(base_result_path) if base_result_path else None,
-        "shrunk_result_path": str(shrunk_result_path) if shrunk_result_path else None,
         "groups": n_groups,
         "genes": n_genes,
-        # Step-wise metrics (for detailed analysis)
-        "base_seconds": base_seconds,
-        "shrinkage_seconds": shrinkage_seconds,
-        "joint": joint,
-        "shrinkage_type": shrinkage_type,
+        "elapsed_seconds": base_seconds_wall,
+        "peak_memory_mb": base_peak_memory_mb,
+        "profiling_enabled": profiling,
+    }
+
+
+def run_lfcshrink(
+    base_result_path: Path,
+    *,
+    output_dir: Path,
+    data_name: str = "de_nb_glm_shrunk",
+    prior_scale_mode: str = "global",
+    profiling: bool = True,
+) -> Dict[str, Any]:
+    """Run lfcShrink on existing NB-GLM results.
+    
+    This function applies apeGLM LFC shrinkage to existing NB-GLM results.
+    Memory baseline is measured after loading the base result from disk.
+    
+    Parameters
+    ----------
+    base_result_path
+        Path to the base NB-GLM h5ad file (from run_nb_glm_base)
+    output_dir
+        Directory for output files
+    data_name
+        Name for output file (e.g., "de_nb_glm_shrunk" -> crispyx_de_nb_glm_shrunk.h5ad)
+    prior_scale_mode
+        Prior scale estimation mode: "global" or "per_comparison"
+    profiling
+        If True, enable profiling in shrink_lfc
+        
+    Returns
+    -------
+    Dict with result_path, timing, and memory metrics
+    """
+    import time
+    
+    t_start = time.perf_counter()
+    shrunk_result = shrink_lfc(
+        path=base_result_path,
+        output_dir=output_dir,
+        data_name=data_name,
+        profiling=profiling,
+        prior_scale_mode=prior_scale_mode,
+        method="stats",  # Use stats-based shrinkage (Gaussian approx) - more accurate than "full"
+        # Note: "full" re-fits with NB likelihood using stored dispersion, which can
+        # diverge from PyDESeq2 due to different dispersion estimation methods.
+        # "stats" uses Gaussian approximation which is robust and matches pertpy well.
+    )
+    t_end = time.perf_counter()
+    elapsed_seconds = t_end - t_start
+    
+    # Get shrunk output path from result
+    shrunk_result_path = getattr(shrunk_result, "result_path", None)
+    
+    # Read profiling data from shrunk h5ad
+    shrinkage_peak_memory_mb = None
+    if profiling and shrunk_result_path and Path(shrunk_result_path).exists():
+        try:
+            shrunk_adata = ad.read_h5ad(str(shrunk_result_path))
+            prof_data = shrunk_adata.uns.get("profiling")
+            if isinstance(prof_data, dict) and prof_data.get("profiling_enabled"):
+                shrinkage_peak_memory_mb = prof_data.get("shrinkage_peak_memory_mb")
+                # Use internal timing if available
+                if "shrinkage_seconds" in prof_data:
+                    elapsed_seconds = prof_data["shrinkage_seconds"]
+        except Exception:
+            pass  # Fall back to wall-clock timing
+    
+    # Get group/gene counts from shrunk result
+    n_groups = 0
+    n_genes = 0
+    if shrunk_result_path and Path(shrunk_result_path).exists():
+        try:
+            shrunk_adata = ad.read_h5ad(str(shrunk_result_path))
+            n_groups = shrunk_adata.n_obs
+            n_genes = shrunk_adata.n_vars
+        except Exception:
+            pass
+    
+    return {
+        "result_path": str(shrunk_result_path) if shrunk_result_path else None,
+        "groups": n_groups,
+        "genes": n_genes,
+        "elapsed_seconds": elapsed_seconds,
+        "peak_memory_mb": shrinkage_peak_memory_mb,
+        "shrinkage_type": "apeglm",
+        "prior_scale_mode": prior_scale_mode,
+        "profiling_enabled": profiling,
+    }
+
+
+def run_pydeseq2_base(
+    dataset_path: Path,
+    *,
+    perturbation_column: str,
+    control_label: str,
+    output_dir: Path,
+    n_jobs: int | None = None,
+) -> Dict[str, Any]:
+    """Run PyDESeq2 base DE fitting only (no shrinkage).
+    
+    This function runs PyDESeq2 without LFC shrinkage, saving base results.
+    Shrinkage is handled by a separate run_pydeseq2_lfcshrink step.
+    
+    Returns timing and memory metrics for the base fitting only.
+    """
+    import gc
+    import io
+    import time
+    from contextlib import redirect_stdout, redirect_stderr
+    
+    import numpy as np
+    import pandas as pd
+    import scanpy as sc
+    import scipy.sparse as sp
+    from pydeseq2.dds import DeseqDataSet
+    from pydeseq2.ds import DeseqStats
+    
+    t_func_start = time.perf_counter()
+    
+    # Load data
+    t_load_start = time.perf_counter()
+    adata = sc.read_h5ad(str(dataset_path))
+    t_load_end = time.perf_counter()
+    gc.collect()
+    
+    # Get unique perturbations (excluding control)
+    perturbations = [p for p in adata.obs[perturbation_column].unique() if p != control_label]
+    
+    t_process_start = time.perf_counter()
+    all_base_results = []
+    
+    for pert in perturbations:
+        # Subset to control + current perturbation
+        mask = adata.obs[perturbation_column].isin([control_label, pert])
+        adata_subset = adata[mask].copy()
+        
+        # PyDESeq2 requires dense matrix with integer counts
+        if sp.issparse(adata_subset.X):
+            adata_subset.X = np.asarray(adata_subset.X.todense())
+        # Ensure integer counts
+        adata_subset.X = np.round(adata_subset.X).astype(int)
+        
+        # Reorder categories so perturbation is first (becomes reference)
+        try:
+            adata_subset.obs[perturbation_column] = adata_subset.obs[perturbation_column].cat.reorder_categories([pert, control_label])
+        except Exception:
+            pass
+        
+        # Run PyDESeq2
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            try:
+                dds = DeseqDataSet(
+                    adata=adata_subset,
+                    design_factors=perturbation_column,
+                    refit_cooks=True,
+                    n_cpus=n_jobs or 1,
+                )
+                dds.deseq2()
+                
+                stat_res = DeseqStats(
+                    dds,
+                    contrast=[perturbation_column, control_label, pert],
+                    alpha=0.05,
+                    n_cpus=n_jobs or 1,
+                )
+                stat_res.summary()
+                
+                # Save base results
+                base_results_df = stat_res.results_df.copy()
+                base_results_df["log2FoldChange"] = -base_results_df["log2FoldChange"]
+                if "stat" in base_results_df.columns:
+                    base_results_df["stat"] = -base_results_df["stat"]
+                base_results_df["gene"] = base_results_df.index
+                base_results_df[perturbation_column] = pert
+                # Store dds and stat_res references for lfcShrink step
+                base_results_df["_coeff_name"] = f"{perturbation_column}[T.{control_label}]"
+                base_results_df = base_results_df.reset_index(drop=True)
+                all_base_results.append(base_results_df)
+                
+            except Exception:
+                continue
+    
+    t_process_end = time.perf_counter()
+    
+    # Format and save base results
+    if all_base_results:
+        base_df = pd.concat(all_base_results, ignore_index=True)
+        base_df = base_df.rename(columns={
+            "log2FoldChange": "log_fc",
+            "lfcSE": "log_fc_se", 
+            "stat": "statistic",
+            "pvalue": "pvalue",
+            "padj": "pvalue_adj",
+        })
+        # Drop internal column before saving
+        if "_coeff_name" in base_df.columns:
+            base_df = base_df.drop(columns=["_coeff_name"])
+    else:
+        base_df = pd.DataFrame()
+    
+    t_save_start = time.perf_counter()
+    base_output_path = output_dir / "pertpy_de_pydeseq2.csv"
+    base_df.to_csv(base_output_path, index=False)
+    t_save_end = time.perf_counter()
+    
+    gc.collect()
+    
+    return {
+        "result_path": str(base_output_path),
+        "groups": len(perturbations),
+        "import_seconds": t_load_start - t_func_start,
+        "load_seconds": t_load_end - t_load_start,
+        "process_seconds": t_process_end - t_process_start,
+        "save_seconds": t_save_end - t_save_start,
+    }
+
+
+def run_pydeseq2_lfcshrink(
+    dataset_path: Path,
+    *,
+    perturbation_column: str,
+    control_label: str,
+    output_dir: Path,
+    n_jobs: int | None = None,
+) -> Dict[str, Any]:
+    """Run PyDESeq2 lfcShrink only.
+    
+    This function runs PyDESeq2 DE fitting followed by lfcShrink,
+    but only reports timing for the shrinkage step. The base fitting
+    is necessary to get the DeseqStats object for shrinkage.
+    
+    Memory baseline is measured after the base fitting completes,
+    so only shrinkage memory is counted.
+    """
+    import gc
+    import io
+    import time
+    from contextlib import redirect_stdout, redirect_stderr
+    
+    import numpy as np
+    import pandas as pd
+    import scanpy as sc
+    import scipy.sparse as sp
+    from pydeseq2.dds import DeseqDataSet
+    from pydeseq2.ds import DeseqStats
+    
+    t_func_start = time.perf_counter()
+    
+    # Load data
+    adata = sc.read_h5ad(str(dataset_path))
+    gc.collect()
+    
+    # Get unique perturbations (excluding control)
+    perturbations = [p for p in adata.obs[perturbation_column].unique() if p != control_label]
+    
+    all_shrunk_results = []
+    total_shrinkage_seconds = 0.0
+    
+    for pert in perturbations:
+        # Subset to control + current perturbation
+        mask = adata.obs[perturbation_column].isin([control_label, pert])
+        adata_subset = adata[mask].copy()
+        
+        # PyDESeq2 requires dense matrix with integer counts
+        if sp.issparse(adata_subset.X):
+            adata_subset.X = np.asarray(adata_subset.X.todense())
+        adata_subset.X = np.round(adata_subset.X).astype(int)
+        
+        try:
+            adata_subset.obs[perturbation_column] = adata_subset.obs[perturbation_column].cat.reorder_categories([pert, control_label])
+        except Exception:
+            pass
+        
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            try:
+                # Run base fitting (not timed for this method)
+                dds = DeseqDataSet(
+                    adata=adata_subset,
+                    design_factors=perturbation_column,
+                    refit_cooks=True,
+                    n_cpus=n_jobs or 1,
+                )
+                dds.deseq2()
+                
+                coeff_name = f"{perturbation_column}[T.{control_label}]"
+                
+                stat_res = DeseqStats(
+                    dds,
+                    contrast=[perturbation_column, control_label, pert],
+                    alpha=0.05,
+                    n_cpus=n_jobs or 1,
+                )
+                stat_res.summary()
+                
+                # Time only the shrinkage step
+                t_shrink_start = time.perf_counter()
+                shrinkage_applied = False
+                try:
+                    stat_res.lfc_shrink(coeff=coeff_name)
+                    shrinkage_applied = True
+                except Exception:
+                    try:
+                        if hasattr(dds, 'varm') and 'LFC' in dds.varm:
+                            available_coeffs = list(dds.varm['LFC'].columns)
+                            matching = [c for c in available_coeffs if c != 'Intercept']
+                            if matching:
+                                stat_res.lfc_shrink(coeff=matching[0])
+                                shrinkage_applied = True
+                    except Exception:
+                        pass
+                t_shrink_end = time.perf_counter()
+                total_shrinkage_seconds += (t_shrink_end - t_shrink_start)
+                
+                # Extract shrunk results
+                shrunk_results_df = stat_res.results_df.copy()
+                shrunk_results_df["log2FoldChange"] = -shrunk_results_df["log2FoldChange"]
+                if "stat" in shrunk_results_df.columns:
+                    shrunk_results_df["stat"] = -shrunk_results_df["stat"]
+                shrunk_results_df["gene"] = shrunk_results_df.index
+                shrunk_results_df[perturbation_column] = pert
+                shrunk_results_df["shrinkage_applied"] = shrinkage_applied
+                shrunk_results_df = shrunk_results_df.reset_index(drop=True)
+                all_shrunk_results.append(shrunk_results_df)
+                
+            except Exception:
+                continue
+    
+    # Format and save shrunk results
+    if all_shrunk_results:
+        shrunk_df = pd.concat(all_shrunk_results, ignore_index=True)
+        shrunk_df = shrunk_df.rename(columns={
+            "log2FoldChange": "log_fc",
+            "lfcSE": "log_fc_se", 
+            "stat": "statistic",
+            "pvalue": "pvalue",
+            "padj": "pvalue_adj",
+        })
+    else:
+        shrunk_df = pd.DataFrame()
+    
+    shrunk_output_path = output_dir / "pertpy_de_pydeseq2_shrunk.csv"
+    shrunk_df.to_csv(shrunk_output_path, index=False)
+    
+    gc.collect()
+    
+    return {
+        "result_path": str(shrunk_output_path),
+        "groups": len(perturbations),
+        "elapsed_seconds": total_shrinkage_seconds,
+        "shrinkage_type": "apeglm",
     }
 
 
@@ -1030,6 +1382,7 @@ class BenchmarkConfig:
     qc_params: Optional[QCParams] = field(default_factory=QCParams)  # None = adaptive
     resource_limits: ResourceLimits = field(default_factory=ResourceLimits)
     methods_to_run: Optional[List[str]] = None
+    optional_methods: Optional[List[str]] = None  # Methods enabled only when explicitly listed
     show_progress: bool = True
     quiet: bool = False
     n_cores: Optional[int] = None
@@ -1046,7 +1399,11 @@ class BenchmarkConfig:
         cls, data: Dict[str, Any], base_output_dir: Optional[Path] = None
     ) -> "BenchmarkConfig":
         """Create config from dictionary (e.g., loaded from YAML)."""
+        # Resolve dataset_path relative to REPO_ROOT if not absolute
         dataset_path = Path(data["dataset_path"])
+        if not dataset_path.is_absolute():
+            dataset_path = REPO_ROOT / dataset_path
+        
         dataset_name = data.get("dataset_name") or dataset_path.stem
 
         if base_output_dir:
@@ -1055,6 +1412,10 @@ class BenchmarkConfig:
             output_dir = Path(
                 data.get("output_dir", f"benchmarking/results/{dataset_name}")
             )
+        
+        # Resolve output_dir relative to REPO_ROOT if not absolute
+        if not output_dir.is_absolute():
+            output_dir = REPO_ROOT / output_dir
 
         qc_data = data.get("qc_params", {})
         # Allow qc_params to be null for adaptive calculation
@@ -1106,6 +1467,7 @@ class BenchmarkConfig:
             qc_params=qc_params,
             resource_limits=resource_limits,
             methods_to_run=data.get("methods_to_run"),
+            optional_methods=data.get("optional_methods"),
             show_progress=data.get("show_progress", True),
             quiet=data.get("quiet", False),
             n_cores=n_cores,
@@ -1130,6 +1492,9 @@ class BenchmarkConfig:
         if "datasets" in data:
             shared = data.get("shared_config", {})
             base_output = Path(shared.get("output_dir", "benchmarking/results"))
+            # Resolve base_output relative to REPO_ROOT if not absolute
+            if not base_output.is_absolute():
+                base_output = REPO_ROOT / base_output
 
             configs = []
             for dataset_data in data["datasets"]:
@@ -1176,11 +1541,6 @@ class DifferentialComparisonSummary:
         return self.metrics.get("pvalue_max_abs_diff")
 
 
-_STANDARD_DE_COLUMNS = ["perturbation", "gene", "effect_size", "statistic", "pvalue"]
-
-_STATUS_ORDER = ["success", "memory_limit", "timeout", "error", "unknown"]
-
-
 def _get_expected_output_path(method_name: str, output_dir: Path, data_name: str = None) -> Path | None:
     """Get the expected output path for a benchmark method.
     
@@ -1215,8 +1575,12 @@ def _get_expected_output_path(method_name: str, output_dir: Path, data_name: str
         return de_dir / "crispyx_de_wilcoxon.h5ad"
     elif method_name == "crispyx_de_nb_glm":
         return de_dir / "crispyx_de_nb_glm.h5ad"
-    elif method_name == "crispyx_de_nb_glm_joint":
-        return de_dir / "crispyx_de_nb_glm_joint_nb_glm.h5ad"  # resolve_output_path adds _nb_glm suffix
+    elif method_name == "crispyx_de_nb_glm_pydeseq2":
+        return de_dir / "crispyx_de_nb_glm_pydeseq2_nb_glm.h5ad"
+    elif method_name == "crispyx_de_lfcshrink":
+        return de_dir / "crispyx_de_nb_glm_shrunk.h5ad"
+    elif method_name == "crispyx_de_lfcshrink_pydeseq2":
+        return de_dir / "crispyx_de_nb_glm_shrunk_pydeseq2.h5ad"
     
     # Scanpy methods with module prefix
     elif method_name == "scanpy_qc_filtered":
@@ -1231,6 +1595,8 @@ def _get_expected_output_path(method_name: str, output_dir: Path, data_name: str
         return de_dir / "edger_de_glm.csv"
     elif method_name == "pertpy_de_pydeseq2":
         return de_dir / "pertpy_de_pydeseq2.csv"
+    elif method_name == "pertpy_de_lfcshrink":
+        return de_dir / "pertpy_de_pydeseq2_shrunk.csv"
     
     return None
 
@@ -1375,6 +1741,10 @@ def _load_method_result(method_name: str, output_dir: Path) -> Optional[Dict[str
 def _load_cached_results(output_dir: Path) -> List[Dict[str, Any]]:
     """Load all cached benchmark results.
     
+    This also validates that timeout/error results are still accurate by checking
+    if output files were created after the cache was written (e.g., if a Docker
+    container continued running after being marked as timed out).
+    
     Parameters
     ----------
     output_dir : Path
@@ -1402,12 +1772,82 @@ def _load_cached_results(output_dir: Path) -> List[Dict[str, Any]]:
                 result = json.load(f)
                 # Only add results that have a method field (exclude comparison metadata)
                 if "method" in result:
+                    # Check if the cache shows an error/timeout but the output file exists
+                    # This can happen if Docker container continued after subprocess timeout
+                    result = _validate_and_recover_cache_result(result, cache_file, output_dir)
                     cached_results.append(result)
         except (json.JSONDecodeError, OSError) as exc:
             print(f"Warning: Skipping corrupted cache file {cache_file.name}: {exc}")
             continue
     
     return cached_results
+
+
+def _validate_and_recover_cache_result(
+    result: Dict[str, Any], 
+    cache_file: Path, 
+    output_dir: Path
+) -> Dict[str, Any]:
+    """Validate cache result and recover status if output file exists.
+    
+    If the cache shows timeout/error but the output file exists and was modified
+    after the cache was written, update the status to 'recovered' and note that
+    the execution actually succeeded despite the timeout.
+    
+    Parameters
+    ----------
+    result : Dict[str, Any]
+        The cached result dictionary
+    cache_file : Path
+        Path to the cache file
+    output_dir : Path
+        Output directory for the dataset
+        
+    Returns
+    -------
+    Dict[str, Any]
+        Updated result dictionary (possibly with corrected status)
+    """
+    method_name = result.get("method")
+    status = result.get("status")
+    
+    # Only check for recovery if the status indicates failure
+    if status not in ("timeout", "error", "memory_limit"):
+        return result
+    
+    # Check if output file exists
+    expected_path = _get_expected_output_path(method_name, output_dir)
+    if expected_path is None or not expected_path.exists():
+        return result
+    
+    # Check if output file was modified after cache file was written
+    try:
+        cache_mtime = cache_file.stat().st_mtime
+        output_mtime = expected_path.stat().st_mtime
+        
+        if output_mtime > cache_mtime:
+            # Output was created after the cache entry - the method actually completed!
+            print(f"  🔧 Recovering {method_name}: output exists despite '{status}' cache status")
+            
+            # Update the result to reflect successful completion
+            recovered_result = result.copy()
+            recovered_result["status"] = "recovered"
+            recovered_result["original_status"] = status
+            recovered_result["original_error"] = result.get("error")
+            recovered_result["error"] = None
+            recovered_result["result_path"] = str(expected_path)
+            
+            # Try to update the cache file with the corrected status
+            try:
+                _save_method_result(method_name, recovered_result, output_dir)
+            except Exception:
+                pass  # Don't fail if we can't update cache
+            
+            return recovered_result
+    except Exception:
+        pass  # On any error, just return the original result
+    
+    return result
 
 
 def _save_cache_config(output_dir: Path, qc_params: Optional[Dict[str, Any]], standardized_path: str) -> None:
@@ -1691,6 +2131,10 @@ def _postprocess_results(df: pd.DataFrame) -> pd.DataFrame:
     remaining_columns = [col for col in table.columns if col not in ordered_columns]
     table = table[ordered_columns + remaining_columns]
 
+    # Drop internal tracking columns
+    internal_columns = ["_loaded_from_cache"]
+    table = table.drop(columns=[c for c in internal_columns if c in table.columns], errors="ignore")
+
     table = table.dropna(axis=1, how="all")
     return table.reset_index(drop=True)
 
@@ -1725,7 +2169,7 @@ def _compute_aggregate_statistics(df: pd.DataFrame) -> Dict[str, Any]:
 
     status_counts = Counter(filled_status)
     ordered_status_counts: Dict[str, int] = {}
-    for status in _STATUS_ORDER:
+    for status in STATUS_ORDER:
         count = int(status_counts.get(status, 0))
         if count:
             ordered_status_counts[status] = count
@@ -1735,7 +2179,9 @@ def _compute_aggregate_statistics(df: pd.DataFrame) -> Dict[str, Any]:
             ordered_status_counts[status] = int(count)
 
     summary["status_counts"] = ordered_status_counts
-    summary["success_count"] = ordered_status_counts.get("success", 0)
+    # Count both 'success' and 'recovered' as successful completions
+    summary["success_count"] = ordered_status_counts.get("success", 0) + ordered_status_counts.get("recovered", 0)
+    summary["recovered_count"] = ordered_status_counts.get("recovered", 0)
     summary["timeout_count"] = ordered_status_counts.get("timeout", 0)
     summary["memory_limit_count"] = ordered_status_counts.get("memory_limit", 0)
     summary["error_count"] = ordered_status_counts.get("error", 0)
@@ -1986,14 +2432,14 @@ def _streaming_de_to_frame(result: Mapping[str, Any]) -> pd.DataFrame:
         frames.append(frame)
     if frames:
         return pd.concat(frames, ignore_index=True)
-    return pd.DataFrame(columns=_STANDARD_DE_COLUMNS)
+    return pd.DataFrame(columns=STANDARD_DE_COLUMNS)
 
 
 def _standardise_de_dataframe(df: Optional[pd.DataFrame]) -> pd.DataFrame:
     """Return ``df`` with standard differential expression column names."""
 
     if df is None or df.empty:
-        return pd.DataFrame(columns=_STANDARD_DE_COLUMNS)
+        return pd.DataFrame(columns=STANDARD_DE_COLUMNS)
 
     result = df.copy()
     lower_to_original = {col.lower(): col for col in result.columns}
@@ -2025,11 +2471,11 @@ def _standardise_de_dataframe(df: Optional[pd.DataFrame]) -> pd.DataFrame:
 
     result = result.rename(columns=rename)
 
-    for column in _STANDARD_DE_COLUMNS:
+    for column in STANDARD_DE_COLUMNS:
         if column not in result.columns:
             result[column] = pd.NA
 
-    result = result[_STANDARD_DE_COLUMNS]
+    result = result[STANDARD_DE_COLUMNS]
     result["perturbation"] = result["perturbation"].astype(str).str.strip()
     result["gene"] = result["gene"].astype(str).str.strip()
     result["effect_size"] = pd.to_numeric(result["effect_size"], errors="coerce")
@@ -2276,8 +2722,6 @@ def _get_method_category(method_name: str) -> tuple[str, str, int]:
         return ("DE: t-test", "t_test", 10)
     elif "_de_wilcoxon" in method_name:
         return ("DE: Wilcoxon", "wilcoxon", 20)
-    elif "_de_nb_glm_joint" in method_name:
-        return ("DE: NB GLM", "nb_glm_joint", 31)
     elif "_de_nb_glm" in method_name:
         return ("DE: NB GLM", "nb_glm", 30)
     elif "_de_glm" in method_name:  # edger
@@ -2777,7 +3221,15 @@ def _generate_improved_markdown(
     md += "- Correlation and overlap values shown as mean±std across perturbations\n"
     md += "- log-Pval: correlations computed on -log₁₀(p) transformed values\n"
     md += "- Top-k overlap: fraction of top-k genes shared between methods\n"
-    
+    md += "- lfcShrink column: shrinkage type used (apeglm, ashr, normal) or blank if none\n"
+    md += "- NB-GLM sf=per: per-comparison size factor estimation (matches PyDESeq2 behavior)\n"
+    md += "- NB-GLM (base): global size factor estimation across all comparisons\n"
+    md += "\n**Note on lfcShrink methods:**\n"
+    md += "- crispyx uses `method='full'` for benchmarking, which re-fits the full NB likelihood with L-BFGS-B optimization per gene. This matches PyDESeq2's apeglm shrinkage exactly.\n"
+    md += "- For production use, `method='stats'` (default in `shrink_lfc`) is ~35× faster by using pre-computed MLE statistics with Newton-Raphson optimization, but results are approximate.\n"
+    md += "\n**Note on overlap exclusions:**\n"
+    md += "- P-value overlap: NB-GLM sf=per and lfcShrink versions are excluded because size factor estimation and LFC shrinkage only affect effect sizes, not test statistics or p-values.\n"
+    md += "- Effect size overlap: NB-GLM sf=per (without lfcShrink) is excluded because per-comparison size factors only affect LFCs when lfcShrink is applied.\n"
     return md
 
 
@@ -2850,19 +3302,23 @@ def _evaluate_benchmarks_legacy(output_dir: Path) -> None:
         ("crispyx_de_nb_glm", "pertpy_de_pydeseq2", "de"),
         # DE GLM - independent shrunk vs PyDESeq2 shrunk (uses shrunk_result_path)
         ("crispyx_de_nb_glm", "pertpy_de_pydeseq2", "de_lfcshrink"),
-        # DE GLM - joint vs independent (internal comparison, base LFCs)
-        ("crispyx_de_nb_glm_joint", "crispyx_de_nb_glm", "de"),
-        # DE GLM - joint vs external tools (base LFCs)
-        ("crispyx_de_nb_glm_joint", "edger_de_glm", "de"),
-        ("crispyx_de_nb_glm_joint", "pertpy_de_pydeseq2", "de_raw"),  # Raw LFC comparison (standard)
-        # DE GLM - joint shrunk vs PyDESeq2 shrunk (uses shrunk_result_path)
-        ("crispyx_de_nb_glm_joint", "pertpy_de_pydeseq2", "de_lfcshrink"),
         # DE GLM - external tool comparison
         ("edger_de_glm", "pertpy_de_pydeseq2", "de"),
         # DE Tests
         ("crispyx_de_t_test", "scanpy_de_t_test", "de"),
         ("crispyx_de_wilcoxon", "scanpy_de_wilcoxon", "de"),
     ]
+    
+    # Add conditional comparisons for optional methods (only if they were run)
+    optional_method_results = df[df["method"] == "crispyx_de_nb_glm_pydeseq2"]
+    if not optional_method_results.empty and optional_method_results.iloc[0]["status"] in ("success", "recovered", "skipped_existing"):
+        # PyDESeq2-parity method vs PyDESeq2 (for parity testing)
+        comparisons.extend([
+            ("crispyx_de_nb_glm_pydeseq2", "pertpy_de_pydeseq2", "de"),
+            ("crispyx_de_nb_glm_pydeseq2", "pertpy_de_pydeseq2", "de_lfcshrink"),
+            # Also compare default vs PyDESeq2-parity variants
+            ("crispyx_de_nb_glm", "crispyx_de_nb_glm_pydeseq2", "de"),
+        ])
     
     # Helper to load DE result DataFrame
     def _load_de_result(method_name: str, result_path_val: str, use_raw_lfc: bool = False) -> Optional[pd.DataFrame]:
@@ -2907,13 +3363,17 @@ def _evaluate_benchmarks_legacy(output_dir: Path) -> None:
     de_methods = [
         "crispyx_de_t_test", "scanpy_de_t_test",
         "crispyx_de_wilcoxon", "scanpy_de_wilcoxon",
-        "crispyx_de_nb_glm", "crispyx_de_nb_glm_joint", "edger_de_glm", "pertpy_de_pydeseq2",
+        "crispyx_de_nb_glm", "crispyx_de_nb_glm_pydeseq2", "edger_de_glm", "pertpy_de_pydeseq2",
     ]
-    methods_with_shrunk = ["crispyx_de_nb_glm", "crispyx_de_nb_glm_joint", "pertpy_de_pydeseq2"]
+    methods_with_shrunk = ["crispyx_de_nb_glm", "crispyx_de_nb_glm_pydeseq2", "pertpy_de_pydeseq2"]
     
     for method_name in de_methods:
         method_res = df[df["method"] == method_name]
-        if method_res.empty or method_res.iloc[0]["status"] != "success":
+        if method_res.empty:
+            continue
+        method_status = method_res.iloc[0]["status"]
+        # Include success, recovered, and skipped_existing (cached results with valid output)
+        if method_status not in ("success", "recovered", "skipped_existing"):
             continue
         # Load base result
         result_path_val = method_res.iloc[0].get("result_path")
@@ -2951,14 +3411,15 @@ def _evaluate_benchmarks_legacy(output_dir: Path) -> None:
                         print(f"Warning: Could not load shrunk DE result for {shrunk_method_name}: {e}")
     
     for method_a_name, method_b_name, comp_type in comparisons:
-        # Check if both exist and succeeded
+        # Check if both exist and have valid results (success or skipped_existing with output)
         method_a_res = df[df["method"] == method_a_name]
         method_b_res = df[df["method"] == method_b_name]
         
         if method_a_res.empty or method_b_res.empty:
             continue
-            
-        if method_a_res.iloc[0]["status"] != "success" or method_b_res.iloc[0]["status"] != "success":
+        
+        valid_statuses = ("success", "recovered", "skipped_existing")
+        if method_a_res.iloc[0]["status"] not in valid_statuses or method_b_res.iloc[0]["status"] not in valid_statuses:
             continue
             
         # Performance Comparison
@@ -3462,7 +3923,7 @@ class DockerRunner:
         # Normalize paths in summary dict
         if "summary" in result and isinstance(result["summary"], dict):
             summary = result["summary"].copy()
-            for key in ["result_path"]:
+            for key in ["result_path", "shrunk_result_path"]:
                 if key in summary and isinstance(summary[key], str):
                     path = summary[key]
                     # Strip /workspace/ prefix if present
@@ -3470,11 +3931,12 @@ class DockerRunner:
                         summary[key] = path[len("/workspace/"):]
             result["summary"] = summary
         
-        # Also check top-level result_path
-        if "result_path" in result and isinstance(result["result_path"], str):
-            path = result["result_path"]
-            if path.startswith("/workspace/"):
-                result["result_path"] = path[len("/workspace/"):]
+        # Also check top-level result_path and shrunk_result_path
+        for key in ["result_path", "shrunk_result_path"]:
+            if key in result and isinstance(result[key], str):
+                path = result[key]
+                if path.startswith("/workspace/"):
+                    result[key] = path[len("/workspace/"):]
         
         return result
     
@@ -3505,7 +3967,38 @@ class DockerRunner:
         
         # Create temporary directory for IPC
         run_id = str(uuid.uuid4())[:8]
+        container_name = f"crispyx_{run_id}"
         temp_dir = Path(tempfile.mkdtemp(prefix=f"crispyx_docker_{run_id}_"))
+        
+        def _cleanup_container() -> None:
+            """Stop and remove the container if it exists."""
+            try:
+                # Stop the container (with timeout to avoid hanging)
+                subprocess.run(
+                    ["docker", "stop", "-t", "5", container_name],
+                    capture_output=True,
+                    timeout=30,
+                )
+            except (subprocess.TimeoutExpired, Exception):
+                # Force kill if stop times out
+                try:
+                    subprocess.run(
+                        ["docker", "kill", container_name],
+                        capture_output=True,
+                        timeout=10,
+                    )
+                except Exception:
+                    pass
+            
+            # Remove container (in case --rm didn't work due to crash)
+            try:
+                subprocess.run(
+                    ["docker", "rm", "-f", container_name],
+                    capture_output=True,
+                    timeout=10,
+                )
+            except Exception:
+                pass
         
         try:
             # Prepare input configuration
@@ -3533,6 +4026,7 @@ class DockerRunner:
             
             cmd = [
                 "docker", "run", "--rm",
+                f"--name={container_name}",  # Named container for cleanup
                 f"--memory={memory_bytes}",
                 "--memory-swap=-1",  # Disable swap to enforce memory limit
                 f"--cpus={self.n_cores}",
@@ -3601,22 +4095,78 @@ class DockerRunner:
                         
             except subprocess.TimeoutExpired:
                 elapsed = time.perf_counter() - start_time
-                # Kill container if still running
-                subprocess.run(["docker", "kill", f"crispyx_{run_id}"], capture_output=True)
+                # Kill and cleanup container
+                _cleanup_container()
                 return {
                     "method": method.name,
                     "status": "timeout",
                     "elapsed_seconds": elapsed,
                     "error": f"Container timed out after {time_limit}s",
                 }
+            except Exception as e:
+                # Handle any other errors (including keyboard interrupt)
+                elapsed = time.perf_counter() - start_time
+                _cleanup_container()
+                return {
+                    "method": method.name,
+                    "status": "error",
+                    "elapsed_seconds": elapsed,
+                    "error": f"Unexpected error: {str(e)[-500:]}",
+                }
                 
         finally:
+            # Always attempt container cleanup (in case of OOM or other failures)
+            _cleanup_container()
+            
             # Cleanup temp directory
             import shutil
             try:
                 shutil.rmtree(temp_dir)
             except Exception:
                 pass
+    
+    def cleanup_orphaned_containers(self) -> int:
+        """Clean up any orphaned crispyx containers from previous runs.
+        
+        This is useful to call at the start of a benchmark session to ensure
+        no stale containers are consuming memory.
+        
+        Returns
+        -------
+        int
+            Number of containers cleaned up.
+        """
+        try:
+            # Find all containers with crispyx_ prefix
+            result = subprocess.run(
+                ["docker", "ps", "-a", "--filter", "name=crispyx_", "--format", "{{.Names}}"],
+                capture_output=True,
+                timeout=30,
+            )
+            if result.returncode != 0:
+                return 0
+            
+            container_names = result.stdout.decode().strip().split('\n')
+            container_names = [n for n in container_names if n]  # Filter empty strings
+            
+            cleaned = 0
+            for name in container_names:
+                try:
+                    # Force remove each container
+                    subprocess.run(
+                        ["docker", "rm", "-f", name],
+                        capture_output=True,
+                        timeout=10,
+                    )
+                    cleaned += 1
+                    if not self.quiet:
+                        print(f"  🧹 Cleaned up orphaned container: {name}")
+                except Exception:
+                    pass
+            
+            return cleaned
+        except Exception:
+            return 0
     
     def ensure_image(self) -> bool:
         """Ensure the Docker image exists, building if necessary.
@@ -4000,6 +4550,7 @@ def create_benchmark_suite(
     qc_params: QCParams | None = None,
     n_cores: int | None = None,
     chunk_size: int | None = None,
+    memory_limit_gb: float | None = None,
 ) -> Dict[str, BenchmarkMethod]:
     """Return the available benchmark methods for the provided dataset.
     
@@ -4021,6 +4572,10 @@ def create_benchmark_suite(
         Number of cores to use for parallel DE methods. If None, auto-detects.
     chunk_size
         Optional fixed chunk size to use. Overrides qc_params.chunk_size if provided.
+    memory_limit_gb
+        Optional memory limit in GB for memory-adaptive methods like NB-GLM.
+        If provided, methods will use streaming mode when matrix size exceeds
+        a fraction of this limit.
     """
     import anndata as ad
     
@@ -4150,39 +4705,70 @@ def create_benchmark_suite(
         ),
         "crispyx_de_nb_glm": BenchmarkMethod(
             name="crispyx_de_nb_glm",
-            description="NB-GLM (independent) with base + apeGLM shrinkage",
-            function=run_nb_glm_integrated,
+            description="NB-GLM base fitting (no shrinkage)",
+            function=run_nb_glm_base,
             kwargs={
                 "path": dataset_path,
                 **shared_kwargs,
                 "output_dir": de_dir,
                 "n_jobs": n_cores,
-                "joint": False,
-                "shrinkage_type": "apeglm",
                 "size_factor_method": "deseq2",
                 "scale_size_factors": False,
-                "use_control_cache": True,  # Enable memory-optimized control caching
-                "size_factor_scope": "global",  # Use global size factors for efficiency
+                "use_control_cache": True,
+                "size_factor_scope": "global",
+                "data_name": "de_nb_glm",
+                "memory_limit_gb": memory_limit_gb,
             },
             summary=_summarise_runner_result,
         ),
-        "crispyx_de_nb_glm_joint": BenchmarkMethod(
-            name="crispyx_de_nb_glm_joint",
-            description="NB-GLM (joint) with base + apeGLM shrinkage",
-            function=run_nb_glm_integrated,
+        # NB-GLM with PyDESeq2-parity configuration (for benchmarking parity)
+        "crispyx_de_nb_glm_pydeseq2": BenchmarkMethod(
+            name="crispyx_de_nb_glm_pydeseq2",
+            description="NB-GLM with PyDESeq2-parity settings (fisher SE, per-comparison SF/disp)",
+            function=run_nb_glm_base,
             kwargs={
                 "path": dataset_path,
                 **shared_kwargs,
                 "output_dir": de_dir,
                 "n_jobs": n_cores,
-                "joint": True,
-                "shrinkage_type": "apeglm",
                 "size_factor_method": "deseq2",
                 "scale_size_factors": False,
-                "use_control_cache": True,  # Not used for joint but included for consistency
-                "size_factor_scope": "global",  # Use global size factors for efficiency
+                "use_control_cache": False,  # per-comparison requires fresh computation
+                "size_factor_scope": "per_comparison",
+                "se_method": "fisher",
+                "dispersion_scope": "per_comparison",
+                "data_name": "de_nb_glm_pydeseq2_nb_glm",  # End with _nb_glm to prevent suffix duplication
+                "memory_limit_gb": memory_limit_gb,
             },
             summary=_summarise_runner_result,
+        ),
+        # lfcShrink with global prior scale (faster)
+        "crispyx_de_lfcshrink": BenchmarkMethod(
+            name="crispyx_de_lfcshrink",
+            description="apeGLM LFC shrinkage (global prior scale)",
+            function=run_lfcshrink,
+            kwargs={
+                "base_result_path": de_dir / "crispyx_de_nb_glm.h5ad",
+                "output_dir": de_dir,
+                "data_name": "de_nb_glm_shrunk",
+                "prior_scale_mode": "global",
+            },
+            summary=_summarise_runner_result,
+            depends_on="crispyx_de_nb_glm",
+        ),
+        # lfcShrink with PyDESeq2-parity configuration (uses PyDESeq2-parity NB-GLM base)
+        "crispyx_de_lfcshrink_pydeseq2": BenchmarkMethod(
+            name="crispyx_de_lfcshrink_pydeseq2",
+            description="apeGLM LFC shrinkage with PyDESeq2-parity base (per-comparison prior scale)",
+            function=run_lfcshrink,
+            kwargs={
+                "base_result_path": de_dir / "crispyx_de_nb_glm_pydeseq2_nb_glm.h5ad",
+                "output_dir": de_dir,
+                "data_name": "de_nb_glm_shrunk_pydeseq2",
+                "prior_scale_mode": "per_comparison",
+            },
+            summary=_summarise_runner_result,
+            depends_on="crispyx_de_nb_glm_pydeseq2",
         ),
         "scanpy_qc_filtered": BenchmarkMethod(
             name="scanpy_qc_filtered",
@@ -4241,8 +4827,8 @@ def create_benchmark_suite(
         ),
         "pertpy_de_pydeseq2": BenchmarkMethod(
             name="pertpy_de_pydeseq2",
-            description="PyDESeq2 with base + apeGLM shrinkage",
-            function=run_pydeseq2_integrated,
+            description="PyDESeq2 base fitting (no shrinkage)",
+            function=run_pydeseq2_base,
             kwargs={
                 "dataset_path": dataset_path,
                 "perturbation_column": shared_kwargs["perturbation_column"],
@@ -4251,6 +4837,20 @@ def create_benchmark_suite(
                 "n_jobs": n_cores,
             },
             summary=_summarise_runner_result,
+        ),
+        "pertpy_de_lfcshrink": BenchmarkMethod(
+            name="pertpy_de_lfcshrink",
+            description="PyDESeq2 apeGLM LFC shrinkage",
+            function=run_pydeseq2_lfcshrink,
+            kwargs={
+                "dataset_path": dataset_path,
+                "perturbation_column": shared_kwargs["perturbation_column"],
+                "control_label": shared_kwargs["control_label"],
+                "output_dir": de_dir,
+                "n_jobs": n_cores,
+            },
+            summary=_summarise_runner_result,
+            depends_on="pertpy_de_pydeseq2",
         ),
     }
 
@@ -4390,6 +4990,7 @@ def _format_summary_markdown(summary: Dict[str, Any]) -> str:
 
     total_methods = summary.get("total_methods", 0)
     success_count = summary.get("success_count", 0)
+    recovered_count = summary.get("recovered_count", 0)
     timeout_count = summary.get("timeout_count", 0)
     memory_limit_count = summary.get("memory_limit_count", 0)
     error_count = summary.get("error_count", 0)
@@ -4404,6 +5005,10 @@ def _format_summary_markdown(summary: Dict[str, Any]) -> str:
     if success_rate is not None:
         success_line += f" ({success_rate * 100:.1f}% success rate)"
     lines.append(success_line)
+
+    # Note any recovered methods (completed despite initial timeout/error)
+    if recovered_count:
+        lines.append(f"  - Recovered (completed after timeout): {recovered_count}")
 
     if non_success:
         lines.append(f"- **Did not succeed:** {non_success}")
@@ -4714,10 +5319,22 @@ def _run_single_benchmark(
         qc_params=config.qc_params,  # Will use adaptive if None
         n_cores=config.n_cores,
         chunk_size=config.chunk_size,
+        memory_limit_gb=config.resource_limits.memory_limit if config.resource_limits.memory_limit > 0 else None,
     )
+    
+    # Define optional methods (excluded by default, only run when explicitly requested)
+    # These methods are useful for specific validation but not needed for standard benchmarks
+    # Methods with _pydeseq2 suffix are specifically designed to match PyDESeq2's exact behavior
+    OPTIONAL_METHODS = {
+        "crispyx_de_lfcshrink",  # LFC shrinkage step (runs separately from NB-GLM base)
+        "crispyx_de_nb_glm_pydeseq2",  # NB-GLM with PyDESeq2-parity settings for benchmarking
+        "crispyx_de_lfcshrink_pydeseq2",  # LFC shrinkage with PyDESeq2-parity base
+        "pertpy_de_lfcshrink",  # PyDESeq2 LFC shrinkage step
+    }
     
     methods_to_run = config.methods_to_run
     if methods_to_run:
+        # When --methods is specified, allow any available method including optional ones
         selected_names: list[str] = []
         for name in methods_to_run:
             if name in available_methods:
@@ -4739,8 +5356,21 @@ def _run_single_benchmark(
                 f"Unknown method '{name}'. Available methods: {sorted(available_methods)}"
             )
     else:
+        # Default: run all methods except optional ones
         ordered_methods = sorted(available_methods.values(), key=_method_sort_key)
-        selected_names = [method.name for method in ordered_methods]
+        selected_names = [
+            method.name for method in ordered_methods
+            if method.name not in OPTIONAL_METHODS
+        ]
+        
+        # Add optional methods if explicitly enabled in config
+        if config.optional_methods:
+            for opt_name in config.optional_methods:
+                if opt_name in available_methods and opt_name not in selected_names:
+                    selected_names.append(opt_name)
+                elif opt_name not in available_methods:
+                    import warnings
+                    warnings.warn(f"Unknown optional method '{opt_name}' will be skipped")
 
     # Sort methods topologically to respect dependencies
     # Methods with depends_on must run after their dependency
@@ -4816,6 +5446,10 @@ def _run_single_benchmark(
                 f"Docker image {config.docker_image} is not available and could not be built. "
                 "Please build the image manually: docker build -t crispyx-benchmark benchmarking/"
             )
+        # Clean up any orphaned containers from previous runs
+        cleaned = docker_runner.cleanup_orphaned_containers()
+        if cleaned > 0 and not config.quiet:
+            print(f"  🧹 Cleaned up {cleaned} orphaned container(s) from previous runs")
         if not config.quiet:
             print(f"  🐳 Docker mode enabled with image: {config.docker_image}")
             print(f"      Memory limit: {config.resource_limits.memory_limit:.1f} GB")
@@ -4832,6 +5466,9 @@ def _run_single_benchmark(
     else:
         method_iterator = selected_names
 
+    # Track which methods were actually executed (not loaded from cache)
+    actually_executed: set[str] = set()
+
     for name in method_iterator:
         if name not in available_methods:
             raise ValueError(f"Unknown method '{name}'. Available methods: {sorted(available_methods)}")
@@ -4843,7 +5480,8 @@ def _run_single_benchmark(
             cached_result = _load_method_result(method.name, config.output_dir)
             
             if cached_result is not None:
-                # Use cached result
+                # Use cached result - mark as loaded from cache for accurate summary
+                cached_result["_loaded_from_cache"] = True
                 rows.append(cached_result)
                 
                 # Display cached stats
@@ -4978,36 +5616,31 @@ def _run_single_benchmark(
             row["error"] = result["error"]
         
         rows.append(row)
+        actually_executed.add(method.name)
         
         # Save result to cache immediately after completion
         _save_method_result(method.name, row, config.output_dir)
     
     # Load any cached results that weren't re-run and merge with new results
     cached_results = _load_cached_results(config.output_dir)
-    executed_methods = {row["method"] for row in rows}
+    methods_in_rows = {row["method"] for row in rows}
     
-    # Track statistics for merge summary
-    cached_count = 0
-    skipped_count = sum(1 for r in rows if r.get("status") == "skipped_existing" or 
-                        (r.get("status") == "success" and r.get("method") not in 
-                         {m.name for m in available_methods.values() if m.name in selected_names}))
-    executed_count = sum(1 for r in rows if r.get("status") not in ("skipped_existing", None) and 
-                         r.get("method") in selected_names)
-    
-    # Add cached results for methods that weren't executed this run
+    # Add cached results for methods that weren't processed this run
     for cached_row in cached_results:
         method_name = cached_row.get("method")
-        if method_name not in executed_methods:
+        if method_name not in methods_in_rows:
+            cached_row["_loaded_from_cache"] = True
             rows.append(cached_row)
-            cached_count += 1
     
-    # Display merge summary if we loaded cached results
-    if not config.quiet and (cached_count > 0 or skipped_count > 0):
+    # Calculate accurate counts based on what was actually executed
+    executed_count = len(actually_executed)
+    cached_count = len(rows) - executed_count
+    
+    # Display merge summary
+    if not config.quiet and len(rows) > 0:
         print(f"\n📊 Benchmark Result Summary:")
         if executed_count > 0:
             print(f"   ✅ Newly executed: {executed_count} method(s)")
-        if skipped_count > 0:
-            print(f"   ⏭️  Skipped (output exists): {skipped_count} method(s)")
         if cached_count > 0:
             print(f"   💾 Loaded from cache: {cached_count} method(s)")
         print(f"   📋 Total results: {len(rows)} method(s)")
@@ -5197,10 +5830,7 @@ def main() -> None:
         md_path.write_text(_dataframe_to_markdown(df, summary))
         summary_json_path.write_text(json.dumps(summary, indent=2, sort_keys=True))
         
-        # Run evaluation
-        evaluate_benchmarks(config.output_dir)
-        
-        # Evaluate benchmarks (generate comparison tables)
+       # Run evaluation (generate comparison tables and visualizations)
         evaluate_benchmarks(config.output_dir)
 
         if not config.quiet:

@@ -1,11 +1,18 @@
-"""Memory tracking utilities for benchmarking.
+"""Profiling utilities for benchmarking (memory tracking and timing analysis).
 
-This module provides a MemoryTracker class for measuring memory usage during
-benchmark execution. It uses platform-specific APIs to capture both peak and
-average memory consumption.
+This module provides:
+1. MemoryTracker class for measuring memory usage during benchmark execution
+2. Timing profile functions for analyzing NB-GLM bottlenecks
+3. Platform-specific memory measurement APIs
 
-Usage:
-    from benchmarking.tools.memory import MemoryTracker
+.. note::
+    For new code, consider using :class:`crispyx.profiling.Profiler` which
+    provides unified timing and memory profiling with additional features
+    like visualization. ``MemoryTracker`` is retained for backward compatibility
+    with existing benchmarking infrastructure.
+
+Usage (Memory Tracking):
+    from benchmarking.tools.profiling import MemoryTracker
     
     with MemoryTracker() as mt:
         # Run benchmark code
@@ -13,16 +20,47 @@ Usage:
     
     print(f"Peak memory: {mt.get_peak_mb():.2f} MB")
     print(f"Average memory: {mt.get_average_mb():.2f} MB")
+
+Usage (Timing Profile):
+    python -m benchmarking.tools.profiling --mode timing
+    python -m benchmarking.tools.profiling --mode compare
+
+Alternative (unified profiler from crispyx):
+    from crispyx.profiling import Profiler
+    
+    with Profiler(timing=True, memory=True, sampling=True) as p:
+        p.start("computation")
+        result = expensive_computation()
+        p.stop("computation")
+    
+    print(p.get_report())
 """
 from __future__ import annotations
 
+import logging
 import os
 import resource
 import sys
 import threading
 import time
+from pathlib import Path
 from typing import List, Optional
 
+# Re-export unified Profiler for new code
+try:
+    from crispyx.profiling import Profiler, MemoryProfiler as UnifiedMemoryProfiler
+except ImportError:
+    # crispyx not installed in editable mode during development
+    Profiler = None
+    UnifiedMemoryProfiler = None
+
+
+logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# Memory Measurement Functions
+# =============================================================================
 
 # Global flag to track if current RSS warning has been logged (one-time warning)
 _CURRENT_RSS_WARNING_LOGGED = False
@@ -132,6 +170,39 @@ def get_current_rss_bytes() -> Optional[float]:
         _CURRENT_RSS_WARNING_LOGGED = True
     return None
 
+
+def get_peak_memory_mb() -> float:
+    """Return the current process peak RSS in megabytes.
+    
+    Convenience function for quick peak memory checks.
+    
+    Returns
+    -------
+    float
+        Peak RSS in megabytes
+    """
+    return get_peak_memory_bytes() / (1024.0 * 1024.0)
+
+
+def peak_memory_delta_mb(baseline_bytes: float) -> float:
+    """Return peak memory delta from baseline in megabytes.
+    
+    Parameters
+    ----------
+    baseline_bytes : float
+        Baseline memory in bytes (from earlier get_peak_memory_bytes() call)
+    
+    Returns
+    -------
+    float
+        Peak memory delta in MB, or 0.0 if current is less than baseline
+    """
+    return max(0.0, (get_peak_memory_bytes() - baseline_bytes) / (1024.0 * 1024.0))
+
+
+# =============================================================================
+# MemoryTracker Class
+# =============================================================================
 
 class MemoryTracker:
     """Context manager for tracking memory usage during benchmark execution.
@@ -362,34 +433,9 @@ class MemoryTracker:
         self.stop()
 
 
-def get_peak_memory_mb() -> float:
-    """Return the current process peak RSS in megabytes.
-    
-    Convenience function for quick peak memory checks.
-    
-    Returns
-    -------
-    float
-        Peak RSS in megabytes
-    """
-    return get_peak_memory_bytes() / (1024.0 * 1024.0)
-
-
-def peak_memory_delta_mb(baseline_bytes: float) -> float:
-    """Return peak memory delta from baseline in megabytes.
-    
-    Parameters
-    ----------
-    baseline_bytes : float
-        Baseline memory in bytes (from earlier get_peak_memory_bytes() call)
-    
-    Returns
-    -------
-    float
-        Peak memory delta in MB, or 0.0 if current is less than baseline
-    """
-    return max(0.0, (get_peak_memory_bytes() - baseline_bytes) / (1024.0 * 1024.0))
-
+# =============================================================================
+# Subprocess Memory Sampling
+# =============================================================================
 
 def sample_subprocess_memory(
     pid: int,
@@ -414,8 +460,6 @@ def sample_subprocess_memory(
     sample_interval : float
         Time interval between samples in seconds (default: 0.1)
     """
-    import os
-    
     proc = None
     use_proc_fallback = False
     
@@ -464,3 +508,340 @@ def sample_subprocess_memory(
             # Process terminated or access denied
             break
         stop_event.wait(sample_interval)
+
+
+# =============================================================================
+# Timing Profile Functions
+# =============================================================================
+
+def _load_adamson_subset():
+    """Load Adamson_subset data and prepare for profiling.
+    
+    Returns
+    -------
+    tuple
+        (adata, pert_col, labels, control_label, size_factors, backed_path)
+    """
+    import numpy as np
+    import scanpy as sc
+    
+    # Load Adamson_subset
+    data_path = Path(__file__).parents[1] / ".." / "data" / "Adamson_subset.h5ad"
+    data_path = data_path.resolve()
+    if not data_path.exists():
+        logger.error(f"Data file not found: {data_path}")
+        return None
+    
+    logger.info(f"Loading data from {data_path}")
+    adata = sc.read_h5ad(data_path)
+    logger.info(f"Dataset: {adata.n_obs} cells × {adata.n_vars} genes")
+    
+    # Identify perturbation column
+    pert_col = None
+    for col in ["perturbation", "gene", "target", "condition"]:
+        if col in adata.obs.columns:
+            pert_col = col
+            break
+    
+    if pert_col is None:
+        logger.error("Could not find perturbation column")
+        logger.info(f"Available columns: {list(adata.obs.columns)}")
+        return None
+    
+    logger.info(f"Using perturbation column: {pert_col}")
+    
+    # Identify control label
+    labels = adata.obs[pert_col].values.astype(str)
+    unique_labels = np.unique(labels)
+    control_label = None
+    for candidate in ["control", "Control", "NT", "non-targeting", "ctrl", "CTRL"]:
+        if candidate in unique_labels:
+            control_label = candidate
+            break
+    
+    if control_label is None:
+        logger.error("Could not find control label")
+        logger.info(f"Available labels: {unique_labels[:10]}")
+        return None
+    
+    logger.info(f"Control label: {control_label}")
+    
+    # Compute simple size factors (total count normalization)
+    logger.info("Computing size factors...")
+    if hasattr(adata.X, 'toarray'):
+        totals = np.asarray(adata.X.sum(axis=1)).flatten()
+    else:
+        totals = np.sum(adata.X, axis=1)
+    size_factors = totals / np.median(totals)
+    size_factors = np.maximum(size_factors, 1e-10)
+    
+    # Save to backed format for streaming
+    backed_path = Path("/tmp/adamson_subset_backed.h5ad")
+    adata.write(backed_path)
+    
+    return adata, pert_col, labels, control_label, size_factors, backed_path
+
+
+def profile_joint_model():
+    """Profile the joint NB-GLM model on Adamson_subset.
+    
+    Runs the joint NB-GLM with timing profiling enabled and outputs
+    a detailed breakdown of where time is spent.
+    """
+    import numpy as np
+    from crispyx.glm import estimate_joint_model_lbfgsb
+    from crispyx.data import read_backed
+    
+    result = _load_adamson_subset()
+    if result is None:
+        return
+    
+    adata, pert_col, labels, control_label, size_factors, backed_path = result
+    
+    # Run joint model with timing profiling
+    logger.info("=" * 60)
+    logger.info("Running joint NB-GLM with timing profiling...")
+    logger.info("=" * 60)
+    
+    backed = read_backed(backed_path)
+    try:
+        model_result = estimate_joint_model_lbfgsb(
+            backed,
+            obs_df=adata.obs,
+            perturbation_labels=labels,
+            control_label=control_label,
+            covariate_columns=[],
+            size_factors=size_factors,
+            chunk_size="auto",
+            max_iter=25,
+            tol=1e-6,
+            dispersion_method="moments",  # Faster for profiling
+            shrink_dispersion=True,
+            per_comparison_dispersion=True,
+            use_map_dispersion=True,
+            cook_filter=False,
+            lfc_shrinkage_type="none",
+            n_jobs=-1,
+            profile_memory=False,
+            profile_timing=True,  # Enable timing profiling
+            size_factor_scope="global",
+        )
+    finally:
+        backed.file.close()
+    
+    logger.info("=" * 60)
+    logger.info("Profiling complete!")
+    logger.info(f"Fitted {len(model_result.perturbation_labels)} perturbations")
+    logger.info(f"Converged: {model_result.converged.sum()}/{len(model_result.converged)} genes")
+    logger.info("=" * 60)
+    
+    # Show profiling stats if available
+    if model_result.profiling_stats:
+        logger.info("Profiling stats stored in result.profiling_stats")
+    
+    # Clean up
+    backed_path.unlink(missing_ok=True)
+
+
+def profile_shared_vs_per_comparison():
+    """Compare shared vs per-comparison dispersion accuracy.
+    
+    Runs the joint NB-GLM model twice - once with shared dispersion and once
+    with per-comparison dispersion - and compares the results.
+    """
+    import numpy as np
+    from scipy.stats import spearmanr
+    from crispyx.glm import estimate_joint_model_lbfgsb
+    from crispyx.data import read_backed
+    
+    result = _load_adamson_subset()
+    if result is None:
+        return
+    
+    adata, pert_col, labels, control_label, size_factors, backed_path = result
+    
+    # Run with per-comparison dispersion (baseline)
+    logger.info("=" * 60)
+    logger.info("Running with per_comparison_dispersion=True...")
+    logger.info("=" * 60)
+    
+    backed = read_backed(backed_path)
+    t0 = time.perf_counter()
+    try:
+        result_per = estimate_joint_model_lbfgsb(
+            backed,
+            obs_df=adata.obs,
+            perturbation_labels=labels,
+            control_label=control_label,
+            covariate_columns=[],
+            size_factors=size_factors,
+            per_comparison_dispersion=True,
+            use_map_dispersion=True,
+            profile_timing=True,
+        )
+    finally:
+        backed.file.close()
+    t_per = time.perf_counter() - t0
+    
+    # Run with shared dispersion
+    logger.info("=" * 60)
+    logger.info("Running with per_comparison_dispersion=False...")
+    logger.info("=" * 60)
+    
+    backed = read_backed(backed_path)
+    t0 = time.perf_counter()
+    try:
+        result_shared = estimate_joint_model_lbfgsb(
+            backed,
+            obs_df=adata.obs,
+            perturbation_labels=labels,
+            control_label=control_label,
+            covariate_columns=[],
+            size_factors=size_factors,
+            per_comparison_dispersion=False,
+            use_map_dispersion=True,
+            profile_timing=True,
+        )
+    finally:
+        backed.file.close()
+    t_shared = time.perf_counter() - t0
+    
+    # Compare results
+    logger.info("=" * 60)
+    logger.info("COMPARISON RESULTS")
+    logger.info("=" * 60)
+    logger.info(f"Time with per-comparison dispersion: {t_per:.2f}s")
+    logger.info(f"Time with shared dispersion: {t_shared:.2f}s")
+    logger.info(f"Speedup: {t_per/t_shared:.2f}x")
+    
+    # Compute correlation of LFC estimates
+    lfc_per = result_per.beta_perturbation.ravel()
+    lfc_shared = result_shared.beta_perturbation.ravel()
+    
+    # Filter out NaN/Inf values
+    valid = np.isfinite(lfc_per) & np.isfinite(lfc_shared)
+    corr, pval = spearmanr(lfc_per[valid], lfc_shared[valid])
+    logger.info(f"LFC Spearman correlation: {corr:.4f} (p={pval:.2e})")
+    
+    # Compute correlation of dispersions
+    disp_per = result_per.dispersion
+    disp_shared = result_shared.dispersion
+    valid_disp = np.isfinite(disp_per) & np.isfinite(disp_shared)
+    corr_disp, _ = spearmanr(disp_per[valid_disp], disp_shared[valid_disp])
+    logger.info(f"Dispersion Spearman correlation: {corr_disp:.4f}")
+    
+    logger.info("=" * 60)
+    if corr >= 0.90:
+        logger.info(f"✓ Accuracy >= 90% ({corr:.1%}) - shared dispersion can be default")
+    else:
+        logger.info(f"✗ Accuracy < 90% ({corr:.1%}) - keep per-comparison as default")
+    logger.info("=" * 60)
+    
+    # Clean up
+    backed_path.unlink(missing_ok=True)
+
+
+def profile_with_memory_tracking():
+    """Profile the joint NB-GLM model with both timing and memory tracking.
+    
+    Uses the unified Profiler class to collect both timing and memory stats.
+    """
+    import numpy as np
+    from crispyx.glm import estimate_joint_model_lbfgsb
+    from crispyx.data import read_backed
+    
+    result = _load_adamson_subset()
+    if result is None:
+        return
+    
+    adata, pert_col, labels, control_label, size_factors, backed_path = result
+    
+    logger.info("=" * 60)
+    logger.info("Running joint NB-GLM with full profiling (timing + memory)...")
+    logger.info("=" * 60)
+    
+    backed = read_backed(backed_path)
+    try:
+        model_result = estimate_joint_model_lbfgsb(
+            backed,
+            obs_df=adata.obs,
+            perturbation_labels=labels,
+            control_label=control_label,
+            covariate_columns=[],
+            size_factors=size_factors,
+            chunk_size="auto",
+            max_iter=25,
+            tol=1e-6,
+            dispersion_method="moments",
+            shrink_dispersion=True,
+            per_comparison_dispersion=True,
+            use_map_dispersion=True,
+            cook_filter=False,
+            lfc_shrinkage_type="none",
+            n_jobs=-1,
+            profile_memory=True,   # Enable memory profiling
+            profile_timing=True,   # Enable timing profiling
+            size_factor_scope="global",
+        )
+    finally:
+        backed.file.close()
+    
+    logger.info("=" * 60)
+    logger.info("Profiling complete!")
+    logger.info(f"Fitted {len(model_result.perturbation_labels)} perturbations")
+    logger.info(f"Converged: {model_result.converged.sum()}/{len(model_result.converged)} genes")
+    logger.info("=" * 60)
+    
+    # Show profiling stats
+    if model_result.profiling_stats:
+        import json
+        logger.info("Profiling stats:")
+        logger.info(json.dumps(model_result.profiling_stats, indent=2, default=str))
+    
+    # Clean up
+    backed_path.unlink(missing_ok=True)
+
+
+# =============================================================================
+# Main Entry Point
+# =============================================================================
+
+def main():
+    """Main entry point for running profiling from command line."""
+    import argparse
+    
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    )
+    
+    parser = argparse.ArgumentParser(
+        description="Profile NB-GLM timing and memory usage",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+    python -m benchmarking.tools.profiling --mode timing
+    python -m benchmarking.tools.profiling --mode compare
+    python -m benchmarking.tools.profiling --mode full
+        """
+    )
+    parser.add_argument(
+        "--mode",
+        choices=["timing", "compare", "full"],
+        default="timing",
+        help="Mode: 'timing' for detailed timing profile, "
+             "'compare' for shared vs per-comparison dispersion, "
+             "'full' for both timing and memory profiling",
+    )
+    args = parser.parse_args()
+    
+    if args.mode == "timing":
+        profile_joint_model()
+    elif args.mode == "compare":
+        profile_shared_vs_per_comparison()
+    else:  # full
+        profile_with_memory_tracking()
+
+
+if __name__ == "__main__":
+    main()

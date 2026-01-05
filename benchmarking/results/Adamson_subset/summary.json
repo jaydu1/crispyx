@@ -1,14 +1,14 @@
 {
   "adaptive_qc": true,
   "adaptive_qc_mode": "conservative",
-  "average_runtime_seconds": 23.525815804023296,
+  "average_runtime_seconds": 17.545157091280757,
   "categories": [],
   "dependency_errors": [],
   "error_count": 0,
   "error_details": [],
   "memory_limit_count": 0,
   "non_success_count": 0,
-  "original_dataset_path": "data/Adamson_subset.h5ad",
+  "original_dataset_path": "/home/jinhongd/Streamlining-CRISPR-Screen-Analysis/data/Adamson_subset.h5ad",
   "other_errors": [],
   "qc_params_used": {
     "chunk_size": 8192,
@@ -16,12 +16,13 @@
     "min_cells_per_perturbation": 50,
     "min_genes": 50
   },
-  "standardized_dataset_path": "benchmarking/results/Adamson_subset/.cache/standardized_Adamson_subset.h5ad",
+  "recovered_count": 0,
+  "standardized_dataset_path": "/home/jinhongd/Streamlining-CRISPR-Screen-Analysis/benchmarking/results/Adamson_subset/.cache/standardized_Adamson_subset.h5ad",
   "status_counts": {
-    "success": 12
+    "success": 15
   },
-  "success_count": 12,
+  "success_count": 15,
   "success_rate": 1.0,
   "timeout_count": 0,
-  "total_methods": 12
+  "total_methods": 15
 }

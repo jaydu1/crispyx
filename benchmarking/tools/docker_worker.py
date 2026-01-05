@@ -55,12 +55,12 @@ if str(WORKSPACE / "src") not in sys.path:
 # Import MemoryTracker - handle both running from /app and from /workspace
 _script_dir = Path(__file__).parent
 if _script_dir.name == "app":
-    # Running from /app: import memory.py directly (copied alongside docker_worker.py)
+    # Running from /app: import profiling.py directly (copied alongside docker_worker.py)
     sys.path.insert(0, str(_script_dir))
-    from memory import MemoryTracker
+    from profiling import MemoryTracker
 else:
     # Running from /workspace: import from benchmarking package
-    from benchmarking.tools.memory import MemoryTracker
+    from benchmarking.tools.profiling import MemoryTracker
 
 
 def _set_thread_env_vars(n_threads: int) -> None:
