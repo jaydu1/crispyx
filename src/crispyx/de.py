@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gc
 import json
 import logging
 import os
@@ -1441,19 +1442,28 @@ def t_test(
             _adjust_pvalue_matrix(pval_memmap, method="benjamini-hochberg", out=pvalue_adj_memmap)
             ds_pvals_adj[:] = pvalue_adj_memmap
 
-        pts_rest_arr = np.asarray(pts_rest_memmap)
+        # Convert memmap arrays to regular arrays before tempdir cleanup
+        stat_matrix = np.asarray(stat_memmap)
+        pval_matrix = np.asarray(pval_memmap)
+        pval_adj_matrix = np.asarray(pvalue_adj_memmap)
+        lfc_matrix = np.asarray(lfc_memmap)
+        effect_matrix = np.asarray(effect_memmap)
+        pts_matrix = np.asarray(pts_memmap)
+        pts_rest_matrix = np.asarray(pts_rest_memmap)
+        order_matrix = np.asarray(order_memmap)
+        
         result = RankGenesGroupsResult(
             genes=gene_symbols,
             groups=candidates,
-            statistics=np.asarray(stat_memmap),
-            pvalues=np.asarray(pval_memmap),
-            pvalues_adj=np.asarray(pvalue_adj_memmap),
-            logfoldchanges=np.asarray(lfc_memmap),
-            effect_size=np.asarray(effect_memmap),
+            statistics=stat_matrix,
+            pvalues=pval_matrix,
+            pvalues_adj=pval_adj_matrix,
+            logfoldchanges=lfc_matrix,
+            effect_size=effect_matrix,
             u_statistics=np.zeros(shape, dtype=np.float32),
-            pts=np.asarray(pts_memmap),
-            pts_rest=pts_rest_arr,
-            order=np.asarray(order_memmap),
+            pts=pts_matrix,
+            pts_rest=pts_rest_matrix,
+            order=order_matrix,
             groupby=perturbation_column,
             method="t_test",
             control_label=control_label,
@@ -1462,8 +1472,21 @@ def t_test(
             result=None,
         )
 
-        adata.uns["rank_genes_groups"] = result.to_rank_genes_groups_dict()
-        adata.write(output_path)
+    # Create AnnData with layer-based storage (avoid recarray-based rank_genes_groups
+    # which fails with HDF5 header size limits for large group counts)
+    var = pd.DataFrame(index=gene_symbols)
+    adata = ad.AnnData(effect_matrix, obs=obs, var=var)
+    adata.layers["t_score"] = stat_matrix
+    adata.layers["pvalue"] = pval_matrix
+    adata.layers["pvalue_adj"] = pval_adj_matrix
+    adata.layers["logfoldchange"] = lfc_matrix
+    adata.layers["pts"] = pts_matrix
+    adata.layers["pts_rest"] = pts_rest_matrix
+    adata.uns["method"] = "t_test"
+    adata.uns["control_label"] = control_label
+    adata.uns["perturbation_column"] = perturbation_column
+    adata.uns["pvalue_correction"] = "benjamini-hochberg"
+    adata.write(output_path)
     
     # Clean up checkpoint on successful completion
     if checkpoint_path.exists():
@@ -2539,11 +2562,17 @@ def nb_glm_test(
         
         # Memory-aware worker limiting: Each worker processes ~n_genes data
         # Estimate memory per worker based on control + perturbation matrices
-        # Typical per-worker memory: control_matrix + group_matrix + work arrays
+        # Typical per-worker memory: control_matrix (deserialized copy) + group_matrix + work arrays
         # ~= n_control * n_genes * 8 + n_group * n_genes * 8 + overhead
+        # The control_matrix is serialized via pickle and each loky worker deserializes it
         avg_group_size = max(1, (n_cells_total - control_n) // max(1, n_groups))
-        # Estimate ~6 work arrays: Y_ctrl, Y_pert, mu_ctrl, mu_pert, W_ctrl, W_pert (batched)
-        memory_per_worker_mb = (control_n + avg_group_size) * n_genes * 8 * 6 / 1e6
+        # Conservative estimate: control_matrix (copy per worker) + group_matrix + 8 work arrays + overhead
+        # Control cache includes: control_matrix, beta_intercept, control_dispersion, etc
+        n_work_arrays = 8  # Increased from 6 to be more conservative
+        control_cache_mb = control_n * n_genes * 8 / 1e6  # Control matrix copy per worker
+        worker_data_mb = (control_n + avg_group_size) * n_genes * 8 * n_work_arrays / 1e6
+        serialization_overhead = 1.5  # Account for pickle/loky overhead
+        memory_per_worker_mb = (control_cache_mb + worker_data_mb) * serialization_overhead
         memory_limit_mb = memory_limit_gb * 1000 if memory_limit_gb is not None else None
         memory_limited_workers = _estimate_max_workers(
             n_samples=control_n + avg_group_size,
@@ -2554,7 +2583,7 @@ def nb_glm_test(
         )
         if max_workers is None and memory_limited_workers < effective_n_jobs:
             # Only apply memory limiting if max_workers not explicitly set
-            logger.info(f"Memory-aware limiting: {effective_n_jobs} -> {memory_limited_workers} workers")
+            logger.info(f"Memory-aware limiting: {effective_n_jobs} -> {memory_limited_workers} workers (est. {memory_per_worker_mb:.0f} MB/worker)")
             effective_n_jobs = memory_limited_workers
         effective_n_jobs = max(1, effective_n_jobs)
         
@@ -2630,6 +2659,7 @@ def nb_glm_test(
                 )
                 logger.info(f"Global dispersion precomputed: prior_var={control_cache.global_disp_prior_var:.4f}")
                 del all_cell_matrix  # Free memory
+                gc.collect()  # Force garbage collection before spawning workers
         
         # Log progress info
         if resume and completed_labels:
@@ -3329,18 +3359,29 @@ def wilcoxon_test(
         for idx in range(n_groups):
             order_matrix[idx] = np.argsort(-z_matrix[idx], kind="mergesort")
 
+        # Convert memmap arrays to regular arrays before tempdir cleanup
+        z_arr = np.array(z_matrix)
+        pval_arr = np.array(pvalue_matrix)
+        pval_adj_arr = np.array(pvalue_adj_matrix)
+        lfc_arr = np.array(lfc_matrix)
+        effect_arr = np.array(effect_matrix)
+        u_arr = np.array(u_matrix)
+        pts_arr = np.array(pts_matrix, dtype=np.float32)
+        pts_rest_arr = np.array(pts_rest_matrix, dtype=np.float32)
+        order_arr = np.array(order_matrix)
+        
         result = RankGenesGroupsResult(
             genes=gene_symbols,
             groups=candidates,
-            statistics=np.array(z_matrix),
-            pvalues=np.array(pvalue_matrix),
-            pvalues_adj=np.array(pvalue_adj_matrix),
-            logfoldchanges=np.array(lfc_matrix),
-            effect_size=np.array(effect_matrix),
-            u_statistics=np.array(u_matrix),
-            pts=np.array(pts_matrix, dtype=np.float32),
-            pts_rest=np.array(pts_rest_matrix, dtype=np.float32),
-            order=np.array(order_matrix),
+            statistics=z_arr,
+            pvalues=pval_arr,
+            pvalues_adj=pval_adj_arr,
+            logfoldchanges=lfc_arr,
+            effect_size=effect_arr,
+            u_statistics=u_arr,
+            pts=pts_arr,
+            pts_rest=pts_rest_arr,
+            order=order_arr,
             groupby=perturbation_column,
             method="wilcoxon",
             control_label=control_label,
@@ -3348,17 +3389,26 @@ def wilcoxon_test(
             pvalue_correction=corr_method,
         )
 
-        obs_index = pd.Index(candidates, name="perturbation").astype(str)
-        adata = ad.AnnData(np.zeros((len(candidates), 0)), obs=pd.DataFrame(index=obs_index))
-        adata.uns["rank_genes_groups"] = result.to_rank_genes_groups_dict()
-        adata.uns["genes"] = gene_array
-        adata.uns["method"] = "wilcoxon"
-        adata.uns["control_label"] = control_label
-        adata.uns["tie_correct"] = tie_correct
-        adata.uns["pvalue_correction"] = corr_method
-        # output_path already resolved earlier
-        adata.write(output_path)
-        result.result = AnnData(output_path)
+    # Create AnnData with layer-based storage (avoid recarray-based rank_genes_groups
+    # which fails with HDF5 header size limits for large group counts)
+    obs_index = pd.Index(candidates, name="perturbation").astype(str)
+    obs = pd.DataFrame({perturbation_column: obs_index.to_list()}, index=obs_index)
+    var = pd.DataFrame(index=gene_symbols)
+    adata = ad.AnnData(effect_arr, obs=obs, var=var)
+    adata.layers["z_score"] = z_arr
+    adata.layers["pvalue"] = pval_arr
+    adata.layers["pvalue_adj"] = pval_adj_arr
+    adata.layers["logfoldchange"] = lfc_arr
+    adata.layers["u_statistic"] = u_arr
+    adata.layers["pts"] = pts_arr
+    adata.layers["pts_rest"] = pts_rest_arr
+    adata.uns["method"] = "wilcoxon"
+    adata.uns["control_label"] = control_label
+    adata.uns["perturbation_column"] = perturbation_column
+    adata.uns["tie_correct"] = tie_correct
+    adata.uns["pvalue_correction"] = corr_method
+    adata.write(output_path)
+    result.result = AnnData(output_path)
     
     # Clean up checkpoint on successful completion
     if checkpoint_path.exists():

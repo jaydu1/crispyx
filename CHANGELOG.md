@@ -16,6 +16,13 @@ All notable changes to crispyx are documented here.
 - **t-test p-value calculation**: Changed from normal distribution approximation to proper 
   t-distribution with Welch-Satterthwaite degrees of freedom, matching Scanpy's implementation.
   P-value overlap with Scanpy improved from 0.975-0.996 to 1.000 across all top-k thresholds.
+- **t-test/Wilcoxon HDF5 write error for large datasets**: Fixed "object header message is 
+  too large" error when saving results for datasets with many perturbation groups (e.g., 2000+).
+  Changed from recarray-based `rank_genes_groups` storage to layer-based AnnData storage,
+  consistent with `nb_glm_test` output format.
+- **NB-GLM memory management**: Improved memory estimation for parallel workers to account
+  for control cache serialization overhead (1.5× factor). Added `gc.collect()` after freeing
+  global dispersion matrix to ensure memory is released before spawning joblib workers.
 
 ### Added
 - **`tl.shrink_lfc()` namespace method**: Added `cx.tl.shrink_lfc()` for API consistency 
