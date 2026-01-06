@@ -14,7 +14,7 @@ qc_params: null  # Will be calculated adaptively based on data distribution
 
 # Resource limits
 resource_limits:
-  time_limit: 36000  # 10 hours per method
+  time_limit: 10800  # 3 hours per method
   memory_limit: 128.0  # GB per method
 
 # Parallelization configuration

@@ -4430,12 +4430,13 @@ def _run_with_limits(
             }
     
     # Use spawn context for R/rpy2 compatibility, to avoid OpenMP fork issues
-    # triggered by some scanpy workflows, AND for crispyx NB-GLM methods that
-    # use Numba (forking inherits the parent's already-initialized Numba threads).
+    # triggered by some scanpy workflows, AND for crispyx methods that use Numba
+    # (forking inherits the parent's already-initialized Numba threads).
+    # This includes nb_glm, wilcoxon (uses _wilcoxon_sparse_batch_numba), and t_test.
     needs_spawn = (
         'pertpy' in method.name.lower() 
         or 'scanpy' in method.name.lower()
-        or 'nb_glm' in method.name.lower()  # Numba-based methods need spawn
+        or 'crispyx_de' in method.name.lower()  # All crispyx DE methods use Numba kernels
     )
     mp_context = mp.get_context('spawn') if needs_spawn else mp
     

@@ -1,7 +1,7 @@
 # Benchmark Configuration for Adamson_subset
 # Subset of Adamson dataset for testing and development
 
-dataset_path: "/data/Adamson_subset.h5ad"
+dataset_path: "data/Adamson_subset.h5ad"
 output_dir: "benchmarking/results/Adamson_subset"
 
 # Dataset column configuration

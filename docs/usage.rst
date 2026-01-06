@@ -114,6 +114,12 @@ The negative binomial GLM (``method="nb_glm"``) supports several options:
   estimates when sample sizes are small or when you expect homogeneous 
   dispersion across perturbations.
 
+* **Scanpy format** (``scanpy_format=True``): Write Scanpy-compatible 
+  ``uns["rank_genes_groups"]`` structure for interoperability with 
+  ``sc.get.rank_genes_groups_df()`` and similar utilities. This option is 
+  available for ``t_test()``, ``wilcoxon_test()``, and ``nb_glm_test()``.
+  Default is ``False`` for performance.
+
 .. code-block:: python
 
    # Basic NB-GLM (faster, per-perturbation dispersion)

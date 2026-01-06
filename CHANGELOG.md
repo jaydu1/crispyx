@@ -23,14 +23,29 @@ All notable changes to crispyx are documented here.
 - **NB-GLM memory management**: Improved memory estimation for parallel workers to account
   for control cache serialization overhead (1.5× factor). Added `gc.collect()` after freeing
   global dispersion matrix to ensure memory is released before spawning joblib workers.
+- **Benchmark subprocess fork/OpenMP conflict**: Fixed "fork() called from a process already 
+  using GNU OpenMP" error for wilcoxon_test in benchmarks. Changed spawn context to cover 
+  all crispyx DE methods that use Numba kernels.
+- **Numerical warnings suppressed**: Fixed divide-by-zero warning in t-test Welch df 
+  calculation and "Mean of empty slice" warning in shrink_lfc.
 
 ### Added
+- **`scanpy_format` parameter for DE tests**: Added optional `scanpy_format: bool = False` 
+  parameter to `t_test()`, `wilcoxon_test()`, and `nb_glm_test()`. When True, writes 
+  Scanpy-compatible `uns["rank_genes_groups"]` structure for interoperability with 
+  `sc.get.rank_genes_groups_df()` and similar Scanpy utilities.
 - **`tl.shrink_lfc()` namespace method**: Added `cx.tl.shrink_lfc()` for API consistency 
   with other tools. Equivalent to calling `cx.shrink_lfc()` directly.
 - **Resume/checkpoint documentation**: Added comprehensive documentation for `resume` and 
   `checkpoint_interval` parameters in usage guide and README.
 
 ### Improved
+- **QC performance for dense datasets**: Added numba-accelerated dense→CSR conversion 
+  achieving 60× speedup for the write phase. Replogle-E-k562 (310K cells) QC improved 
+  from 122s to 54s (2.3× faster).
+- **Adaptive QC algorithm**: Automatically detects dense vs sparse storage format and 
+  routes to optimized code paths. Sparse datasets use in-memory CSR caching; dense 
+  datasets avoid expensive format conversion.
 - **`wilcoxon_test` docstring**: Complete parameter documentation for all 14 parameters
   including `min_cells_expressed`, `chunk_size`, `tie_correct`, `n_jobs`, `resume`, etc.
 - **Tutorial notebook**: Added NB-GLM and LFC shrinkage sections demonstrating the 
@@ -46,6 +61,11 @@ All notable changes to crispyx are documented here.
   - Updated `comparison.py`, `visualization.py`, `generate_results.py`, `run_benchmarks.py` 
     to import from shared modules
   - Removed ~600 lines of duplicate code across the module
+- **QC module cleanup**: Removed ~159 lines of dead/duplicate code from `qc.py`:
+  - Removed unused `_filter_genes_and_count_nnz` function (superseded by optimized paths)
+  - Consolidated duplicate `_calculate_qc_chunk_size` to use shared `calculate_optimal_chunk_size` from `data.py`
+- **NB-GLM cleanup**: Removed redundant `peak_rss` logging at end of `nb_glm_test()` 
+  (superseded by the `profiling` parameter which provides proper memory tracking).
 
 ## [0.5.0] - 2026-01
 

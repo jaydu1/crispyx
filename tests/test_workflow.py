@@ -379,12 +379,14 @@ def test_scanpy_style_namespaces_match_direct(tmp_path):
         data_name="direct_wilcoxon",
         min_cells_expressed=0,
     )
-    wilcoxon_wrapped_uns = wilcoxon_wrapped.uns["rank_genes_groups"].load()
-    wrapped_groups = list(wilcoxon_wrapped_uns["names"].dtype.names)
+    # Wilcoxon uses layer-based storage for scalability with large group counts
+    # (avoids recarray-based rank_genes_groups which hits HDF5 header limits)
+    wrapped_groups = wilcoxon_wrapped.obs.index.tolist()
     direct_order = wilcoxon_direct.to_full_order_dict()
-    full_wrapped = wilcoxon_wrapped_uns["full"]
-    np.testing.assert_allclose(full_wrapped["scores"], direct_order["scores"])
-    np.testing.assert_allclose(full_wrapped["pvals"], direct_order["pvals"])
+    # Access results from layers instead of uns["rank_genes_groups"]
+    wilcoxon_mem = wilcoxon_wrapped.to_memory()
+    np.testing.assert_allclose(wilcoxon_mem.layers["z_score"], direct_order["scores"])
+    np.testing.assert_allclose(wilcoxon_mem.layers["pvalue"], direct_order["pvals"])
     assert set(wrapped_groups) == set(wilcoxon_direct.groups)
     avg_wrapped.close()
     avg_direct.close()

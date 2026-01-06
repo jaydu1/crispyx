@@ -6,7 +6,6 @@ import gc
 import json
 import logging
 import os
-import resource
 import tempfile
 import threading
 import time
@@ -565,6 +564,59 @@ def _adjust_pvalue_matrix(
     return adjusted
 
 
+def _write_rank_genes_groups_hdf5(
+    output_path: Path,
+    result: "RankGenesGroupsResult",
+) -> None:
+    """Write rank_genes_groups to HDF5 for Scanpy compatibility.
+    
+    Writes arrays in full matrix order (groups × genes) to uns/rank_genes_groups/full.
+    This format is compatible with Scanpy's rank_genes_groups output but avoids
+    the recarray format which causes HDF5 header size limits for large group counts.
+    
+    Parameters
+    ----------
+    output_path
+        Path to the h5ad file to modify.
+    result
+        RankGenesGroupsResult containing the DE statistics.
+        
+    Notes
+    -----
+    For datasets with many groups (>1000), this adds ~2-6 seconds of I/O overhead.
+    The recarray format (with group names as dtype fields) is avoided because it
+    hits HDF5 header size limits at ~2000+ groups.
+    """
+    with h5py.File(output_path, "r+") as handle:
+        uns_group = handle.require_group("uns")
+        if "rank_genes_groups" in uns_group:
+            del uns_group["rank_genes_groups"]
+        rgg = uns_group.create_group("rank_genes_groups")
+        
+        # Store full-order matrices (groups × genes)
+        full = rgg.create_group("full")
+        full.create_dataset("scores", data=result.statistics)
+        full.create_dataset("pvals", data=result.pvalues)
+        full.create_dataset("pvals_adj", data=result.pvalues_adj)
+        full.create_dataset("logfoldchanges", data=result.logfoldchanges)
+        full.create_dataset("auc", data=result.effect_size)
+        full.create_dataset("u_stat", data=result.u_statistics)
+        full.create_dataset("pts", data=result.pts)
+        full.create_dataset("pts_rest", data=result.pts_rest)
+        
+        # Store order and metadata
+        rgg.create_dataset("order", data=result.order)
+        rgg.create_dataset("names", data=np.array(result.groups, dtype="S"))
+        
+        # Store params for compatibility
+        params = rgg.create_group("params")
+        params.attrs["groupby"] = result.groupby
+        params.attrs["method"] = result.method
+        params.attrs["reference"] = result.control_label
+        params.attrs["tie_correct"] = result.tie_correct
+        params.attrs["corr_method"] = result.pvalue_correction
+
+
 def _validate_size_factors(
     size_factors: ArrayLike, n_cells: int, *, scale: bool = True
 ) -> np.ndarray:
@@ -1077,13 +1129,12 @@ def t_test(
     verbose: bool = False,
     resume: bool = False,
     checkpoint_interval: int | None = None,
+    scanpy_format: bool = False,
 ) -> RankGenesGroupsResult:
     """Perform a t-test comparing log-expression means for each perturbation.
     
-    Returns a RankGenesGroupsResult containing differential expression statistics
-    in Scanpy-compatible format. Results are stored in an h5ad file with 
-    `uns['rank_genes_groups']` containing logfoldchanges, scores (z-statistics),
-    p-values, adjusted p-values, and proportion of expressing cells.
+    Returns a RankGenesGroupsResult containing differential expression statistics.
+    Results are stored in an h5ad file with layers containing the statistics.
     
     The RankGenesGroupsResult implements the Mapping interface, so it can be used
     like a dict: `result[perturbation_label]` returns a DifferentialExpressionResult
@@ -1128,13 +1179,17 @@ def t_test(
         If True, attempt to resume from a previous interrupted run using checkpoint.
     checkpoint_interval
         Number of perturbations between checkpoint saves. Auto-determined if None.
+    scanpy_format
+        If True, write Scanpy-compatible ``uns['rank_genes_groups']`` structure
+        in addition to the layer-based storage. Adds ~2-6 seconds of I/O overhead
+        for large datasets. Default False for performance.
     
     Returns
     -------
     RankGenesGroupsResult
-        Differential expression results in Scanpy-compatible format. Access results
-        via dict-like interface: `result[label].effect_size`, `result[label].pvalue`, etc.
-        The h5ad file path is available at `result.result_path`.
+        Differential expression results. Access results via dict-like interface:
+        `result[label].effect_size`, `result[label].pvalue`, etc. The h5ad file
+        path is available at `result.result_path`.
     """
 
 
@@ -1347,7 +1402,12 @@ def t_test(
                 if control_n > 1:
                     denominator += (var_term_ctrl ** 2) / (control_n - 1)
                 # Avoid division by zero; set df to a large value when denominator is 0
-                df_welch = np.where(denominator > 0, numerator / denominator, 1e6)
+                # Use np.divide with where to prevent NaN from 0/0
+                df_welch = np.divide(
+                    numerator, denominator,
+                    out=np.full_like(numerator, 1e6),
+                    where=denominator > 0
+                )
                 # Clip df to reasonable bounds (minimum 1, no upper limit needed)
                 df_welch = np.clip(df_welch, 1.0, None)
                 
@@ -1488,6 +1548,10 @@ def t_test(
     adata.uns["pvalue_correction"] = "benjamini-hochberg"
     adata.write(output_path)
     
+    # Optionally write Scanpy-compatible rank_genes_groups structure
+    if scanpy_format:
+        _write_rank_genes_groups_hdf5(output_path, result)
+    
     # Clean up checkpoint on successful completion
     if checkpoint_path.exists():
         try:
@@ -1542,14 +1606,13 @@ def nb_glm_test(
     profiling: bool = False,
     memory_limit_gb: float | None = None,
     max_dense_fraction: float = 0.3,
+    scanpy_format: bool = False,
 ) -> RankGenesGroupsResult:
     """Perform negative binomial GLM differential expression test.
     
-    Returns a RankGenesGroupsResult containing differential expression statistics
-    in Scanpy-compatible format. Uses a negative binomial GLM framework that can
-    incorporate covariates. Results are stored in an h5ad file with 
-    `uns['rank_genes_groups']` containing logfoldchanges, scores (Wald statistics),
-    p-values, adjusted p-values, and proportion of expressing cells.
+    Returns a RankGenesGroupsResult containing differential expression statistics.
+    Uses a negative binomial GLM framework that can incorporate covariates. 
+    Results are stored in an h5ad file with layers containing the statistics.
     
     The RankGenesGroupsResult implements the Mapping interface, so it can be used 
     like a dict: `result[perturbation_label]` returns a DifferentialExpressionResult
@@ -1715,13 +1778,17 @@ def nb_glm_test(
         If the estimated memory for densifying the full cell×gene matrix exceeds
         max_dense_fraction × min(available_memory, memory_limit_gb), the function
         switches to streaming mode. Default is 0.3 (30% of available memory).
+    scanpy_format
+        If True, write Scanpy-compatible ``uns['rank_genes_groups']`` structure
+        in addition to the layer-based storage. Adds ~2-6 seconds of I/O overhead
+        for large datasets. Default False for performance.
     
     Returns
     -------
     RankGenesGroupsResult
-        Differential expression results in Scanpy-compatible format. Access results
-        via dict-like interface: `result[label].effect_size`, `result[label].pvalue`, etc.
-        The h5ad file path is available at `result.result_path`.
+        Differential expression results. Access results via dict-like interface:
+        `result[label].effect_size`, `result[label].pvalue`, etc. The h5ad file
+        path is available at `result.result_path`.
     """
     # Validate min_mu parameter
     if min_mu < 0:
@@ -2986,14 +3053,13 @@ def nb_glm_test(
         pvalue_correction=corr_method,
         result=AnnData(output_path),
     )
-    peak_rss_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-    peak_rss_mb = peak_rss_kb / 1024.0
-    logger.info(
-        "nb_glm_test peak RSS: %.2f MB (chunk_size=%d, irls_batch_size=%s)",
-        peak_rss_mb,
-        chunk_size,
-        "auto" if irls_batch_size is None else irls_batch_size,
-    )
+    
+    # Optionally write Scanpy-compatible rank_genes_groups structure
+    if scanpy_format:
+        _write_rank_genes_groups_hdf5(output_path, result)
+        # Reload to pick up the new uns structure
+        result.result = AnnData(output_path)
+    
     return result
 
 
@@ -3014,6 +3080,7 @@ def wilcoxon_test(
     verbose: bool = False,
     resume: bool = False,
     checkpoint_interval: int | None = None,
+    scanpy_format: bool = False,
 ) -> RankGenesGroupsResult:
     """Perform a Wilcoxon rank-sum (Mann-Whitney U) test for each gene.
 
@@ -3063,13 +3130,17 @@ def wilcoxon_test(
         Number of gene chunks between checkpoint saves. If None, auto-determined
         based on dataset size. The checkpoint file `<output>.progress.json` is
         written atomically to prevent corruption.
+    scanpy_format
+        If True, write Scanpy-compatible ``uns['rank_genes_groups']`` structure
+        in addition to the layer-based storage. Adds ~2-6 seconds of I/O overhead
+        for large datasets. Default False for performance.
 
     Returns
     -------
     RankGenesGroupsResult
-        Differential expression results in Scanpy-compatible format. Access results
-        via dict-like interface: `result[label].effect_size`, `result[label].pvalue`, etc.
-        The h5ad file path is available at `result.result_path`.
+        Differential expression results. Access results via dict-like interface:
+        `result[label].effect_size`, `result[label].pvalue`, etc. The h5ad file
+        path is available at `result.result_path`.
     """
 
     backed = read_backed(path)
@@ -3408,6 +3479,11 @@ def wilcoxon_test(
     adata.uns["tie_correct"] = tie_correct
     adata.uns["pvalue_correction"] = corr_method
     adata.write(output_path)
+    
+    # Optionally write Scanpy-compatible rank_genes_groups structure
+    if scanpy_format:
+        _write_rank_genes_groups_hdf5(output_path, result)
+    
     result.result = AnnData(output_path)
     
     # Clean up checkpoint on successful completion
@@ -3641,7 +3717,11 @@ def shrink_lfc(
         # This is a proxy for expression level used in gene-specific prior scaling
         if np.any(np.isfinite(fitted_intercept)):
             # Use mean intercept across perturbations for each gene
-            mean_intercept = np.nanmean(fitted_intercept, axis=0)  # Shape: (n_genes,)
+            # Suppress "Mean of empty slice" RuntimeWarning when all values are NaN for a gene
+            import warnings
+            with warnings.catch_warnings():
+                warnings.filterwarnings('ignore', message='Mean of empty slice')
+                mean_intercept = np.nanmean(fitted_intercept, axis=0)  # Shape: (n_genes,)
             base_mean_proxy = np.exp(np.clip(mean_intercept, -20, 20))  # Clamp to avoid overflow
             logger.debug("Using intercept-derived base_mean for gene-specific priors")
         else:
