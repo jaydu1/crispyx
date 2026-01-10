@@ -14,45 +14,39 @@ import scipy.sparse as sp
 
 logger = logging.getLogger(__name__)
 
-# Try to import numba for accelerated CSR conversion
-try:
-    from numba import njit, prange
-    _HAS_NUMBA = True
-except ImportError:
-    _HAS_NUMBA = False
+from numba import njit, prange
 
 # Numba-accelerated helpers for dense→CSR conversion (60x faster than scipy)
-if _HAS_NUMBA:
-    @njit(parallel=True)
-    def _numba_count_row_nnz(dense: np.ndarray) -> np.ndarray:
-        """Count non-zeros per row using parallel numba."""
-        n_rows = dense.shape[0]
-        row_nnz = np.zeros(n_rows, dtype=np.int64)
-        for i in prange(n_rows):
-            count = 0
-            for j in range(dense.shape[1]):
-                if dense[i, j] != 0:
-                    count += 1
-            row_nnz[i] = count
-        return row_nnz
+@njit(parallel=True)
+def _numba_count_row_nnz(dense: np.ndarray) -> np.ndarray:
+    """Count non-zeros per row using parallel numba."""
+    n_rows = dense.shape[0]
+    row_nnz = np.zeros(n_rows, dtype=np.int64)
+    for i in prange(n_rows):
+        count = 0
+        for j in range(dense.shape[1]):
+            if dense[i, j] != 0:
+                count += 1
+        row_nnz[i] = count
+    return row_nnz
 
-    @njit(parallel=True)
-    def _numba_extract_csr_data(
-        dense: np.ndarray,
-        indptr: np.ndarray,
-        data: np.ndarray,
-        indices: np.ndarray,
-    ) -> None:
-        """Extract CSR data/indices in parallel from dense array."""
-        n_rows = dense.shape[0]
-        for i in prange(n_rows):
-            pos = indptr[i]
-            for j in range(dense.shape[1]):
-                val = dense[i, j]
-                if val != 0:
-                    data[pos] = val
-                    indices[pos] = j
-                    pos += 1
+@njit(parallel=True)
+def _numba_extract_csr_data(
+    dense: np.ndarray,
+    indptr: np.ndarray,
+    data: np.ndarray,
+    indices: np.ndarray,
+) -> None:
+    """Extract CSR data/indices in parallel from dense array."""
+    n_rows = dense.shape[0]
+    for i in prange(n_rows):
+        pos = indptr[i]
+        for j in range(dense.shape[1]):
+            val = dense[i, j]
+            if val != 0:
+                data[pos] = val
+                indices[pos] = j
+                pos += 1
 
 ENSEMBL_PREFIXES = ("ENS", "FBgn", "YAL", "YBL", "YCL", "YDL", "YEL", "YFL", "YGL", "YHL", "YIL", "YJL", "YKL", "YLL", "YML", "YNL", "YOL", "YPL", "YQL", "YRL", "YSL", "YTL", "YUL", "YVL", "YWL", "YXL")
 
@@ -576,8 +570,7 @@ def _extract_csr_components_dense(
     if not block.flags['C_CONTIGUOUS']:
         block = np.ascontiguousarray(block)
     
-    if _HAS_NUMBA:
-        # Use numba-accelerated parallel extraction (60x faster than scipy)
+    # Use numba-accelerated parallel extraction (60x faster than scipy)
         row_nnz = _numba_count_row_nnz(block)
         indptr = np.zeros(block.shape[0] + 1, dtype=np.int64)
         indptr[1:] = np.cumsum(row_nnz)
@@ -591,30 +584,6 @@ def _extract_csr_components_dense(
         _numba_extract_csr_data(block.astype(dtype, copy=False), indptr, data, indices)
         
         return data, indices, row_nnz, total_nnz
-    else:
-        # Fallback to numpy-based extraction
-        nonzero_mask = block != 0
-        rows, cols = np.nonzero(nonzero_mask)
-        
-        if len(rows) == 0:
-            return (
-                np.array([], dtype=dtype),
-                np.array([], dtype=np.int32),
-                np.zeros(block.shape[0], dtype=np.int64),
-                0,
-            )
-        
-        # Extract values and sort by row
-        data = block[rows, cols].astype(dtype, copy=False)
-        indices = cols.astype(np.int32, copy=False)
-        sort_idx = np.argsort(rows, kind='stable')
-        data = data[sort_idx]
-        indices = indices[sort_idx]
-        
-        # Compute row_nnz
-        row_nnz = np.bincount(rows, minlength=block.shape[0]).astype(np.int64)
-        
-        return data, indices, row_nnz, len(data)
 
 
 def write_filtered_subset(
