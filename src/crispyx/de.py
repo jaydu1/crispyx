@@ -1536,7 +1536,7 @@ def t_test(
     # which fails with HDF5 header size limits for large group counts)
     var = pd.DataFrame(index=gene_symbols)
     adata = ad.AnnData(effect_matrix, obs=obs, var=var)
-    adata.layers["t_score"] = stat_matrix
+    adata.layers["z_score"] = stat_matrix  # t-statistic (converges to z for large n)
     adata.layers["pvalue"] = pval_matrix
     adata.layers["pvalue_adj"] = pval_adj_matrix
     adata.layers["logfoldchange"] = lfc_matrix
