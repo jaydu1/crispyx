@@ -2,6 +2,19 @@
 
 All notable changes to crispyx are documented here.
 
+## [0.7.0] - 2026-01
+
+### Fixed
+- **Docker container timezone mismatch**: Fixed timestamps in `.progress.json` checkpoint 
+  files showing UTC time instead of local time when running benchmarks in Docker containers.
+  Added `/etc/localtime` mount to `docker-compose.yml` and `DockerRunner` to sync container 
+  timezone with host.
+- **`--force` with `--methods` now preserves cached results**: When using `--force` with 
+  specific `--methods`, only the cache for those methods is cleared. Cached results for 
+  other methods are preserved and included in the final benchmark report. Previously, 
+  `--force` would clear the entire cache, causing reports to only show the re-run methods.
+
+
 ## [0.6.0] - 2026-01
 
 ### Breaking Changes
@@ -20,9 +33,11 @@ All notable changes to crispyx are documented here.
   too large" error when saving results for datasets with many perturbation groups (e.g., 2000+).
   Changed from recarray-based `rank_genes_groups` storage to layer-based AnnData storage,
   consistent with `nb_glm_test` output format.
-- **NB-GLM memory management**: Improved memory estimation for parallel workers to account
-  for control cache serialization overhead (1.5× factor). Added `gc.collect()` after freeing
-  global dispersion matrix to ensure memory is released before spawning joblib workers.
+- **NB-GLM memory estimation causing severe under-parallelization**: Fixed memory estimation
+  that incorrectly calculated 29 GB per worker (vs actual 1.6 GB), limiting Adamson benchmark
+  to 3 workers instead of 32. Root cause: control cache was counted per-worker instead of 
+  as shared (copy-on-write) memory, and `n_work_arrays=8` was used even in global dispersion
+  mode which only needs 2 work arrays. **Result: 4.7× speedup on Adamson (5038s → 1070s)**.
 - **Benchmark subprocess fork/OpenMP conflict**: Fixed "fork() called from a process already 
   using GNU OpenMP" error for wilcoxon_test in benchmarks. Changed spawn context to cover 
   all crispyx DE methods that use Numba kernels.
@@ -40,6 +55,15 @@ All notable changes to crispyx are documented here.
   `checkpoint_interval` parameters in usage guide and README.
 
 ### Improved
+- **NB-GLM adaptive memory estimation**: Complete rewrite of memory-aware worker limiting
+  to use dataset statistics computed from metadata without loading the full matrix:
+  - Control cache counted as shared (copy-on-write) base memory, not per-worker
+  - Context-aware `n_work_arrays`: 2 for global dispersion mode, 6 for per-comparison
+  - P95 group size for realistic memory estimates (avoids over-conservative from outliers)
+  - 200 MB minimum floor per worker for Python/loky process overhead
+  - 20% headroom reserve for system overhead and GC
+  - Dataset-size-aware caps: n_perts/2 for tiny datasets (<1 GB) to reduce parallelization overhead
+  - Works for all dataset sizes from 0.16 GB (Adamson_subset) to 339 GB (Feng-ts)
 - **QC performance for dense datasets**: Added numba-accelerated dense→CSR conversion 
   achieving 60× speedup for the write phase. Replogle-E-k562 (310K cells) QC improved 
   from 122s to 54s (2.3× faster).
