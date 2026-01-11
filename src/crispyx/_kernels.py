@@ -82,10 +82,6 @@ def _nb_loglik_grid_numba(
     return ll_grid
 
 
-# Removed: Joint model streaming kernels (_accumulate_perturbation_blocks_numba, 
-# _batch_schur_solve_numba) - joint NB-GLM mode deprecated in v0.5.0
-
-
 # =============================================================================
 # Dispersion estimation kernels
 # =============================================================================

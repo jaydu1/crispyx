@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import gc
-import json
 import logging
 import os
 import tempfile
@@ -53,7 +52,6 @@ from .glm import (
     shrink_lfc_apeglm,
     shrink_lfc_apeglm_from_stats,
     _estimate_apeglm_prior_scale,
-    _estimate_max_workers,
 )
 from ._kernels import (
     _rankdata_2d_numba,
@@ -63,286 +61,32 @@ from ._kernels import (
     _wilcoxon_all_perts_numba,
     _ZERO_PARTITION_THRESHOLD,
 )
+from ._checkpoint import (
+    _write_checkpoint_atomic,
+    _read_checkpoint,
+    _scan_h5ad_completed,
+    _get_resumable_candidates,
+    _get_checkpoint_interval,
+    _create_progress_context,
+    _DummyProgress,
+)
+from ._size_factors import (
+    _validate_size_factors,
+    _median_of_ratios_size_factors,
+    _deseq2_style_size_factors,
+    _compute_subset_size_factors,
+)
+from ._statistics import (
+    _tie_correction,
+    _adjust_pvalue_matrix,
+    _compute_se_batched,
+    _compute_mom_dispersion_batched,
+)
+from ._memory import (
+    _estimate_max_workers,
+)
 
 logger = logging.getLogger(__name__)
-
-
-# =============================================================================
-# Checkpoint and Progress Utilities for Streaming DE Tests
-# =============================================================================
-
-def _write_checkpoint_atomic(
-    checkpoint_path: Path,
-    data: dict,
-) -> None:
-    """Write checkpoint data atomically using temp file + rename.
-    
-    This ensures checkpoint file is never corrupted on crash.
-    """
-    # Ensure parent directory exists
-    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
-    
-    # Write to a temporary file in the same directory
-    tmp_path = checkpoint_path.with_suffix(".tmp")
-    try:
-        with open(tmp_path, "w") as f:
-            json.dump(data, f, indent=2)
-        # Atomic rename
-        os.rename(tmp_path, checkpoint_path)
-    except Exception:
-        # Clean up temp file on error
-        if tmp_path.exists():
-            try:
-                tmp_path.unlink()
-            except Exception:
-                pass
-        raise
-
-
-def _read_checkpoint(checkpoint_path: Path) -> dict | None:
-    """Read checkpoint file, returning None if missing or corrupted.
-    
-    Returns
-    -------
-    dict or None
-        Checkpoint data if valid, None if file is missing or corrupted.
-    """
-    if not checkpoint_path.exists():
-        return None
-    try:
-        with open(checkpoint_path, "r") as f:
-            data = json.load(f)
-        # Validate required fields
-        if not isinstance(data, dict):
-            return None
-        if "completed" not in data or "total" not in data:
-            return None
-        return data
-    except (json.JSONDecodeError, IOError, OSError):
-        return None
-
-
-def _scan_h5ad_completed(
-    h5ad_path: Path,
-    all_candidates: list[str],
-    result_dataset: str = "uns/rank_genes_groups/full/scores",
-) -> list[str]:
-    """Scan h5ad file to detect completed perturbations by non-zero/non-NaN rows.
-    
-    This is a fallback when checkpoint file is missing or corrupted.
-    
-    Parameters
-    ----------
-    h5ad_path
-        Path to the output h5ad file.
-    all_candidates
-        List of all perturbation labels (in order).
-    result_dataset
-        HDF5 dataset path to check for results. Should have shape (n_groups, n_genes).
-        
-    Returns
-    -------
-    list[str]
-        List of perturbation labels that have been completed.
-    """
-    completed = []
-    if not h5ad_path.exists():
-        return completed
-    
-    try:
-        with h5py.File(h5ad_path, "r") as f:
-            # Try to access the result dataset
-            if result_dataset in f:
-                ds = f[result_dataset]
-                n_groups = ds.shape[0]
-                for idx in range(min(n_groups, len(all_candidates))):
-                    row = ds[idx, :]
-                    # Check if row has any non-NaN, non-zero values
-                    if np.any(np.isfinite(row) & (row != 0)):
-                        completed.append(all_candidates[idx])
-            else:
-                # Try alternative: check layers in X matrix
-                if "X" in f:
-                    X = f["X"]
-                    if hasattr(X, "shape") and len(X.shape) == 2:
-                        n_groups = X.shape[0]
-                        for idx in range(min(n_groups, len(all_candidates))):
-                            row = X[idx, :]
-                            if np.any(np.isfinite(row) & (row != 0)):
-                                completed.append(all_candidates[idx])
-    except Exception as e:
-        logger.warning(f"Failed to scan h5ad for completed perturbations: {e}")
-    
-    return completed
-
-
-def _get_resumable_candidates(
-    checkpoint_path: Path,
-    h5ad_path: Path,
-    all_candidates: list[str],
-    retry_failed: bool = True,
-) -> tuple[list[str], list[str], list[str]]:
-    """Get candidates to process, accounting for previous progress.
-    
-    Parameters
-    ----------
-    checkpoint_path
-        Path to the progress JSON file.
-    h5ad_path
-        Path to the output h5ad file.
-    all_candidates
-        List of all perturbation labels to process.
-    retry_failed
-        If True, previously failed perturbations will be retried.
-        
-    Returns
-    -------
-    tuple[list[str], list[str], list[str]]
-        (candidates_to_run, completed, failed)
-        - candidates_to_run: perturbations that need to be processed
-        - completed: perturbations already completed
-        - failed: perturbations that failed (for logging)
-    """
-    checkpoint = _read_checkpoint(checkpoint_path)
-    
-    if checkpoint is not None:
-        completed = checkpoint.get("completed", [])
-        failed = checkpoint.get("failed", [])
-        logger.info(f"Resuming: {len(completed)}/{len(all_candidates)} already completed")
-        if failed:
-            logger.info(f"  {len(failed)} previously failed perturbations")
-    else:
-        # Checkpoint missing or corrupted - try scanning h5ad
-        if h5ad_path.exists():
-            logger.warning(
-                f"Checkpoint file missing or corrupted at {checkpoint_path}. "
-                f"Scanning h5ad file to detect completed perturbations..."
-            )
-            completed = _scan_h5ad_completed(h5ad_path, all_candidates)
-            failed = []
-            if completed:
-                logger.info(f"Detected {len(completed)} completed perturbations from h5ad scan")
-        else:
-            completed = []
-            failed = []
-    
-    # Determine which candidates to run
-    completed_set = set(completed)
-    failed_set = set(failed) if not retry_failed else set()
-    
-    candidates_to_run = [
-        c for c in all_candidates 
-        if c not in completed_set and c not in failed_set
-    ]
-    
-    return candidates_to_run, completed, failed
-
-
-def _load_existing_nb_glm_result(
-    output_path: Path,
-    candidates: list[str],
-    gene_symbols: list[str],
-    perturbation_column: str,
-    control_label: str,
-    corr_method: str,
-) -> "RankGenesGroupsResult":
-    """Load an existing NB-GLM result from an h5ad file.
-    
-    Used when resume=True and all perturbations are already completed.
-    """
-    adata = ad.read_h5ad(output_path)
-    
-    # NB-GLM stores results in layers, not uns["rank_genes_groups"]
-    statistic_matrix = np.array(adata.layers["z_score"])
-    pvalue_matrix = np.array(adata.layers["pvalue"])
-    pvalue_adj_matrix = np.array(adata.layers["pvalue_adj"])
-    logfc_matrix = np.array(adata.layers["logfoldchange"])
-    effect_matrix = logfc_matrix.copy()  # effect_size equals logfc for NB-GLM
-    pts_matrix = np.array(adata.layers.get("pts", np.zeros_like(effect_matrix, dtype=np.float32)))
-    pts_rest_matrix = np.array(adata.layers.get("pts_rest", np.zeros_like(effect_matrix, dtype=np.float32)))
-    
-    # Reconstruct order from statistics
-    statistic_for_order = np.where(
-        np.isfinite(statistic_matrix), np.abs(statistic_matrix), -np.inf
-    )
-    order_matrix = np.argsort(-statistic_for_order, axis=1, kind="mergesort")
-    
-    return RankGenesGroupsResult(
-        genes=pd.Index(gene_symbols),
-        groups=candidates,
-        statistics=statistic_matrix,
-        pvalues=pvalue_matrix,
-        pvalues_adj=pvalue_adj_matrix,
-        logfoldchanges=logfc_matrix,
-        effect_size=effect_matrix,
-        u_statistics=np.zeros_like(effect_matrix),
-        pts=pts_matrix,
-        pts_rest=pts_rest_matrix,
-        order=order_matrix,
-        groupby=perturbation_column,
-        method="nb_glm",
-        control_label=control_label,
-        tie_correct=False,
-        pvalue_correction=corr_method,
-        result=adata,
-    )
-
-
-def _create_progress_context(
-    total: int,
-    desc: str,
-    verbose: bool,
-) -> "tqdm | _DummyProgress":
-    """Create a progress bar context manager.
-    
-    Returns tqdm progress bar if verbose=True and tqdm is available,
-    otherwise returns a dummy context manager.
-    """
-    if verbose and HAS_TQDM and total > 0:
-        return tqdm(total=total, desc=desc, unit="perturbation")
-    return _DummyProgress()
-
-
-class _DummyProgress:
-    """Dummy progress bar that does nothing (for when verbose=False)."""
-    
-    def __enter__(self):
-        return self
-    
-    def __exit__(self, *args):
-        pass
-    
-    def update(self, n: int = 1):
-        pass
-    
-    def set_postfix(self, **kwargs):
-        pass
-
-
-def _get_checkpoint_interval(n_perturbations: int, checkpoint_interval: int | None) -> int:
-    """Determine checkpoint interval based on dataset size.
-    
-    Parameters
-    ----------
-    n_perturbations
-        Total number of perturbations.
-    checkpoint_interval
-        User-specified interval, or None for auto.
-        
-    Returns
-    -------
-    int
-        Number of perturbations to process between checkpoints.
-    """
-    if checkpoint_interval is not None:
-        return max(1, checkpoint_interval)
-    # Auto: every 1 for small datasets, every 10 for larger ones
-    if n_perturbations < 100:
-        return 1
-    elif n_perturbations < 1000:
-        return 10
-    else:
-        return 50
 
 
 @dataclass
@@ -474,6 +218,57 @@ class RankGenesGroupsResult(Mapping[str, DifferentialExpressionResult]):
             "pts_rest": self.pts_rest.copy(),
         }
 
+
+def _load_existing_nb_glm_result(
+    output_path: Path,
+    candidates: list[str],
+    gene_symbols: list[str],
+    perturbation_column: str,
+    control_label: str,
+    corr_method: str,
+) -> "RankGenesGroupsResult":
+    """Load an existing NB-GLM result from an h5ad file.
+    
+    Used when resume=True and all perturbations are already completed.
+    """
+    adata = ad.read_h5ad(output_path)
+    
+    # NB-GLM stores results in layers, not uns["rank_genes_groups"]
+    statistic_matrix = np.array(adata.layers["z_score"])
+    pvalue_matrix = np.array(adata.layers["pvalue"])
+    pvalue_adj_matrix = np.array(adata.layers["pvalue_adj"])
+    logfc_matrix = np.array(adata.layers["logfoldchange"])
+    effect_matrix = logfc_matrix.copy()  # effect_size equals logfc for NB-GLM
+    pts_matrix = np.array(adata.layers.get("pts", np.zeros_like(effect_matrix, dtype=np.float32)))
+    pts_rest_matrix = np.array(adata.layers.get("pts_rest", np.zeros_like(effect_matrix, dtype=np.float32)))
+    
+    # Reconstruct order from statistics
+    statistic_for_order = np.where(
+        np.isfinite(statistic_matrix), np.abs(statistic_matrix), -np.inf
+    )
+    order_matrix = np.argsort(-statistic_for_order, axis=1, kind="mergesort")
+    
+    return RankGenesGroupsResult(
+        genes=pd.Index(gene_symbols),
+        groups=candidates,
+        statistics=statistic_matrix,
+        pvalues=pvalue_matrix,
+        pvalues_adj=pvalue_adj_matrix,
+        logfoldchanges=logfc_matrix,
+        effect_size=effect_matrix,
+        u_statistics=np.zeros_like(effect_matrix),
+        pts=pts_matrix,
+        pts_rest=pts_rest_matrix,
+        order=order_matrix,
+        groupby=perturbation_column,
+        method="nb_glm",
+        control_label=control_label,
+        tie_correct=False,
+        pvalue_correction=corr_method,
+        result=adata,
+    )
+
+
 def _resolve_candidates(
     labels: np.ndarray,
     control_label: str,
@@ -487,81 +282,6 @@ def _resolve_candidates(
     if not candidates:
         raise ValueError("No perturbation groups available for differential expression testing")
     return candidates
-
-
-def _tie_correction(ranks: np.ndarray) -> np.ndarray:
-    """Compute tie correction factors for each column of ``ranks``."""
-
-    n_genes = ranks.shape[1]
-    correction = np.ones(n_genes, dtype=np.float64)
-    for idx in range(n_genes):
-        column = np.sort(np.ravel(ranks[:, idx]))
-        size = float(column.size)
-        if size < 2:
-            continue
-        boundaries = np.concatenate(
-            (
-                np.array([True]),
-                column[1:] != column[:-1],
-                np.array([True]),
-            )
-        )
-        indices = np.flatnonzero(boundaries)
-        counts = np.diff(indices).astype(np.float64)
-        denom = size**3 - size
-        if denom <= 0:
-            continue
-        correction[idx] = 1.0 - float(np.sum(counts**3 - counts)) / denom
-    return correction
-
-
-def _adjust_pvalue_matrix(
-    matrix: np.ndarray,
-    method: Literal["benjamini-hochberg", "bonferroni"],
-    out: np.ndarray | None = None,
-) -> np.ndarray:
-    """Return a p-value matrix adjusted per row using the requested method.
-
-    Parameters
-    ----------
-    matrix
-        P-value matrix to correct.
-    method
-        Correction method to apply.
-    out
-        Optional array to write results into. If provided, must be the same shape
-        as ``matrix``.
-    """
-
-    adjusted = out if out is not None else np.ones_like(matrix)
-    for row_idx in range(matrix.shape[0]):
-        row = matrix[row_idx]
-        valid = np.isfinite(row)
-        if not np.any(valid):
-            adjusted[row_idx] = row
-            continue
-        values = row[valid]
-        if method == "bonferroni":
-            n_tests = values.size
-            scaled = np.minimum(values * n_tests, 1.0)
-            result = np.empty_like(values)
-            result[:] = scaled
-        elif method == "benjamini-hochberg":
-            order = np.argsort(values)
-            ordered = values[order]
-            n_tests = ordered.size
-            ranks = np.arange(1, n_tests + 1, dtype=np.float64)
-            adj = ordered * n_tests / ranks
-            adj = np.minimum.accumulate(adj[::-1])[::-1]
-            adj = np.clip(adj, 0.0, 1.0)
-            result = np.empty_like(ordered)
-            result[order] = adj
-        else:  # pragma: no cover - defensive programming
-            raise ValueError(f"Unsupported correction method: {method}")
-        new_row = np.array(row, copy=True)
-        new_row[valid] = result
-        adjusted[row_idx] = new_row
-    return adjusted
 
 
 def _write_rank_genes_groups_hdf5(
@@ -615,503 +335,6 @@ def _write_rank_genes_groups_hdf5(
         params.attrs["reference"] = result.control_label
         params.attrs["tie_correct"] = result.tie_correct
         params.attrs["corr_method"] = result.pvalue_correction
-
-
-def _validate_size_factors(
-    size_factors: ArrayLike, n_cells: int, *, scale: bool = True
-) -> np.ndarray:
-    size_factors_arr = np.asarray(size_factors, dtype=np.float64).reshape(-1)
-    if size_factors_arr.shape[0] != n_cells:
-        raise ValueError(
-            f"Provided size_factors have length {size_factors_arr.shape[0]} but expected {n_cells}"
-        )
-    mask = np.isfinite(size_factors_arr) & (size_factors_arr > 0)
-    if not np.any(mask):
-        raise ValueError("Provided size_factors contain no positive finite values")
-    size_factors_arr[~mask] = np.nanmedian(size_factors_arr[mask])
-    if scale:
-        scale_factor = np.exp(np.mean(np.log(np.clip(size_factors_arr, 1e-12, None))))
-        return size_factors_arr / scale_factor
-    return size_factors_arr
-
-
-def _compute_se_batched(
-    Y_control: np.ndarray,
-    Y_pert: np.ndarray,
-    control_offset: np.ndarray,
-    pert_offset: np.ndarray,
-    beta0: np.ndarray,
-    beta1: np.ndarray,
-    dispersion: np.ndarray,
-    *,
-    gene_batch_size: int = 5000,
-    ridge: float = 1e-6,
-    se_method: Literal["sandwich", "fisher"] = "sandwich",
-) -> np.ndarray:
-    """Compute SE using batched processing to reduce peak memory.
-    
-    Instead of building a full (n_cells, n_genes) matrix for mu and W,
-    this function processes genes in batches and accumulates the XᵀWX sums.
-    
-    Parameters
-    ----------
-    Y_control
-        Control expression matrix, shape (n_control, n_genes).
-    Y_pert
-        Perturbation expression matrix, shape (n_pert, n_genes).
-    control_offset
-        Log size factors for control cells, shape (n_control,).
-    pert_offset
-        Log size factors for perturbation cells, shape (n_pert,).
-    beta0
-        Intercept coefficients, shape (n_genes,).
-    beta1
-        Perturbation effect coefficients, shape (n_genes,).
-    dispersion
-        Dispersion values, shape (n_genes,).
-    gene_batch_size
-        Number of genes to process per batch.
-    ridge
-        Ridge penalty for regularization.
-    se_method
-        Method for computing standard errors:
-        - "sandwich": Sandwich estimator SE = sqrt(c' @ H @ M @ H @ c). More
-          robust to model misspecification. This is the default.
-        - "fisher": Standard Fisher information SE = sqrt(diag(inv(X'WX + ridge*I))).
-          Matches PyDESeq2's approach for better parity.
-        
-    Returns
-    -------
-    np.ndarray
-        Standard errors for perturbation effect, shape (n_genes,).
-    """
-    n_control = Y_control.shape[0]
-    n_pert = Y_pert.shape[0]
-    n_genes = Y_control.shape[1]
-    
-    # Output SE array
-    se = np.full(n_genes, np.nan, dtype=np.float64)
-    
-    # Process genes in batches
-    for g_start in range(0, n_genes, gene_batch_size):
-        g_end = min(g_start + gene_batch_size, n_genes)
-        batch_genes = g_end - g_start
-        
-        # Extract batch data
-        beta0_batch = beta0[g_start:g_end]
-        beta1_batch = beta1[g_start:g_end]
-        disp_batch = dispersion[g_start:g_end]
-        
-        # Compute mu for control cells: mu = exp(beta0 + offset)
-        # Shape: (n_control, batch_genes)
-        eta_ctrl = beta0_batch[None, :] + control_offset[:, None]
-        np.clip(eta_ctrl, -30, 30, out=eta_ctrl)
-        mu_ctrl = np.exp(eta_ctrl)
-        np.maximum(mu_ctrl, 1e-10, out=mu_ctrl)
-        
-        # Compute mu for perturbation cells: mu = exp(beta0 + beta1 + offset)
-        # Shape: (n_pert, batch_genes)
-        eta_pert = beta0_batch[None, :] + beta1_batch[None, :] + pert_offset[:, None]
-        np.clip(eta_pert, -30, 30, out=eta_pert)
-        mu_pert = np.exp(eta_pert)
-        np.maximum(mu_pert, 1e-10, out=mu_pert)
-        
-        # Compute weights: W = mu / (1 + mu * disp)
-        # Control weights
-        W_ctrl = mu_ctrl / (1 + mu_ctrl * disp_batch[None, :])
-        # Perturbation weights
-        W_pert = mu_pert / (1 + mu_pert * disp_batch[None, :])
-        
-        # Fisher information (XᵀWX) - unregularized
-        # For design [1, p] where p is perturbation indicator (0 for ctrl, 1 for pert):
-        # M00 = sum_all(W), M01 = M10 = sum_pert(W), M11 = sum_pert(W)
-        M00 = W_ctrl.sum(axis=0) + W_pert.sum(axis=0)  # (batch_genes,)
-        M01 = W_pert.sum(axis=0)  # (batch_genes,) - only pert contributes
-        M11 = W_pert.sum(axis=0)  # same as M01 since indicator is 1
-        
-        # Free work arrays
-        del eta_ctrl, eta_pert, mu_ctrl, mu_pert, W_ctrl, W_pert
-        
-        # Regularized: Mr = M + ridge*I
-        Mr00 = M00 + ridge
-        Mr01 = M01
-        Mr11 = M11 + ridge
-        
-        # Inverse: H = inv(Mr) for 2x2 matrix
-        det_r = Mr00 * Mr11 - Mr01 ** 2
-        np.maximum(det_r, 1e-12, out=det_r)
-        
-        H00 = Mr11 / det_r
-        H01 = -Mr01 / det_r
-        H11 = Mr00 / det_r
-        
-        # Compute SE based on method
-        if se_method == "fisher":
-            # Fisher information SE: SE = sqrt(diag(inv(X'WX + ridge*I)))
-            # For perturbation effect, this is just H11
-            var_pert = H11
-        else:
-            # Sandwich SE for perturbation effect (contrast [0, 1])
-            # SE = sqrt(c' @ H @ M @ H @ c) where c = [0, 1]
-            var_pert = H01**2 * M00 + 2 * H01 * H11 * M01 + H11**2 * M11
-        
-        se[g_start:g_end] = np.sqrt(np.maximum(var_pert, 1e-12))
-    
-    return se
-
-
-def _compute_mom_dispersion_batched(
-    Y_control: np.ndarray,
-    Y_pert: np.ndarray,
-    control_offset: np.ndarray,
-    pert_offset: np.ndarray,
-    beta0: np.ndarray,
-    beta1: np.ndarray,
-    converged: np.ndarray,
-    *,
-    gene_batch_size: int = 5000,
-) -> np.ndarray:
-    """Compute MoM dispersion using batched processing to reduce peak memory.
-    
-    Instead of building full (n_cells, n_genes) matrices for mu and residuals,
-    this function processes genes in batches.
-    
-    Parameters
-    ----------
-    Y_control
-        Control expression matrix, shape (n_control, n_genes).
-    Y_pert
-        Perturbation expression matrix, shape (n_pert, n_genes).
-    control_offset
-        Log size factors for control cells, shape (n_control,).
-    pert_offset
-        Log size factors for perturbation cells, shape (n_pert,).
-    beta0
-        Intercept coefficients, shape (n_genes,).
-    beta1
-        Perturbation effect coefficients, shape (n_genes,).
-    converged
-        Convergence mask, shape (n_genes,).
-    gene_batch_size
-        Number of genes to process per batch.
-        
-    Returns
-    -------
-    np.ndarray
-        MoM dispersion estimates, shape (n_genes,).
-    """
-    n_control = Y_control.shape[0]
-    n_pert = Y_pert.shape[0]
-    n_genes = Y_control.shape[1]
-    n_total = n_control + n_pert
-    dof = max(n_total - 2, 1)
-    
-    # Output dispersion array
-    disp = np.full(n_genes, np.nan, dtype=np.float64)
-    
-    # Process genes in batches
-    for g_start in range(0, n_genes, gene_batch_size):
-        g_end = min(g_start + gene_batch_size, n_genes)
-        
-        # Extract batch data
-        beta0_batch = beta0[g_start:g_end]
-        beta1_batch = beta1[g_start:g_end]
-        conv_batch = converged[g_start:g_end]
-        Y_ctrl_batch = Y_control[:, g_start:g_end]
-        Y_pert_batch = Y_pert[:, g_start:g_end]
-        
-        # Compute mu for control cells: mu = exp(beta0 + offset)
-        eta_ctrl = beta0_batch[None, :] + control_offset[:, None]
-        np.clip(eta_ctrl, -30, 30, out=eta_ctrl)
-        mu_ctrl = np.exp(eta_ctrl)
-        np.maximum(mu_ctrl, 1e-10, out=mu_ctrl)
-        # Zero out non-converged genes
-        mu_ctrl[:, ~conv_batch] = 1e-10
-        
-        # Compute mu for perturbation cells: mu = exp(beta0 + beta1 + offset)
-        eta_pert = beta0_batch[None, :] + beta1_batch[None, :] + pert_offset[:, None]
-        np.clip(eta_pert, -30, 30, out=eta_pert)
-        mu_pert = np.exp(eta_pert)
-        np.maximum(mu_pert, 1e-10, out=mu_pert)
-        mu_pert[:, ~conv_batch] = 1e-10
-        
-        # Compute MoM dispersion
-        # Formula: alpha = sum((Y - mu)^2 - Y) / mu^2) / dof
-        resid_ctrl = Y_ctrl_batch - mu_ctrl
-        resid_pert = Y_pert_batch - mu_pert
-        
-        numerator = (
-            np.sum((resid_ctrl * resid_ctrl - Y_ctrl_batch) / np.maximum(mu_ctrl * mu_ctrl, 1e-10), axis=0)
-            + np.sum((resid_pert * resid_pert - Y_pert_batch) / np.maximum(mu_pert * mu_pert, 1e-10), axis=0)
-        )
-        
-        disp[g_start:g_end] = np.clip(numerator / dof, 1e-8, 1e6)
-    
-    return disp
-
-
-def _median_of_ratios_size_factors(
-    path: str | Path, *, chunk_size: int = 2048, scale: bool = True
-) -> np.ndarray:
-    """Compute median-of-ratios size factors with vectorized row-median computation.
-    
-    Optimized implementation using Numba-accelerated parallel row-median kernel
-    for significant speedup on large datasets (5× faster than per-row Python loop
-    with the default chunk_size=2048).
-    
-    Parameters
-    ----------
-    path
-        Path to h5ad file with count data.
-    chunk_size
-        Number of cells to process per chunk. Larger values reduce I/O overhead
-        but use more memory. Default 2048 balances speed and memory usage.
-    scale
-        If True, rescale size factors so their geometric mean equals 1.
-        
-    Returns
-    -------
-    np.ndarray
-        Size factors for each cell.
-    """
-    from ._kernels import _compute_row_medians_csr
-    
-    backed = read_backed(path)
-    n_cells = backed.n_obs
-    n_genes = backed.n_vars
-    log_sum = np.zeros(n_genes, dtype=np.float64)
-    log_count = np.zeros(n_genes, dtype=np.int64)
-    try:
-        for _, block in iter_matrix_chunks(
-            backed, axis=0, chunk_size=chunk_size, convert_to_dense=False
-        ):
-            csr = sp.csr_matrix(block)
-            csc = csr.tocsc()
-            counts_per_gene = np.diff(csc.indptr)
-            if not counts_per_gene.any():
-                continue
-            gene_indices = np.repeat(np.arange(n_genes, dtype=np.int64), counts_per_gene)
-            data = np.log(np.clip(csc.data, 1e-12, None))
-            np.add.at(log_sum, gene_indices, data)
-            np.add.at(log_count, gene_indices, 1)
-    finally:
-        backed.file.close()
-    geo_means = np.zeros(n_genes, dtype=np.float64)
-    valid_geo = log_count > 0
-    geo_means[valid_geo] = np.exp(log_sum[valid_geo] / log_count[valid_geo])
-
-    size_factors = np.full(n_cells, np.nan, dtype=np.float64)
-    backed = read_backed(path)
-    try:
-        for slc, block in iter_matrix_chunks(
-            backed, axis=0, chunk_size=chunk_size, convert_to_dense=False
-        ):
-            csr = sp.csr_matrix(block, dtype=np.float64)
-            # Vectorized row-median computation using Numba kernel
-            chunk_medians = _compute_row_medians_csr(
-                csr.data.astype(np.float64),
-                csr.indices.astype(np.int64),
-                csr.indptr.astype(np.int64),
-                geo_means,
-                csr.shape[0],
-            )
-            size_factors[slc] = chunk_medians
-    finally:
-        backed.file.close()
-
-    valid_sf = np.isfinite(size_factors) & (size_factors > 0)
-    if not np.any(valid_sf):
-        return np.ones(n_cells, dtype=np.float64)
-    fallback = np.nanmedian(size_factors[valid_sf])
-    size_factors[~valid_sf] = fallback
-    if scale:
-        scale_factor = np.exp(np.mean(np.log(np.clip(size_factors, 1e-12, None))))
-        return size_factors / scale_factor
-    return size_factors
-
-
-def _deseq2_style_size_factors(
-    path: str | Path, *, chunk_size: int = 256, scale: bool = True
-) -> np.ndarray:
-    """Compute DESeq2-style size factors using only genes expressed in all cells.
-    
-    This method computes size factors in the same way as DESeq2/PyDESeq2:
-    1. Find genes expressed (count > 0) in ALL cells
-    2. Compute geometric mean of counts per gene across all cells
-    3. For each cell, compute ratios of counts to geometric means
-    4. Take median of ratios as the size factor
-    
-    This approach works well for bulk RNA-seq where most genes are expressed in all
-    samples, but may have issues with very sparse single-cell data where few genes
-    are expressed in all cells.
-    
-    Parameters
-    ----------
-    path
-        Path to h5ad file with count data.
-    chunk_size
-        Number of cells to process per chunk.
-    scale
-        If True, rescale size factors so their geometric mean equals 1.
-        
-    Returns
-    -------
-    np.ndarray
-        Size factors for each cell.
-    """
-    from scipy.stats import gmean
-    
-    backed = read_backed(path)
-    n_cells = backed.n_obs
-    n_genes = backed.n_vars
-    
-    # First pass: find genes expressed in all cells
-    all_expressed = np.ones(n_genes, dtype=bool)
-    try:
-        for _, block in iter_matrix_chunks(
-            backed, axis=0, chunk_size=chunk_size, convert_to_dense=False
-        ):
-            csr = sp.csr_matrix(block)
-            # Check which genes have zero counts in this chunk
-            gene_has_nonzero = np.zeros(n_genes, dtype=bool)
-            if csr.nnz > 0:
-                gene_indices = csr.indices
-                gene_has_nonzero[gene_indices] = True
-            # Genes that have zeros in any chunk are not "all expressed"
-            genes_with_zeros = ~gene_has_nonzero
-            # For each row in chunk, check if gene has zero
-            for row_idx in range(csr.shape[0]):
-                start = csr.indptr[row_idx]
-                end = csr.indptr[row_idx + 1]
-                row_gene_indices = set(csr.indices[start:end])
-                for gene_idx in range(n_genes):
-                    if gene_idx not in row_gene_indices:
-                        all_expressed[gene_idx] = False
-    finally:
-        backed.file.close()
-    
-    n_all_expressed = np.sum(all_expressed)
-    if n_all_expressed < 10:
-        logger.warning(
-            f"Only {n_all_expressed} genes expressed in all cells. "
-            "Consider using size_factor_method='sparse' for sparse data."
-        )
-    if n_all_expressed == 0:
-        logger.warning(
-            "No genes expressed in all cells. Falling back to sparse method."
-        )
-        return _median_of_ratios_size_factors(path, chunk_size=chunk_size, scale=scale)
-    
-    # Collect counts for all-expressed genes
-    all_expressed_idx = np.where(all_expressed)[0]
-    counts_filtered = np.zeros((n_cells, n_all_expressed), dtype=np.float64)
-    
-    backed = read_backed(path)
-    try:
-        cell_offset = 0
-        for slc, block in iter_matrix_chunks(
-            backed, axis=0, chunk_size=chunk_size, convert_to_dense=True
-        ):
-            block_arr = np.asarray(block)
-            counts_filtered[slc.start:slc.stop, :] = block_arr[:, all_expressed_idx]
-            cell_offset = slc.stop
-    finally:
-        backed.file.close()
-    
-    # Compute geometric means per gene
-    geo_means = gmean(counts_filtered, axis=0)
-    
-    # Compute ratios and take median
-    ratios = counts_filtered / geo_means
-    size_factors = np.median(ratios, axis=1)
-    
-    # Handle any invalid values
-    valid_sf = np.isfinite(size_factors) & (size_factors > 0)
-    if not np.all(valid_sf):
-        fallback = np.nanmedian(size_factors[valid_sf])
-        size_factors[~valid_sf] = fallback
-    
-    if scale:
-        scale_factor = np.exp(np.mean(np.log(np.clip(size_factors, 1e-12, None))))
-        return size_factors / scale_factor
-    return size_factors
-
-
-def _compute_subset_size_factors(
-    X: np.ndarray | sp.spmatrix,
-    cell_mask: np.ndarray,
-    *,
-    scale: bool = True,
-) -> np.ndarray:
-    """Compute DESeq2-style size factors for a subset of cells.
-    
-    Uses only genes expressed in ALL cells of the subset (like DESeq2/PyDESeq2).
-    
-    Parameters
-    ----------
-    X
-        Full count matrix (n_cells, n_genes).
-    cell_mask
-        Boolean mask indicating which cells to include in the subset.
-    scale
-        If True, scale so geometric mean of size factors equals 1.
-        
-    Returns
-    -------
-    np.ndarray
-        Size factors for cells in the subset (length = sum(cell_mask)).
-    """
-    from scipy.stats import gmean
-    
-    # Get subset matrix
-    if sp.issparse(X):
-        X_sub = X[cell_mask, :].toarray()
-    else:
-        X_sub = np.asarray(X[cell_mask, :])
-    
-    n_cells, n_genes = X_sub.shape
-    
-    # Find genes expressed in ALL cells of subset (DESeq2 style)
-    min_per_gene = X_sub.min(axis=0)
-    all_expressed = min_per_gene > 0
-    n_reference = all_expressed.sum()
-    
-    if n_reference < 5:
-        # Fall back to median-of-ratios with non-zero filtering
-        # Compute geometric means using only non-zero values
-        log_X = np.log(np.maximum(X_sub, 1e-12))
-        log_X[X_sub == 0] = np.nan
-        geo_means = np.exp(np.nanmean(log_X, axis=0))
-        
-        # Compute ratios
-        size_factors = np.zeros(n_cells, dtype=np.float64)
-        for i in range(n_cells):
-            ratios = X_sub[i, :] / geo_means
-            valid = (X_sub[i, :] > 0) & np.isfinite(ratios) & (ratios > 0)
-            if np.sum(valid) > 0:
-                size_factors[i] = np.median(ratios[valid])
-            else:
-                size_factors[i] = np.nan
-    else:
-        # Use only genes expressed in all cells (DESeq2 style)
-        X_ref = X_sub[:, all_expressed]
-        geo_means = gmean(X_ref, axis=0)
-        ratios = X_ref / geo_means
-        size_factors = np.median(ratios, axis=1)
-    
-    # Handle invalid values
-    valid_sf = np.isfinite(size_factors) & (size_factors > 0)
-    if not np.all(valid_sf):
-        if np.any(valid_sf):
-            fallback = np.nanmedian(size_factors[valid_sf])
-            size_factors[~valid_sf] = fallback
-        else:
-            size_factors[:] = 1.0
-    
-    if scale:
-        scale_factor = np.exp(np.mean(np.log(np.clip(size_factors, 1e-12, None))))
-        return size_factors / scale_factor
-    return size_factors
 
 
 def t_test(
@@ -1566,47 +789,54 @@ def t_test(
 def nb_glm_test(
     path: str | Path,
     *,
+    # ---- Data parameters ----
     perturbation_column: str,
     control_label: str | None = None,
     covariates: Iterable[str] | None = None,
     gene_name_column: str | None = None,
     perturbations: Iterable[str] | None = None,
-    share_dispersion: bool = False,
+    # ---- Size factor parameters ----
+    size_factors: ArrayLike | None = None,
+    size_factor_method: Literal["sparse", "deseq2"] = "sparse",
+    size_factor_scope: Literal["global", "per_comparison"] = "global",
+    scale_size_factors: bool = True,
+    # ---- Dispersion parameters ----
     dispersion: float | None = None,
     dispersion_method: Literal["moments", "cox-reid"] = "cox-reid",
     dispersion_scope: Literal["global", "per_comparison"] = "global",
+    share_dispersion: bool = False,
+    use_map_dispersion: bool = True,
+    shrink_dispersion: bool = True,
+    # ---- Optimization parameters ----
     optimization_method: Literal["irls", "lbfgsb"] = "lbfgsb",
     max_iter: int = 25,
     tol: float = 1e-6,
     min_mu: float = 0.5,
     poisson_init_iter: int = 5,
-    min_cells_expressed: int = 0,
-    min_total_count: float = 1.0,
     chunk_size: int = 256,
     irls_batch_size: int | None = 128,
-    size_factors: ArrayLike | None = None,
-    size_factor_method: Literal["sparse", "deseq2"] = "sparse",
+    # ---- Filtering parameters ----
+    min_cells_expressed: int = 0,
+    min_total_count: float = 1.0,
     cook_filter: bool = False,
-    use_map_dispersion: bool = True,
-    shrink_dispersion: bool = True,
+    # ---- Output parameters ----
     lfc_shrinkage_type: Literal["apeglm", "none"] = "none",
+    lfc_base: Literal["log2", "ln"] = "log2",
     corr_method: Literal["benjamini-hochberg", "bonferroni"] = "benjamini-hochberg",
+    se_method: Literal["sandwich", "fisher"] = "sandwich",
     output_dir: str | Path | None = None,
     data_name: str | None = None,
-    n_jobs: int | None = None,
-    max_workers: int | None = None,
-    scale_size_factors: bool = True,
-    lfc_base: Literal["log2", "ln"] = "log2",
-    use_control_cache: bool = True,
-    size_factor_scope: Literal["global", "per_comparison"] = "global",
-    se_method: Literal["sandwich", "fisher"] = "sandwich",
+    scanpy_format: bool = False,
     verbose: bool = False,
+    profiling: bool = False,
+    # ---- Resume/Memory parameters ----
     resume: bool = False,
     checkpoint_interval: int | None = None,
-    profiling: bool = False,
     memory_limit_gb: float | None = None,
     max_dense_fraction: float = 0.3,
-    scanpy_format: bool = False,
+    n_jobs: int | None = None,
+    max_workers: int | None = None,
+    use_control_cache: bool = True,
 ) -> RankGenesGroupsResult:
     """Perform negative binomial GLM differential expression test.
     
@@ -1620,6 +850,9 @@ def nb_glm_test(
     
     Parameters
     ----------
+    
+    **Data parameters**
+    
     path
         Path to an h5ad file containing raw count data.
     perturbation_column
@@ -1632,10 +865,39 @@ def nb_glm_test(
         Column in `adata.var` with gene symbols. If None, uses `adata.var_names`.
     perturbations
         Specific perturbations to test. If None, tests all non-control groups.
-    share_dispersion
-        If True, estimate dispersion once using all cells, then use the same 
-        dispersion values for all Wald tests. If False (default), estimate
-        dispersion separately for each perturbation comparison.
+    
+    **Size factor parameters**
+    
+    size_factors
+        Optional array of per-cell size factors. If None, computes size factors
+        using the method specified by `size_factor_method`.
+    size_factor_method
+        Method for computing size factors when ``size_factors`` is None:
+        - "sparse": Sparse-aware median-of-ratios (default). Computes geometric
+          means using only non-zero values, suitable for sparse single-cell data.
+        - "deseq2": Classic DESeq2/PyDESeq2 style. Uses only genes expressed in
+          ALL cells (typically ~50-100 genes). Provides better numerical alignment
+          with PyDESeq2 results but may be less robust for very sparse data.
+    size_factor_scope
+        Scope for size factor computation:
+        - "global" (default): Compute size factors once on the full dataset. 
+          Recommended for CRISPR screens where all cells come from the same 
+          experiment and share a common sequencing depth distribution. Faster 
+          when combined with use_control_cache=True. Note: produces different 
+          results from PyDESeq2 (ρ ≈ 0.7-0.8) which uses per-comparison normalization.
+        - "per_comparison": Compute size factors separately for each control + 
+          perturbation comparison. This matches PyDESeq2's behavior exactly, 
+          leading to near-perfect LFC, statistic, and p-value concordance 
+          (ρ > 0.97 on Tian-crispra, ρ > 0.99 on Adamson_subset). Use this when 
+          PyDESeq2 compatibility is required or for bulk RNA-seq style analysis.
+    scale_size_factors
+        If True (default), scale size factors so their geometric mean equals 1.
+        This is the standard DESeq2/crispyx behavior. If False, use raw 
+        median-of-ratios size factors without rescaling, which matches 
+        PyDESeq2's default behavior and can improve numerical alignment.
+    
+    **Dispersion parameters**
+    
     dispersion
         Fixed dispersion parameter for negative binomial. If None, estimates per gene.
     dispersion_method
@@ -1653,6 +915,19 @@ def nb_glm_test(
         - "per_comparison": Estimate dispersion separately for each control + 
           perturbation comparison. More accurate when perturbations cause large
           changes in gene expression variance, but significantly slower.
+    share_dispersion
+        If True, estimate dispersion once using all cells, then use the same 
+        dispersion values for all Wald tests. If False (default), estimate
+        dispersion separately for each perturbation comparison.
+    use_map_dispersion
+        If True (default), use MAP dispersion estimation with mean-dispersion trend.
+        If False, use MLE dispersion without trend-based shrinkage.
+    shrink_dispersion
+        If True, fit a mean-dispersion trend and shrink gene-wise dispersions
+        toward the trend using an empirical Bayes prior.
+    
+    **Optimization parameters**
+    
     optimization_method
         Method for coefficient optimization:
         - "lbfgsb": L-BFGS-B optimization (PyDESeq2 style, default). Directly
@@ -1670,10 +945,6 @@ def nb_glm_test(
         PyDESeq2's default. Set to 0.0 to disable clamping.
     poisson_init_iter
         Initial Poisson iterations before switching to negative binomial.
-    min_cells_expressed
-        Minimum total cells (control + perturbation) expressing a gene for testing.
-    min_total_count
-        Minimum total count across all cells for a gene to be tested.
     chunk_size
         Number of genes to process per chunk (memory vs. speed tradeoff). Smaller
         values stream more, reducing peak memory at the cost of additional I/O.
@@ -1681,75 +952,60 @@ def nb_glm_test(
         Maximum number of genes to densify per IRLS step. Keep this small to
         limit per-iteration memory when working with large sparse matrices. Set
         to ``None`` to process each chunk without additional batching.
-    size_factors
-        Optional array of per-cell size factors. If None, computes size factors
-        using the method specified by `size_factor_method`.
-    size_factor_method
-        Method for computing size factors when ``size_factors`` is None:
-        - "sparse": Sparse-aware median-of-ratios (default). Computes geometric
-          means using only non-zero values, suitable for sparse single-cell data.
-        - "deseq2": Classic DESeq2/PyDESeq2 style. Uses only genes expressed in
-          ALL cells (typically ~50-100 genes). Provides better numerical alignment
-          with PyDESeq2 results but may be less robust for very sparse data.
+    
+    **Filtering parameters**
+    
+    min_cells_expressed
+        Minimum total cells (control + perturbation) expressing a gene for testing.
+    min_total_count
+        Minimum total count across all cells for a gene to be tested.
     cook_filter
         Whether to apply Cook's distance outlier filtering when available.
-    shrink_dispersion
-        If True, fit a mean-dispersion trend and shrink gene-wise dispersions
-        toward the trend using an empirical Bayes prior.
+    
+    **Output parameters**
+    
     lfc_shrinkage_type
         Type of log-fold change shrinkage to apply:
         - "none": No shrinkage (default)
         - "apeglm": Adaptive shrinkage using Cauchy prior (PyDESeq2-compatible).
           Preserves large effects while shrinking small/uncertain effects toward
           zero. Also updates standard errors to reflect posterior uncertainty.
-    corr_method
-        Method for p-value correction: "benjamini-hochberg" or "bonferroni".
-    output_dir
-        Directory for output h5ad file. Defaults to input file's directory.
-    data_name
-        Custom name for output file. If None, uses "nb_glm" suffix.
-    n_jobs
-        Number of parallel workers for fitting GLMs across perturbations.
-        If None, uses all available cores. If 1, runs sequentially.
-        If -1, uses all available cores.
-    scale_size_factors
-        If True (default), scale size factors so their geometric mean equals 1.
-        This is the standard DESeq2/crispyx behavior. If False, use raw 
-        median-of-ratios size factors without rescaling, which matches 
-        PyDESeq2's default behavior and can improve numerical alignment.
     lfc_base
         Log base for fold change output:
         - "log2" (default): Output log2 fold change, matching PyDESeq2/edgeR.
         - "ln": Output natural log fold change (raw GLM coefficients).
         Standard error is also converted to match the selected log base.
         Wald statistics remain unchanged since both LFC and SE are scaled equally.
-    use_control_cache
-        If True (default), precompute control cell statistics (intercept, weights,
-        XᵀWX contributions) once and reuse them across all perturbation comparisons.
-        This can significantly reduce memory and computation time when there are
-        many perturbations and the control group is large. Only applies when
-        no covariates are specified and size_factor_scope="global".
-    size_factor_scope
-        Scope for size factor computation:
-        - "global" (default): Compute size factors once on the full dataset. 
-          Recommended for CRISPR screens where all cells come from the same 
-          experiment and share a common sequencing depth distribution. Faster 
-          when combined with use_control_cache=True. Note: produces different 
-          results from PyDESeq2 (ρ ≈ 0.7-0.8) which uses per-comparison normalization.
-        - "per_comparison": Compute size factors separately for each control + 
-          perturbation comparison. This matches PyDESeq2's behavior exactly, 
-          leading to near-perfect LFC, statistic, and p-value concordance 
-          (ρ > 0.97 on Tian-crispra, ρ > 0.99 on Adamson_subset). Use this when 
-          PyDESeq2 compatibility is required or for bulk RNA-seq style analysis.
+    corr_method
+        Method for p-value correction: "benjamini-hochberg" or "bonferroni".
     se_method
         Method for computing standard errors:
         - "sandwich" (default): Sandwich estimator SE = sqrt(c' @ H @ M @ H @ c).
           More robust to model misspecification.
         - "fisher": Standard Fisher information SE = sqrt(diag(inv(X'WX + ridge*I))).
           Matches PyDESeq2's approach for better p-value parity.
+    output_dir
+        Directory for output h5ad file. Defaults to input file's directory.
+    data_name
+        Custom name for output file. If None, uses "nb_glm" suffix.
+    scanpy_format
+        If True, write Scanpy-compatible ``uns['rank_genes_groups']`` structure
+        in addition to the layer-based storage. Adds ~2-6 seconds of I/O overhead
+        for large datasets. Default False for performance.
     verbose
         If True, show a progress bar for perturbation fitting and log per-perturbation
         completion at DEBUG level. Requires tqdm to be installed for progress bar.
+    profiling
+        If True, enable timing and memory profiling. When enabled, stores
+        profiling data in `adata.uns["profiling"]` with fields:
+        - `fit_seconds`: Time for base NB-GLM fitting (excludes lfcShrink)
+        - `fit_peak_memory_mb`: Peak memory during fitting
+        - `profiling_enabled`: True
+        When False (default), `adata.uns["profiling"]` is set to "NA" to
+        avoid profiling overhead in production.
+    
+    **Resume/Memory parameters**
+    
     resume
         If True, attempt to resume from a previous interrupted run. Reads the
         checkpoint file to determine which perturbations have already been
@@ -1760,14 +1016,6 @@ def nb_glm_test(
         auto-determined based on dataset size (1 for <100 perturbations, 10 for
         <1000, 50 for larger). The checkpoint file `<output>_progress.json` is
         written atomically to prevent corruption.
-    profiling
-        If True, enable timing and memory profiling. When enabled, stores
-        profiling data in `adata.uns["profiling"]` with fields:
-        - `fit_seconds`: Time for base NB-GLM fitting (excludes lfcShrink)
-        - `fit_peak_memory_mb`: Peak memory during fitting
-        - `profiling_enabled`: True
-        When False (default), `adata.uns["profiling"]` is set to "NA" to
-        avoid profiling overhead in production.
     memory_limit_gb
         Optional memory limit in GB. If provided, this is used together with
         available system memory to determine when to switch to streaming mode
@@ -1778,10 +1026,18 @@ def nb_glm_test(
         If the estimated memory for densifying the full cell×gene matrix exceeds
         max_dense_fraction × min(available_memory, memory_limit_gb), the function
         switches to streaming mode. Default is 0.3 (30% of available memory).
-    scanpy_format
-        If True, write Scanpy-compatible ``uns['rank_genes_groups']`` structure
-        in addition to the layer-based storage. Adds ~2-6 seconds of I/O overhead
-        for large datasets. Default False for performance.
+    n_jobs
+        Number of parallel workers for fitting GLMs across perturbations.
+        If None, uses all available cores. If 1, runs sequentially.
+        If -1, uses all available cores.
+    max_workers
+        Alias for n_jobs (for compatibility). If both are specified, n_jobs takes precedence.
+    use_control_cache
+        If True (default), precompute control cell statistics (intercept, weights,
+        XᵀWX contributions) once and reuse them across all perturbation comparisons.
+        This can significantly reduce memory and computation time when there are
+        many perturbations and the control group is large. Only applies when
+        no covariates are specified and size_factor_scope="global".
     
     Returns
     -------
@@ -2627,35 +1883,94 @@ def nb_glm_test(
             effective_n_jobs = min(n_jobs, cpu_count)
         effective_n_jobs = max(1, effective_n_jobs)
         
-        # Memory-aware worker limiting: Each worker processes ~n_genes data
-        # Estimate memory per worker based on control + perturbation matrices
-        # Typical per-worker memory: control_matrix (deserialized copy) + group_matrix + work arrays
-        # ~= n_control * n_genes * 8 + n_group * n_genes * 8 + overhead
-        # The control_matrix is serialized via pickle and each loky worker deserializes it
+        # Memory-aware worker limiting: Adaptive estimation based on dataset statistics
+        # Compute group size statistics without loading the full matrix
+        # Use numpy unique with counts since labels is a numpy array
+        unique_labels, label_counts = np.unique(labels, return_counts=True)
+        group_sizes = dict(zip(unique_labels, label_counts))
+        pert_group_sizes = [group_sizes.get(g, 0) for g in candidates]
+        max_group_size = max(pert_group_sizes) if pert_group_sizes else 1
         avg_group_size = max(1, (n_cells_total - control_n) // max(1, n_groups))
-        # Conservative estimate: control_matrix (copy per worker) + group_matrix + 8 work arrays + overhead
-        # Control cache includes: control_matrix, beta_intercept, control_dispersion, etc
-        n_work_arrays = 8  # Increased from 6 to be more conservative
-        control_cache_mb = control_n * n_genes * 8 / 1e6  # Control matrix copy per worker
-        worker_data_mb = (control_n + avg_group_size) * n_genes * 8 * n_work_arrays / 1e6
-        serialization_overhead = 1.5  # Account for pickle/loky overhead
-        memory_per_worker_mb = (control_cache_mb + worker_data_mb) * serialization_overhead
-        memory_limit_mb = memory_limit_gb * 1000 if memory_limit_gb is not None else None
-        memory_limited_workers = _estimate_max_workers(
-            n_samples=control_n + avg_group_size,
-            n_genes=n_genes,
-            memory_per_worker_mb=memory_per_worker_mb,
-            available_mb=None,  # Auto-detect
-            memory_limit_mb=memory_limit_mb,
+        
+        # Use p95 group size for realistic estimate (avoids over-conservative from outliers)
+        if len(pert_group_sizes) >= 10:
+            p95_group_size = int(np.percentile(pert_group_sizes, 95))
+            use_group_size = p95_group_size
+        else:
+            use_group_size = max_group_size
+        
+        # Decide early if we can use control cache (needed for memory estimation)
+        can_use_cache_early = (
+            use_control_cache and 
+            len(covariates) == 0 and
+            size_factor_scope == "global"
         )
+        
+        # Context-aware n_work_arrays based on dispersion mode
+        # Global dispersion: control cache is shared (COW), only need 2 work arrays per worker
+        # Per-comparison: need full matrices for MAP dispersion estimation
+        if can_use_cache_early and dispersion_scope == "global":
+            n_work_arrays = 2  # Only mu and W arrays needed per worker
+            # Control cache is shared (copy-on-write), count as base memory not per-worker
+            base_memory_mb = control_n * n_genes * 8 / 1e6 + 500  # + process overhead
+            per_worker_data_mb = use_group_size * n_genes * 8 * (1 + n_work_arrays) / 1e6 * 1.5
+        else:
+            n_work_arrays = 6  # Full matrices for per-comparison MAP
+            # Control matrix is copied per worker in this mode
+            base_memory_mb = 500  # Just process overhead
+            per_worker_data_mb = (control_n + use_group_size) * n_genes * 8 * n_work_arrays / 1e6 * 1.5
+        
+        # Minimum floor: Python/loky per-process overhead
+        per_worker_mb = max(per_worker_data_mb, 200)
+        
+        # Calculate available memory
+        if memory_limit_gb is not None:
+            available_mb = memory_limit_gb * 1000
+        else:
+            try:
+                import psutil
+                available_mb = psutil.virtual_memory().available / 1e6
+            except ImportError:
+                available_mb = 8000.0  # 8 GB default
+        
+        # Reserve 20% headroom for safety
+        usable_mb = available_mb * 0.8
+        remaining_mb = max(usable_mb - base_memory_mb, per_worker_mb)
+        max_workers_by_memory = max(1, int(remaining_mb / per_worker_mb))
+        
+        # Dataset-size-aware caps
+        full_matrix_gb = (control_n + avg_group_size * n_groups) * n_genes * 8 / 1e9
+        if full_matrix_gb < 1.0:
+            # Tiny dataset: cap workers to reduce parallelization overhead
+            max_workers_by_size = max(4, n_groups // 2)
+        else:
+            max_workers_by_size = n_groups
+        
+        # Apply all constraints
+        # Use candidates_to_run (not n_groups) for worker limit since that's what we're actually running
+        n_to_run = len(candidates_to_run)
+        memory_limited_workers = min(max_workers_by_memory, max_workers_by_size, n_to_run)
+        
         if max_workers is None and memory_limited_workers < effective_n_jobs:
             # Only apply memory limiting if max_workers not explicitly set
-            logger.info(f"Memory-aware limiting: {effective_n_jobs} -> {memory_limited_workers} workers (est. {memory_per_worker_mb:.0f} MB/worker)")
+            # Determine limiting factor for logging
+            if memory_limited_workers == n_to_run and n_to_run < max_workers_by_memory and n_to_run < max_workers_by_size:
+                limit_reason = "perturbation_count"
+            elif memory_limited_workers == max_workers_by_memory:
+                limit_reason = "memory"
+            elif memory_limited_workers == max_workers_by_size:
+                limit_reason = "small_dataset"
+            else:
+                limit_reason = "perturbation_count"
+            logger.info(
+                f"Memory-aware limiting: {effective_n_jobs} -> {memory_limited_workers} workers "
+                f"(reason: {limit_reason}, base: {base_memory_mb:.0f}MB, per_worker: {per_worker_mb:.0f}MB, "
+                f"available: {available_mb:.0f}MB, full_matrix: {full_matrix_gb:.1f}GB)"
+            )
             effective_n_jobs = memory_limited_workers
         effective_n_jobs = max(1, effective_n_jobs)
         
         # For small number of perturbations to run, run sequentially to avoid overhead
-        n_to_run = len(candidates_to_run)
         use_parallel = n_to_run >= 4 and effective_n_jobs > 1
         
         # Decide whether to use control cache optimization

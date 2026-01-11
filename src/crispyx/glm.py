@@ -31,6 +31,14 @@ from ._kernels import (
 # Import profiling utilities from dedicated module
 from .profiling import Profiler, MemoryProfiler, TimingProfiler
 
+# Import memory utilities
+from ._memory import (
+    _get_available_memory_mb,
+    _estimate_dense_memory_gb,
+    _estimate_gene_batch_size_fitter,
+    _estimate_max_workers,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -297,36 +305,6 @@ def precompute_control_statistics(
         pts_rest=pts_rest.astype(np.float32),
         global_size_factors=global_size_factors,
     )
-
-
-def _get_available_memory_mb() -> float:
-    """Get available system memory in MB, with fallback."""
-    try:
-        import psutil
-        return psutil.virtual_memory().available / 1e6
-    except ImportError:
-        return 8000.0  # 8 GB default fallback
-
-
-def _estimate_dense_memory_gb(n_cells: int, n_genes: int, n_copies: int = 3) -> float:
-    """Estimate memory required to densify a matrix with work arrays.
-    
-    Parameters
-    ----------
-    n_cells
-        Number of cells (rows).
-    n_genes
-        Number of genes (columns).
-    n_copies
-        Number of dense matrix copies needed (default 3: Y, mu, work arrays).
-        
-    Returns
-    -------
-    float
-        Estimated memory in GB.
-    """
-    bytes_per_element = 8  # float64
-    return n_cells * n_genes * bytes_per_element * n_copies / 1e9
 
 
 def precompute_global_dispersion(
@@ -1421,54 +1399,6 @@ def shrink_dispersions(
     return shrunk
 
 
-def _refine_dispersion_brent(
-    j: int,
-    Y_col: np.ndarray,
-    mu_col: np.ndarray,
-    log_trend_j: float,
-    prior_var: float,
-    log_min: float,
-    log_max: float,
-) -> float:
-    """Refine dispersion for a single gene using Brent's method.
-    
-    This is used after grid search to get the exact optimum.
-    Memory optimization: computes gammaln(Y + 1) on-the-fly.
-    """
-    from scipy.optimize import brentq, minimize_scalar
-    
-    def neg_posterior(log_alpha: float) -> float:
-        alpha = np.exp(log_alpha)
-        r = 1.0 / alpha
-        
-        # NB log-likelihood - using numba-accelerated gammaln
-        ll = np.sum(
-            gammaln_nb(Y_col + r)
-            - gammaln_nb(r)
-            - gammaln_nb(Y_col + 1.0)
-            + r * np.log(r / (r + mu_col + 1e-12))
-            + Y_col * np.log(mu_col / (r + mu_col + 1e-12) + 1e-12)
-        )
-        
-        # Log-prior
-        log_prior = -0.5 * (log_alpha - log_trend_j) ** 2 / prior_var
-        
-        return -(ll + log_prior)
-    
-    # Use bounded scalar optimization with Brent's method
-    result = minimize_scalar(
-        neg_posterior,
-        bounds=(log_min, log_max),
-        method='bounded',
-        options={'xatol': 1e-4}
-    )
-    
-    if result.success:
-        return np.exp(result.x)
-    else:
-        return np.exp(log_trend_j)  # Fallback to trend
-
-
 def estimate_dispersion_map(
     Y: np.ndarray,
     mu: np.ndarray,
@@ -1592,109 +1522,6 @@ def estimate_dispersion_map(
             Y, mu, log_trend, log_alpha_grid, prior_var
         )
         return np.exp(np.clip(best_log_alpha, log_min, log_max))
-
-
-def _estimate_dispersion_map_sequential(
-    Y: np.ndarray,
-    mu: np.ndarray,
-    trend: np.ndarray,
-    *,
-    prior_var: float | None = None,
-    min_disp: float = 1e-8,
-    max_disp: float = 10.0,
-) -> np.ndarray:
-    """Original sequential MAP dispersion estimation (kept for reference/testing).
-    
-    This is the original per-gene sequential implementation. Use estimate_dispersion_map
-    for the optimized vectorized version.
-    """
-    from scipy.optimize import minimize_scalar
-    from scipy.special import polygamma
-    
-    n_cells, n_genes = Y.shape
-    Y = np.asarray(Y, dtype=np.float64)
-    mu = np.asarray(mu, dtype=np.float64)
-    trend = np.asarray(trend, dtype=np.float64)
-    
-    # Clip mu to avoid numerical issues
-    mu = np.maximum(mu, 1e-10)
-    
-    # Initial estimate: use method of moments for MLE
-    resid = Y - mu
-    variance = resid ** 2 - Y
-    denom = np.maximum(mu ** 2, 1e-10)
-    dof = max(n_cells - 2, 1)
-    alpha_mle = np.sum(variance / denom, axis=0) / dof
-    alpha_mle = np.clip(alpha_mle, min_disp, max_disp)
-    
-    # Estimate prior variance if not provided (PyDESeq2 style)
-    if prior_var is None:
-        log_alpha = np.log(np.maximum(alpha_mle, min_disp))
-        log_trend_arr = np.log(np.maximum(trend, min_disp))
-        valid = np.isfinite(log_alpha) & np.isfinite(log_trend_arr)
-        if np.sum(valid) > 10:
-            residuals = log_alpha[valid] - log_trend_arr[valid]
-            # Robust estimate using MAD (mean absolute deviation)
-            mad = np.median(np.abs(residuals - np.median(residuals)))
-            squared_logres = (1.4826 * mad) ** 2
-            # PyDESeq2 formula: max(squared_logres - polygamma_correction, 0.25)
-            num_vars = 2  # intercept + perturbation
-            polygamma_corr = polygamma(1, (n_cells - num_vars) / 2)
-            prior_var = max(squared_logres - polygamma_corr, 0.25)
-        else:
-            prior_var = 0.25
-    
-    log_trend = np.log(np.maximum(trend, min_disp))
-    log_min = np.log(min_disp)
-    log_max = np.log(max_disp)
-    
-    # Result array
-    alpha_map = np.zeros(n_genes, dtype=np.float64)
-    
-    def nb_loglik_plus_prior(log_alpha, y_col, mu_col, log_trend_j, prior_var):
-        """Negative of (log-likelihood + log-prior) for minimization."""
-        alpha = np.exp(log_alpha)
-        inv_alpha = 1.0 / alpha
-        
-        # NB log-likelihood (vectorized over cells, using numba-accelerated gammaln)
-        ll = np.sum(
-            gammaln_nb(y_col + inv_alpha)
-            - gammaln_nb(inv_alpha)
-            - gammaln_nb(y_col + 1)
-            + inv_alpha * np.log(inv_alpha / (inv_alpha + mu_col))
-            + y_col * np.log(mu_col / (inv_alpha + mu_col))
-        )
-        
-        # Log-normal prior on log(alpha)
-        log_prior = -0.5 * (log_alpha - log_trend_j) ** 2 / prior_var
-        
-        # Return negative for minimization
-        return -(ll + log_prior)
-    
-    # Optimize each gene
-    for j in range(n_genes):
-        y_col = Y[:, j]
-        mu_col = mu[:, j]
-        log_trend_j = log_trend[j]
-        
-        # Use bounded scalar optimization
-        result = minimize_scalar(
-            lambda x: nb_loglik_plus_prior(x, y_col, mu_col, log_trend_j, prior_var),
-            bounds=(log_min, log_max),
-            method='bounded',
-            options={'xatol': 1e-4}
-        )
-        
-        if result.success:
-            alpha_map[j] = np.exp(result.x)
-        else:
-            # Fall back to trend if optimization fails
-            alpha_map[j] = trend[j]
-    
-    # Clip to bounds
-    alpha_map = np.clip(alpha_map, min_disp, max_disp)
-    
-    return alpha_map
 
 
 def _estimate_apeglm_prior_scale(
@@ -2706,162 +2533,6 @@ def _nb_deviance(
     return float(2.0 * np.sum(term1 - term2))
 
 
-def _lbfgsb_nb_fit_gene(
-    Y_gene: np.ndarray,
-    X_dense: np.ndarray,
-    pert_indicators: np.ndarray,
-    log_size_factors: np.ndarray,
-    alpha: float,
-    beta0_dense: np.ndarray,
-    beta0_pert: np.ndarray,
-    pert_has_data: np.ndarray,
-    min_beta: float = -30.0,
-    max_beta: float = 30.0,
-) -> Tuple[np.ndarray, np.ndarray, float, bool]:
-    """Fit NB GLM for a single gene using L-BFGS-B.
-    
-    This is a fallback optimizer when IRLS doesn't converge well.
-    
-    Parameters
-    ----------
-    Y_gene : (n_samples,)
-        Observed counts for this gene.
-    X_dense : (n_samples, n_dense)
-        Dense design matrix part (intercept + covariates).
-    pert_indicators : (n_samples,)
-        Integer indices of perturbation (-1 for control).
-    log_size_factors : (n_samples,)
-        Log size factors (offset).
-    alpha : float
-        Dispersion for this gene.
-    beta0_dense : (n_dense,)
-        Initial values for intercept + covariates.
-    beta0_pert : (n_pert,)
-        Initial values for perturbation effects.
-    pert_has_data : (n_pert,)
-        Boolean mask for perturbations with enough data.
-    min_beta, max_beta : float
-        Bounds for coefficients (PyDESeq2 uses -30, 30).
-        
-    Returns
-    -------
-    beta_dense : (n_dense,)
-        Fitted intercept + covariate coefficients.
-    beta_pert : (n_pert,)
-        Fitted perturbation coefficients.
-    deviance : float
-        Final deviance.
-    converged : bool
-        Whether optimization converged.
-    """
-    n_dense = X_dense.shape[1]
-    n_pert = len(beta0_pert)
-    
-    def neg_log_lik(beta_flat):
-        """Negative log-likelihood for L-BFGS-B."""
-        beta_dense = beta_flat[:n_dense]
-        beta_pert = beta_flat[n_dense:]
-        
-        # Compute eta = X_dense @ beta_dense + pert_effect + offset
-        eta = X_dense @ beta_dense + log_size_factors
-        
-        # Add perturbation effects
-        pert_mask = pert_indicators >= 0
-        if np.any(pert_mask):
-            eta[pert_mask] += beta_pert[pert_indicators[pert_mask]]
-        
-        eta = np.clip(eta, -30.0, 30.0)
-        mu = np.exp(eta)
-        mu = np.maximum(mu, 1e-10)
-        
-        # NB log-likelihood (using numba-accelerated gammaln)
-        r = 1.0 / max(alpha, 1e-10)
-        ll = np.sum(
-            gammaln_nb(Y_gene + r)
-            - gammaln_nb(r)
-            - gammaln_nb(Y_gene + 1)
-            + r * np.log(r / (r + mu))
-            + Y_gene * np.log(mu / (r + mu) + 1e-10)
-        )
-        return -ll
-    
-    def neg_log_lik_grad(beta_flat):
-        """Gradient of negative log-likelihood."""
-        beta_dense = beta_flat[:n_dense]
-        beta_pert = beta_flat[n_dense:]
-        
-        # Compute eta and mu
-        eta = X_dense @ beta_dense + log_size_factors
-        pert_mask = pert_indicators >= 0
-        if np.any(pert_mask):
-            eta[pert_mask] += beta_pert[pert_indicators[pert_mask]]
-        
-        eta = np.clip(eta, -30.0, 30.0)
-        mu = np.exp(eta)
-        mu = np.maximum(mu, 1e-10)
-        
-        # Gradient: d(-ll)/d(beta) = -sum((y - mu) / (1 + alpha*mu) * x)
-        r = 1.0 / max(alpha, 1e-10)
-        w = (Y_gene - mu) * r / (r + mu)  # Weighted residual
-        
-        # Gradient w.r.t. dense features
-        grad_dense = -X_dense.T @ w
-        
-        # Gradient w.r.t. perturbation features
-        grad_pert = np.zeros(n_pert, dtype=np.float64)
-        for i in range(len(Y_gene)):
-            p_idx = pert_indicators[i]
-            if p_idx >= 0:
-                grad_pert[p_idx] -= w[i]
-        
-        # Zero out gradient for perturbations without data
-        grad_pert = np.where(pert_has_data, grad_pert, 0.0)
-        
-        return np.concatenate([grad_dense, grad_pert])
-    
-    # Initial values
-    beta0 = np.concatenate([beta0_dense, beta0_pert])
-    
-    # Bounds: all coefficients between min_beta and max_beta
-    bounds = [(min_beta, max_beta) for _ in range(n_dense + n_pert)]
-    
-    try:
-        result = minimize(
-            neg_log_lik,
-            beta0,
-            method='L-BFGS-B',
-            jac=neg_log_lik_grad,
-            bounds=bounds,
-            options={'maxiter': 250, 'ftol': 1e-8, 'gtol': 1e-5},
-        )
-        
-        beta_dense = result.x[:n_dense]
-        beta_pert = result.x[n_dense:]
-        
-        # Zero out coefficients for perturbations without data
-        beta_pert = np.where(pert_has_data, beta_pert, 0.0)
-        
-        # Compute final deviance
-        eta = X_dense @ beta_dense + log_size_factors
-        pert_mask = pert_indicators >= 0
-        if np.any(pert_mask):
-            eta[pert_mask] += beta_pert[pert_indicators[pert_mask]]
-        eta = np.clip(eta, -30.0, 30.0)
-        mu = np.exp(eta)
-        mu = np.maximum(mu, 1e-10)
-        deviance = _nb_deviance(Y_gene, mu, alpha)
-        
-        return beta_dense, beta_pert, deviance, result.success
-        
-    except Exception:
-        # Return initial values if optimization fails
-        return beta0_dense, beta0_pert, np.inf, False
-
-
-# Removed: JointControlCache, SufficientStatsCache, compute_sufficient_stats_streaming,
-# estimate_joint_model_lbfgsb, and JointModelResult (joint NB-GLM mode deprecated in v0.5.0)
-
-
 def estimate_global_dispersion_streaming(
     backed_adata,
     *,
@@ -3078,102 +2749,6 @@ def estimate_global_dispersion_streaming(
     dispersion = np.where(np.isfinite(dispersion), dispersion, 0.1)
     
     return dispersion
-
-
-# =============================================================================
-# Memory-aware auto-tuning utilities for batch processing
-# =============================================================================
-
-def _estimate_gene_batch_size_fitter(
-    n_samples: int,
-    n_genes: int,
-    n_work_arrays: int = 4,
-    target_mb: float = 100.0,
-) -> int:
-    """Estimate optimal gene batch size based on memory constraints.
-    
-    Calculates batch size to keep work array memory usage under target_mb.
-    Work arrays are typically (n_samples, batch_size) shaped.
-    
-    Parameters
-    ----------
-    n_samples
-        Number of samples (cells) in the dataset.
-    n_genes
-        Total number of genes.
-    n_work_arrays
-        Number of work arrays allocated per batch (default 4 after optimization).
-    target_mb
-        Target memory usage in MB for work arrays (default 100 MB).
-        
-    Returns
-    -------
-    int
-        Recommended gene batch size, clamped between 256 and n_genes.
-    """
-    bytes_per_gene = n_samples * 8 * n_work_arrays  # float64 = 8 bytes
-    target_bytes = target_mb * 1e6
-    batch_size = int(target_bytes / bytes_per_gene)
-    # Clamp between 256 (minimum for efficiency) and n_genes (maximum)
-    return max(256, min(batch_size, n_genes))
-
-
-def _estimate_max_workers(
-    n_samples: int,
-    n_genes: int,
-    memory_per_worker_mb: float | None = None,
-    available_mb: float | None = None,
-    memory_limit_mb: float | None = None,
-) -> int:
-    """Estimate maximum number of parallel workers based on memory constraints.
-    
-    Limits worker count to prevent OOM from multiple workers each allocating
-    large work arrays.
-    
-    Parameters
-    ----------
-    n_samples
-        Number of samples (cells) in the dataset.
-    n_genes
-        Total number of genes.
-    memory_per_worker_mb
-        Estimated memory per worker in MB. If None, calculated from data size.
-    available_mb
-        Available memory in MB. If None, uses 80% of system memory.
-    memory_limit_mb
-        Optional explicit memory limit in MB (e.g., from config). If provided,
-        the effective memory budget is min(available_mb, memory_limit_mb).
-        
-    Returns
-    -------
-    int
-        Recommended maximum number of workers.
-    """
-    import os
-    
-    if available_mb is None:
-        # Try to get system memory, default to 8 GB if unavailable
-        try:
-            import psutil
-            available_mb = psutil.virtual_memory().available / 1e6 * 0.8
-        except ImportError:
-            available_mb = 8000.0  # 8 GB default
-    
-    # Apply explicit memory limit if provided
-    if memory_limit_mb is not None:
-        effective_mb = min(available_mb, memory_limit_mb * 0.8)  # 80% of limit
-    else:
-        effective_mb = available_mb
-    
-    if memory_per_worker_mb is None:
-        # Estimate: 4 work arrays + Y subset + overhead
-        n_work_arrays = 5
-        memory_per_worker_mb = n_samples * n_genes * 8 * n_work_arrays / 1e6
-    
-    max_workers = max(1, int(effective_mb / memory_per_worker_mb))
-    cpu_count = os.cpu_count() or 4
-    
-    return min(max_workers, cpu_count)
 
 
 class NBGLMBatchFitter:
