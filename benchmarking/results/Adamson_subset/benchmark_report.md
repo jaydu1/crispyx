@@ -6,45 +6,44 @@
 
 | Package | Method | Status | Total (s) | Memory (MB) | Cells | Genes |
 | --- | --- | --- | --- | --- | --- | --- |
-| scanpy | QC filter | success | 3.71 | 234.94 | 1716.0 | 10500.0 |
-| crispyx | QC filter | success | 3.48 | 228.07 | 1716.0 | 10500.0 |
-| crispyx | pseudobulk (avg log) | success | 3.29 | 460.3 |  |  |
-| crispyx | pseudobulk | success | 3.03 | 309.25 |  |  |
+| crispyx | QC filter | success | 1.05 | 397.5 | 1716.0 | 10500.0 |
+| scanpy | QC filter | success | 3.37 | 234.43 | 1716.0 | 10500.0 |
+| crispyx | pseudobulk (avg log) | success | 0.83 | 698.18 |  |  |
+| crispyx | pseudobulk | success | 0.76 | 545.92 |  |  |
 
 
 ### DE: t-test
 
 | Package | Method | Status | Total (s) | Memory (MB) | Groups |
 | --- | --- | --- | --- | --- | --- |
-| crispyx | t-test | success | 2.93 | 110.13 | 2 |
-| scanpy | t-test | success | 5.22 | 156.94 | 2 |
+| scanpy | t-test | success | 5.54 | 157.67 | 2 |
+| crispyx | t-test | success | 1.99 | 422.38 | 2 |
 
 
 ### DE: Wilcoxon
 
 | Package | Method | Status | Total (s) | Memory (MB) | Groups |
 | --- | --- | --- | --- | --- | --- |
-| scanpy | Wilcoxon | success | 22.82 | 419.25 | 2 |
-| crispyx | Wilcoxon | success | 3.7 | 191.59 | 2 |
+| crispyx | Wilcoxon | success | 2.56 | 487.85 | 2 |
+| scanpy | Wilcoxon | success | 21.56 | 425.23 | 2 |
 
 
 ### DE: NB GLM
 
 | Package | Method | Status | Total (s) | Memory (MB) | Groups |
 | --- | --- | --- | --- | --- | --- |
-| crispyx | NB-GLM (pydeseq2) | success | 37.72 | 1523.05 | 2 |
-| crispyx | NB-GLM | success | 19.86 | 1399.7 | 2 |
-| edgeR | NB-GLM | success | 95.31 | 1969.25 | 2 |
-| pertpy | NB-GLM | success | 27.32 | 2518.96 | 2 |
+| crispyx | NB-GLM | success | 24.14 | 382.5 | 2 |
+| edgeR | NB-GLM | success | 92.33 | 1968.6 | 2 |
+| pertpy | NB-GLM | success | 28.66 | 2466.91 | 2 |
 
 
 ### Other
 
 | Package | Method | Status | Total (s) | Memory (MB) | Groups |
 | --- | --- | --- | --- | --- | --- |
-| crispyx | lfcShrink (pydeseq2) | success | 2.54 | 16.88 | 2 |
-| crispyx | lfcShrink | success | 2.54 | 15.0 | 2 |
-| pertpy | lfcShrink | success | 29.71 | 2512.84 | 2 |
+| crispyx | lfcShrink | success | 0.02 | 324.38 | 2 |
+| crispyx | lfcShrink (pydeseq2) | success | 0.02 | 322.5 | 2 |
+| pertpy | lfcShrink | success | 31.89 | 2504.6 | 2 |
 
 
 ## 2. Performance Comparison
@@ -57,38 +56,38 @@ _crispyx as baseline. Negative values = crispyx is faster/uses less memory._
 
 | crispyx method | compared to | Time Δ | Time % |  | Mem Δ | Mem % |   |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| QC filter | scanpy QC filter | -0.2s | 93.6% | ⚠️ | -6.9 MB | 97.1% | ⚠️ |
+| QC filter | scanpy QC filter | -2.3s | 31.2% | ✅ | +163.1 MB | 169.6% | ❌ |
 
 
 #### DE: t-test
 
 | crispyx method | compared to | Time Δ | Time % |  | Mem Δ | Mem % |   |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| t-test | scanpy t-test | -2.3s | 56.2% | ✅ | -46.8 MB | 70.2% | ✅ |
+| t-test | scanpy t-test | -3.6s | 35.9% | ✅ | +264.7 MB | 267.9% | ❌ |
 
 
 #### DE: Wilcoxon
 
 | crispyx method | compared to | Time Δ | Time % |  | Mem Δ | Mem % |   |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| Wilcoxon | scanpy Wilcoxon | -19.1s | 16.2% | ✅ | -227.7 MB | 45.7% | ✅ |
+| Wilcoxon | scanpy Wilcoxon | -19.0s | 11.9% | ✅ | +62.6 MB | 114.7% | ❌ |
 
 
 #### DE: NB GLM
 
 | crispyx method | compared to | Time Δ | Time % |  | Mem Δ | Mem % |   |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| NB-GLM | edgeR NB-GLM | -75.5s | 20.8% | ✅ | -569.5 MB | 71.1% | ✅ |
-| NB-GLM | pertpy NB-GLM | -7.5s | 72.7% | ✅ | -1119.3 MB | 55.6% | ✅ |
+| NB-GLM | edgeR NB-GLM | -68.2s | 26.1% | ✅ | -1586.1 MB | 19.4% | ✅ |
+| NB-GLM | pertpy NB-GLM | -4.5s | 84.2% | ✅ | -2084.4 MB | 15.5% | ✅ |
 
 
 #### Other
 
 | crispyx method | compared to | Time Δ | Time % |  | Mem Δ | Mem % |   |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| lfcShrink | crispyx lfcShrink (pydeseq2) | +0.0s | 100.1% | ⚠️ | -1.9 MB | 88.9% | ✅ |
-| lfcShrink | pertpy lfcShrink | -27.2s | 8.5% | ✅ | -2497.8 MB | 0.6% | ✅ |
-| lfcShrink (pydeseq2) | pertpy lfcShrink | -27.2s | 8.5% | ✅ | -2496.0 MB | 0.7% | ✅ |
+| lfcShrink | crispyx lfcShrink (pydeseq2) | -0.0s | 68.0% | ✅ | +1.9 MB | 100.6% | ⚠️ |
+| lfcShrink | pertpy lfcShrink | -31.9s | 0.1% | ✅ | -2180.2 MB | 13.0% | ✅ |
+| lfcShrink (pydeseq2) | pertpy lfcShrink | -31.9s | 0.1% | ✅ | -2182.1 MB | 12.9% | ✅ |
 
 
 ### Tool Comparisons
@@ -97,7 +96,7 @@ _Comparisons between external tools._
 
 | package A | method A | package B | method B | Time Δ (A-B) | Time % (A/B) |  | Mem Δ (A-B) | Mem % (A/B) |   |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| edgeR | NB-GLM | pertpy | NB-GLM | +68.0s | 348.9% | ❌ | -549.7 MB | 78.2% | ✅ |
+| edgeR | NB-GLM | pertpy | NB-GLM | +63.7s | 322.1% | ❌ | -498.3 MB | 79.8% | ✅ |
 
 
 ## 3. Accuracy

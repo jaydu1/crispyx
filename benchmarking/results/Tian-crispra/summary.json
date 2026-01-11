@@ -1,7 +1,7 @@
 {
   "adaptive_qc": true,
   "adaptive_qc_mode": "conservative",
-  "average_runtime_seconds": 462.7600816766469,
+  "average_runtime_seconds": 467.6289356951634,
   "categories": [],
   "dependency_errors": [],
   "error_count": 0,
@@ -23,6 +23,7 @@
     "min_cells_per_perturbation": 50,
     "min_genes": 50
   },
+  "recovered_count": 0,
   "standardized_dataset_path": "/home/jinhongd/Streamlining-CRISPR-Screen-Analysis/benchmarking/results/Tian-crispra/.cache/standardized_Tian-crispra.h5ad",
   "status_counts": {
     "success": 10,

@@ -1,7 +1,7 @@
 {
   "adaptive_qc": true,
   "adaptive_qc_mode": "conservative",
-  "average_runtime_seconds": 17.545157091280757,
+  "average_runtime_seconds": 15.337080049339948,
   "categories": [],
   "dependency_errors": [],
   "error_count": 0,
@@ -19,10 +19,10 @@
   "recovered_count": 0,
   "standardized_dataset_path": "/home/jinhongd/Streamlining-CRISPR-Screen-Analysis/benchmarking/results/Adamson_subset/.cache/standardized_Adamson_subset.h5ad",
   "status_counts": {
-    "success": 15
+    "success": 14
   },
-  "success_count": 15,
+  "success_count": 14,
   "success_rate": 1.0,
   "timeout_count": 0,
-  "total_methods": 15
+  "total_methods": 14
 }

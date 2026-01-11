@@ -6,35 +6,35 @@
 
 | Package | Method | Status | Total (s) | Memory (MB) | Cells | Genes |
 | --- | --- | --- | --- | --- | --- | --- |
-| crispyx | QC filter | success | 16.36 | 1577.88 | 21071.0 | 22040.0 |
-| scanpy | QC filter | success | 8.64 | 2315.57 | 21071.0 | 22040.0 |
-| crispyx | pseudobulk (avg log) | success | 29.64 | 1961.57 |  |  |
-| crispyx | pseudobulk | success | 27.41 | 1437.67 |  |  |
+| crispyx | QC filter | success | 13.47 | 2146.7 | 21071.0 | 22040.0 |
+| scanpy | QC filter | success | 8.32 | 2317.14 | 21071.0 | 22040.0 |
+| crispyx | pseudobulk (avg log) | success | 29.08 | 1963.14 |  |  |
+| crispyx | pseudobulk | success | 27.2 | 1437.91 |  |  |
 
 
 ### DE: t-test
 
 | Package | Method | Status | Total (s) | Memory (MB) | Groups |
 | --- | --- | --- | --- | --- | --- |
-| scanpy | t-test | success | 20.23 | 1256.22 | 100 |
-| crispyx | t-test | success | 7.81 | 812.73 | 100 |
+| scanpy | t-test | success | 20.31 | 1259.09 | 100 |
+| crispyx | t-test | success | 5.16 | 355.08 | 100 |
 
 
 ### DE: Wilcoxon
 
 | Package | Method | Status | Total (s) | Memory (MB) | Groups |
 | --- | --- | --- | --- | --- | --- |
-| crispyx | Wilcoxon | success | 23.27 | 1413.09 | 100 |
-| scanpy | Wilcoxon | success | 49.93 | 1775.77 | 100 |
+| crispyx | Wilcoxon | success | 19.75 | 1420.98 | 100 |
+| scanpy | Wilcoxon | success | 56.47 | 1778.31 | 100 |
 
 
 ### DE: NB GLM
 
 | Package | Method | Status | Total (s) | Memory (MB) | Groups |
 | --- | --- | --- | --- | --- | --- |
-| crispyx | NB-GLM | success | 247.54 | 1463.82 | 100.0 |
-| edgeR | NB-GLM | timeout | 3660.11 |  |  |
-| pertpy | NB-GLM | success | 999.44 | 5222.95 | 100.0 |
+| crispyx | NB-GLM | success | 344.24 | 1465.13 | 100.0 |
+| edgeR | NB-GLM | timeout | 3660.1 |  |  |
+| pertpy | NB-GLM | success | 959.83 | 5224.41 | 100.0 |
 
 
 ## 2. Performance Comparison
@@ -47,28 +47,28 @@ _crispyx as baseline. Negative values = crispyx is faster/uses less memory._
 
 | crispyx method | compared to | Time Δ | Time % |  | Mem Δ | Mem % |   |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| QC filter | scanpy QC filter | +7.7s | 189.4% | ❌ | -737.7 MB | 68.1% | ✅ |
+| QC filter | scanpy QC filter | +5.2s | 162.0% | ❌ | -170.4 MB | 92.6% | ⚠️ |
 
 
 #### DE: t-test
 
 | crispyx method | compared to | Time Δ | Time % |  | Mem Δ | Mem % |   |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| t-test | scanpy t-test | -12.4s | 38.6% | ✅ | -443.5 MB | 64.7% | ✅ |
+| t-test | scanpy t-test | -15.2s | 25.4% | ✅ | -904.0 MB | 28.2% | ✅ |
 
 
 #### DE: Wilcoxon
 
 | crispyx method | compared to | Time Δ | Time % |  | Mem Δ | Mem % |   |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| Wilcoxon | scanpy Wilcoxon | -26.7s | 46.6% | ✅ | -362.7 MB | 79.6% | ✅ |
+| Wilcoxon | scanpy Wilcoxon | -36.7s | 35.0% | ✅ | -357.3 MB | 79.9% | ✅ |
 
 
 #### DE: NB GLM
 
 | crispyx method | compared to | Time Δ | Time % |  | Mem Δ | Mem % |   |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| NB-GLM | pertpy NB-GLM | -751.9s | 24.8% | ✅ | -3759.1 MB | 28.0% | ✅ |
+| NB-GLM | pertpy NB-GLM | -615.6s | 35.9% | ✅ | -3759.3 MB | 28.0% | ✅ |
 
 
 ## 3. Accuracy
@@ -86,7 +86,7 @@ _Correlation metrics between crispyx and reference methods. ✅ >0.95, ⚠️ 0.
 
 | crispyx method | compared to | Eff ρ |  | Eff ρₛ |   | Stat ρ |    | Stat ρₛ |     | log-Pval ρ |      | log-Pval ρₛ |       |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| t-test | scanpy t-test | 1.000<br><small>±0.000</small> | ✅ | 1.000<br><small>±0.000</small> | ✅ | 1.000<br><small>±0.000</small> | ✅ | 1.000<br><small>±0.000</small> | ✅ | 1.000<br><small>±0.001</small> | ✅ | 1.000<br><small>±0.000</small> | ✅ |
+| t-test | scanpy t-test | 1.000<br><small>±0.000</small> | ✅ | 1.000<br><small>±0.000</small> | ✅ | - |  | - |  | 1.000<br><small>±0.000</small> | ✅ | 1.000<br><small>±0.000</small> | ✅ |
 
 
 ### DE: Wilcoxon
@@ -113,16 +113,16 @@ _Overlap ratio of top-k DE genes between methods. ✅ >0.7, ⚠️ 0.5-0.7, ❌ 
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | t-test | scanpy t-test | 1.000 | ✅ | 1.000 | ✅ | 1.000 | ✅ |
 | Wilcoxon | scanpy Wilcoxon | 1.000 | ✅ | 1.000 | ✅ | 1.000 | ✅ |
-| NB-GLM | pertpy NB-GLM | 0.520 | ⚠️ | 0.634<br><small>±0.216</small> | ⚠️ | 0.653<br><small>±0.222</small> | ⚠️ |
+| NB-GLM | pertpy NB-GLM | 0.637 | ⚠️ | 0.634 | ⚠️ | 0.653 | ⚠️ |
 
 
 ### P-value Overlap
 
 | crispyx method | compared to | Top-50 |  | Top-100 |   | Top-500 |    |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| t-test | scanpy t-test | 0.940 | ✅ | 0.991<br><small>±0.010</small> | ✅ | 0.996<br><small>±0.005</small> | ✅ |
+| t-test | scanpy t-test | 1.000 | ✅ | 1.000 | ✅ | 1.000 | ✅ |
 | Wilcoxon | scanpy Wilcoxon | 1.000 | ✅ | 1.000 | ✅ | 1.000 | ✅ |
-| NB-GLM | pertpy NB-GLM | 0.040 | ❌ | 0.444<br><small>±0.135</small> | ❌ | 0.516<br><small>±0.152</small> | ⚠️ |
+| NB-GLM | pertpy NB-GLM | 0.410 | ❌ | 0.444 | ❌ | 0.516 | ⚠️ |
 
 
 _Note: Some methods are missing due to errors:_
