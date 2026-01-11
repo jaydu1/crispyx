@@ -19,7 +19,7 @@ DOCKER_BUILDKIT=1 docker build -t crispyx-benchmark -f benchmarking/Dockerfile .
 |------|-------------|
 | `--use-docker` | Run in Docker container |
 | `--build-docker` | Build image before running |
-| `--force` | Re-run all methods (ignore cache) |
+| `--force` | Force re-run. With `--methods`, clears cache for specified methods only (preserves others for reports). Without `--methods`, clears entire cache. |
 | `--clean` | Delete output directory first |
 | `--methods X Y` | Run only specified methods |
 

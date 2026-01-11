@@ -80,6 +80,21 @@ from crispyx.qc import quality_control_summary
 # Import constants from centralized module
 from .constants import CACHE_VERSION, STANDARD_DE_COLUMNS, STATUS_ORDER
 
+# Import cache utilities
+from .cache import (
+    get_expected_output_path,
+    is_scalar_na,
+    make_json_serializable,
+    save_method_result,
+    load_method_result,
+    load_cached_results,
+    validate_and_recover_cache_result,
+    save_cache_config,
+    load_cache_config,
+    invalidate_cache,
+    check_output_exists,
+)
+
 
 # ============================================================================
 # Numba Warm-up for Fair Benchmarking
@@ -1541,428 +1556,21 @@ class DifferentialComparisonSummary:
         return self.metrics.get("pvalue_max_abs_diff")
 
 
-def _get_expected_output_path(method_name: str, output_dir: Path, data_name: str = None) -> Path | None:
-    """Get the expected output path for a benchmark method.
-    
-    Parameters
-    ----------
-    method_name : str
-        Name of the benchmark method
-    output_dir : Path
-        Output directory for the dataset
-    data_name : str, optional
-        Data name prefix (e.g., 'qc', 'de', 'pb') - not used in current implementation
-        
-    Returns
-    -------
-    Path | None
-        Expected output file path, or None if cannot be determined
-    """
-    # Phase-based directories
-    preprocessing_dir = output_dir / "preprocessing"
-    de_dir = output_dir / "de"
-    
-    # crispyx methods with module prefix
-    if method_name == "crispyx_qc_filtered":
-        return preprocessing_dir / "crispyx_qc_filtered.h5ad"
-    elif method_name == "crispyx_pb_avg_log":
-        return preprocessing_dir / "crispyx_pb_avg_log.h5ad"
-    elif method_name == "crispyx_pb_pseudobulk":
-        return preprocessing_dir / "crispyx_pb_pseudobulk.h5ad"
-    elif method_name == "crispyx_de_t_test":
-        return de_dir / "crispyx_de_t_test.h5ad"
-    elif method_name == "crispyx_de_wilcoxon":
-        return de_dir / "crispyx_de_wilcoxon.h5ad"
-    elif method_name == "crispyx_de_nb_glm":
-        return de_dir / "crispyx_de_nb_glm.h5ad"
-    elif method_name == "crispyx_de_nb_glm_pydeseq2":
-        return de_dir / "crispyx_de_nb_glm_pydeseq2_nb_glm.h5ad"
-    elif method_name == "crispyx_de_lfcshrink":
-        return de_dir / "crispyx_de_nb_glm_shrunk.h5ad"
-    elif method_name == "crispyx_de_lfcshrink_pydeseq2":
-        return de_dir / "crispyx_de_nb_glm_shrunk_pydeseq2.h5ad"
-    
-    # Scanpy methods with module prefix
-    elif method_name == "scanpy_qc_filtered":
-        return preprocessing_dir / "scanpy_qc_filtered.h5ad"
-    elif method_name == "scanpy_de_t_test":
-        return de_dir / "scanpy_de_t_test.h5ad"
-    elif method_name == "scanpy_de_wilcoxon":
-        return de_dir / "scanpy_de_wilcoxon.h5ad"
-    
-    # Reference tool CSV outputs
-    elif method_name == "edger_de_glm":
-        return de_dir / "edger_de_glm.csv"
-    elif method_name == "pertpy_de_pydeseq2":
-        return de_dir / "pertpy_de_pydeseq2.csv"
-    elif method_name == "pertpy_de_lfcshrink":
-        return de_dir / "pertpy_de_pydeseq2_shrunk.csv"
-    
-    return None
-
-
-def _is_scalar_na(value: Any) -> bool:
-    """Check if a value is NA/NaN, handling arrays properly.
-    
-    For arrays, returns False (arrays are not scalar NA values).
-    For scalars, returns True if NA/NaN/None.
-    """
-    # Handle None explicitly
-    if value is None:
-        return True
-    # Handle numpy arrays - they are not scalar NA
-    if isinstance(value, np.ndarray):
-        return False
-    # Handle pandas Series/DataFrame - not scalar NA
-    if hasattr(value, '__len__') and hasattr(value, 'dtype'):
-        return False
-    # Try pandas isna for scalars
-    try:
-        result = pd.isna(value)
-        # If result is a scalar bool, return it
-        if isinstance(result, (bool, np.bool_)):
-            return bool(result)
-        # If result is array-like, this wasn't a scalar - return False
-        return False
-    except (TypeError, ValueError):
-        return False
-
-
-def _make_json_serializable(value: Any) -> Any:
-    """Convert a value to a JSON-serializable type.
-    
-    Handles numpy arrays, numpy scalars, pandas types, Path objects, etc.
-    """
-    # Handle None
-    if value is None:
-        return None
-    
-    # Handle numpy arrays - convert to list
-    if isinstance(value, np.ndarray):
-        return value.tolist()
-    
-    # Handle numpy scalar types
-    if isinstance(value, (np.integer,)):
-        return int(value)
-    if isinstance(value, (np.floating,)):
-        return float(value)
-    if isinstance(value, (np.bool_,)):
-        return bool(value)
-    
-    # Handle Path objects
-    if isinstance(value, Path):
-        return str(value)
-    
-    # Handle pandas NA types
-    if pd.isna(value) if not hasattr(value, '__len__') else False:
-        return None
-    
-    # Handle lists recursively
-    if isinstance(value, list):
-        return [_make_json_serializable(v) for v in value]
-    
-    # Handle dicts recursively
-    if isinstance(value, dict):
-        return {k: _make_json_serializable(v) for k, v in value.items()}
-    
-    # Return as-is for standard JSON types (str, int, float, bool)
-    return value
-
-
-def _save_method_result(method_name: str, row_dict: Dict[str, Any], output_dir: Path) -> None:
-    """Save individual method benchmark result to cache.
-    
-    Parameters
-    ----------
-    method_name : str
-        Name of the benchmark method
-    row_dict : Dict[str, Any]
-        Dictionary containing benchmark results (status, runtime, memory, etc.)
-    output_dir : Path
-        Output directory for the dataset
-    """
-    cache_dir = output_dir / ".benchmark_cache"
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    
-    cache_file = cache_dir / f"{method_name}.json"
-    temp_file = cache_dir / f".{method_name}.json.tmp"
-    
-    try:
-        # Convert non-serializable types to JSON-compatible formats
-        serializable_dict = {}
-        for key, value in row_dict.items():
-            serializable_dict[key] = _make_json_serializable(value)
-        
-        # Atomic write: write to temp file, then rename
-        with temp_file.open('w') as f:
-            json.dump(serializable_dict, f, indent=2, sort_keys=True)
-        temp_file.rename(cache_file)
-    except Exception as exc:
-        # Clean up temp file on error
-        if temp_file.exists():
-            temp_file.unlink()
-        # Log warning but don't fail the benchmark
-        print(f"Warning: Failed to save cache for {method_name}: {exc}")
-
-
-def _load_method_result(method_name: str, output_dir: Path) -> Optional[Dict[str, Any]]:
-    """Load individual method benchmark result from cache.
-    
-    Parameters
-    ----------
-    method_name : str
-        Name of the benchmark method
-    output_dir : Path
-        Output directory for the dataset
-        
-    Returns
-    -------
-    Optional[Dict[str, Any]]
-        Cached result dictionary, or None if cache doesn't exist or is corrupted
-    """
-    cache_file = output_dir / ".benchmark_cache" / f"{method_name}.json"
-    
-    if not cache_file.exists():
-        return None
-    
-    try:
-        with cache_file.open('r') as f:
-            return json.load(f)
-    except (json.JSONDecodeError, OSError) as exc:
-        print(f"Warning: Corrupted cache file for {method_name}, will re-run: {exc}")
-        # Delete corrupted cache file
-        try:
-            cache_file.unlink()
-        except Exception:
-            pass
-        return None
-
-
-def _load_cached_results(output_dir: Path) -> List[Dict[str, Any]]:
-    """Load all cached benchmark results.
-    
-    This also validates that timeout/error results are still accurate by checking
-    if output files were created after the cache was written (e.g., if a Docker
-    container continued running after being marked as timed out).
-    
-    Parameters
-    ----------
-    output_dir : Path
-        Output directory for the dataset
-        
-    Returns
-    -------
-    List[Dict[str, Any]]
-        List of cached result dictionaries
-    """
-    cache_dir = output_dir / ".benchmark_cache"
-    if not cache_dir.exists():
-        return []
-    
-    cached_results = []
-    for cache_file in cache_dir.glob("*.json"):
-        # Skip config.json, temp files, and comparison cache files
-        if (cache_file.name in ("config.json", ".config.json.tmp") or 
-            cache_file.name.startswith(".") or
-            cache_file.name.endswith("_comparison.json")):
-            continue
-        
-        try:
-            with cache_file.open('r') as f:
-                result = json.load(f)
-                # Only add results that have a method field (exclude comparison metadata)
-                if "method" in result:
-                    # Check if the cache shows an error/timeout but the output file exists
-                    # This can happen if Docker container continued after subprocess timeout
-                    result = _validate_and_recover_cache_result(result, cache_file, output_dir)
-                    cached_results.append(result)
-        except (json.JSONDecodeError, OSError) as exc:
-            print(f"Warning: Skipping corrupted cache file {cache_file.name}: {exc}")
-            continue
-    
-    return cached_results
-
-
-def _validate_and_recover_cache_result(
-    result: Dict[str, Any], 
-    cache_file: Path, 
-    output_dir: Path
-) -> Dict[str, Any]:
-    """Validate cache result and recover status if output file exists.
-    
-    If the cache shows timeout/error but the output file exists and was modified
-    after the cache was written, update the status to 'recovered' and note that
-    the execution actually succeeded despite the timeout.
-    
-    Parameters
-    ----------
-    result : Dict[str, Any]
-        The cached result dictionary
-    cache_file : Path
-        Path to the cache file
-    output_dir : Path
-        Output directory for the dataset
-        
-    Returns
-    -------
-    Dict[str, Any]
-        Updated result dictionary (possibly with corrected status)
-    """
-    method_name = result.get("method")
-    status = result.get("status")
-    
-    # Only check for recovery if the status indicates failure
-    if status not in ("timeout", "error", "memory_limit"):
-        return result
-    
-    # Check if output file exists
-    expected_path = _get_expected_output_path(method_name, output_dir)
-    if expected_path is None or not expected_path.exists():
-        return result
-    
-    # Check if output file was modified after cache file was written
-    try:
-        cache_mtime = cache_file.stat().st_mtime
-        output_mtime = expected_path.stat().st_mtime
-        
-        if output_mtime > cache_mtime:
-            # Output was created after the cache entry - the method actually completed!
-            print(f"  🔧 Recovering {method_name}: output exists despite '{status}' cache status")
-            
-            # Update the result to reflect successful completion
-            recovered_result = result.copy()
-            recovered_result["status"] = "recovered"
-            recovered_result["original_status"] = status
-            recovered_result["original_error"] = result.get("error")
-            recovered_result["error"] = None
-            recovered_result["result_path"] = str(expected_path)
-            
-            # Try to update the cache file with the corrected status
-            try:
-                _save_method_result(method_name, recovered_result, output_dir)
-            except Exception:
-                pass  # Don't fail if we can't update cache
-            
-            return recovered_result
-    except Exception:
-        pass  # On any error, just return the original result
-    
-    return result
-
-
-def _save_cache_config(output_dir: Path, qc_params: Optional[Dict[str, Any]], standardized_path: str) -> None:
-    """Save cache configuration for validation.
-    
-    Parameters
-    ----------
-    output_dir : Path
-        Output directory for the dataset
-    qc_params : Optional[Dict[str, Any]]
-        QC parameters used (or None if adaptive)
-    standardized_path : str
-        Path to standardized dataset
-    """
-    cache_dir = output_dir / ".benchmark_cache"
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    
-    config_file = cache_dir / "config.json"
-    temp_file = cache_dir / ".config.json.tmp"
-    
-    config = {
-        "cache_version": CACHE_VERSION,
-        "qc_params": qc_params,
-        "standardized_dataset_path": standardized_path,
-        "timestamp": time.time(),
-    }
-    
-    try:
-        with temp_file.open('w') as f:
-            json.dump(config, f, indent=2, sort_keys=True)
-        temp_file.rename(config_file)
-    except Exception as exc:
-        if temp_file.exists():
-            temp_file.unlink()
-        print(f"Warning: Failed to save cache config: {exc}")
-
-
-def _load_cache_config(output_dir: Path) -> Optional[Dict[str, Any]]:
-    """Load cache configuration.
-    
-    Parameters
-    ----------
-    output_dir : Path
-        Output directory for the dataset
-        
-    Returns
-    -------
-    Optional[Dict[str, Any]]
-        Cached config, or None if doesn't exist or is corrupted
-    """
-    config_file = output_dir / ".benchmark_cache" / "config.json"
-    
-    if not config_file.exists():
-        return None
-    
-    try:
-        with config_file.open('r') as f:
-            return json.load(f)
-    except (json.JSONDecodeError, OSError):
-        return None
-
-
-def _invalidate_cache(output_dir: Path, reason: str = "") -> None:
-    """Clear the benchmark cache directory.
-    
-    Parameters
-    ----------
-    output_dir : Path
-        Output directory for the dataset
-    reason : str
-        Reason for invalidation (for logging)
-    """
-    cache_dir = output_dir / ".benchmark_cache"
-    
-    if not cache_dir.exists():
-        return
-    
-    if reason:
-        print(f"  Invalidating cache: {reason}")
-    
-    # Remove all files in cache directory
-    for cache_file in cache_dir.glob("*"):
-        try:
-            if cache_file.is_file():
-                cache_file.unlink()
-        except Exception as exc:
-            print(f"Warning: Failed to remove cache file {cache_file.name}: {exc}")
-
-
-def _check_output_exists(method_name: str, output_dir: Path) -> bool:
-    """Check if output file for a method already exists.
-    
-    Parameters
-    ----------
-    method_name : str
-        Name of the benchmark method
-    output_dir : Path
-        Output directory for the dataset
-        
-    Returns
-    -------
-    bool
-        True if output exists and is non-empty, or if valid cache exists
-    """
-    # First check if data output exists
-    expected_path = _get_expected_output_path(method_name, output_dir)
-    if expected_path is not None and expected_path.exists():
-        # Check file is non-empty (at least 1KB for h5ad files, any size for json)
-        min_size = 1 if expected_path.suffix == '.json' else 1024
-        if expected_path.stat().st_size >= min_size:
-            return True
-    
-    # If no data output, check if cached benchmark result exists
-    cached_result = _load_method_result(method_name, output_dir)
-    return cached_result is not None
+# ============================================================================
+# Cache function references removed - now imported from .cache module
+# The following functions are now imported from benchmarking.tools.cache:
+#   - get_expected_output_path (was _get_expected_output_path)
+#   - is_scalar_na (was _is_scalar_na)
+#   - make_json_serializable (was _make_json_serializable)
+#   - save_method_result (was _save_method_result)
+#   - load_method_result (was _load_method_result)
+#   - load_cached_results (was _load_cached_results)
+#   - validate_and_recover_cache_result (was _validate_and_recover_cache_result)
+#   - save_cache_config (was _save_cache_config)
+#   - load_cache_config (was _load_cache_config)
+#   - invalidate_cache (was _invalidate_cache)
+#   - check_output_exists (was _check_output_exists)
+# ============================================================================
 
 
 def _normalise_path(path: str | Path | None, context: Mapping[str, Any]) -> str | None:
@@ -4034,6 +3642,8 @@ class DockerRunner:
                 "-v", f"{self.workspace_root}:/workspace:rw",
                 # Mount temp directory for IPC
                 "-v", f"{temp_dir}:/ipc:rw",
+                # Mount host timezone so container timestamps match host time
+                "-v", "/etc/localtime:/etc/localtime:ro",
                 # Environment variables
                 "-e", f"NUMBA_NUM_THREADS={self.n_cores}",
                 "-e", f"OMP_NUM_THREADS={self.n_cores}",
@@ -4961,7 +4571,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "-f", "--force",
         action="store_true",
-        help="Force re-run all methods by clearing the .benchmark_cache directory",
+        help="Force re-run methods. When used with --methods, only clears cache for specified methods (preserving others for reports). Otherwise clears entire cache.",
     )
     parser.add_argument(
         "--clear-results", "--clean",
@@ -5283,7 +4893,7 @@ def _run_single_benchmark(
         }
     
     # Check cache validity and invalidate if needed
-    cached_config = _load_cache_config(config.output_dir)
+    cached_config = load_cache_config(config.output_dir)
     should_invalidate = False
     invalidate_reason = ""
     
@@ -5306,10 +4916,10 @@ def _run_single_benchmark(
             invalidate_reason = "standardized dataset path changed"
     
     if should_invalidate:
-        _invalidate_cache(config.output_dir, invalidate_reason)
+        invalidate_cache(config.output_dir, invalidate_reason)
     
     # Save current config to cache
-    _save_cache_config(config.output_dir, qc_params_used, str(standardized_path))
+    save_cache_config(config.output_dir, qc_params_used, str(standardized_path))
 
     available_methods = create_benchmark_suite(
         dataset_path=standardized_path,
@@ -5476,9 +5086,9 @@ def _run_single_benchmark(
         method = available_methods[name]
         
         # Check if output already exists (for resuming interrupted benchmarks)
-        if config.skip_existing and _check_output_exists(method.name, config.output_dir):
+        if config.skip_existing and check_output_exists(method.name, config.output_dir):
             # Try to load cached benchmark metadata
-            cached_result = _load_method_result(method.name, config.output_dir)
+            cached_result = load_method_result(method.name, config.output_dir)
             
             if cached_result is not None:
                 # Use cached result - mark as loaded from cache for accurate summary
@@ -5516,7 +5126,7 @@ def _run_single_benchmark(
                 if not config.quiet:
                     print(f"  ⏭️  Skipping {method.name} (output exists, recovering metadata)")
                 
-                existing_path = _get_expected_output_path(method.name, config.output_dir)
+                existing_path = get_expected_output_path(method.name, config.output_dir)
                 row = {
                     "method": method.name,
                     "description": method.description,
@@ -5566,7 +5176,7 @@ def _run_single_benchmark(
                 rows.append(row)
                 
                 # Save minimal cache entry to avoid repeated "no metrics" warnings
-                _save_method_result(method.name, row, config.output_dir)
+                save_method_result(method.name, row, config.output_dir)
                 
                 # Update progress bar for skipped items (show recovered stats if available)
                 if show_progress:
@@ -5620,10 +5230,10 @@ def _run_single_benchmark(
         actually_executed.add(method.name)
         
         # Save result to cache immediately after completion
-        _save_method_result(method.name, row, config.output_dir)
+        save_method_result(method.name, row, config.output_dir)
     
     # Load any cached results that weren't re-run and merge with new results
-    cached_results = _load_cached_results(config.output_dir)
+    cached_results = load_cached_results(config.output_dir)
     methods_in_rows = {row["method"] for row in rows}
     
     # Add cached results for methods that weren't processed this run
@@ -5773,15 +5383,42 @@ def main() -> None:
                 print(f"Clearing output directory: {config.output_dir}")
                 shutil.rmtree(config.output_dir)
     
-    # Handle --force flag (clear cache to force re-run of all methods)
-    # Also sets skip_existing=False for all configs to ensure methods are re-run
+    # Handle --force flag (force re-run of methods, selectively clearing cache)
+    # When --methods is specified, only clear cache for those specific methods
+    # When --methods is NOT specified, clear entire cache to force re-run of all methods
     if hasattr(args, 'force') and args.force:
         for config in configs:
             cache_dir = config.output_dir / ".benchmark_cache"
             if cache_dir.exists():
-                import shutil
-                print(f"Clearing benchmark cache: {cache_dir}")
-                shutil.rmtree(cache_dir)
+                if args.methods is not None and len(args.methods) > 0:
+                    # Selective cache clearing: only clear cache for specified methods
+                    # This preserves cached results for other methods (used in reports)
+                    methods_to_clear = set(args.methods)
+                    cleared_count = 0
+                    for cache_file in cache_dir.glob("*.json"):
+                        # Skip config.json and temp files
+                        if cache_file.name in ("config.json",) or cache_file.name.startswith("."):
+                            continue
+                        # Extract method name from cache filename (e.g., "crispyx_de_nb_glm.json")
+                        method_name = cache_file.stem
+                        # Check if this method should be cleared
+                        # Also check for prefix matches (e.g., "crispyx" matches "crispyx_de_nb_glm")
+                        should_clear = method_name in methods_to_clear or any(
+                            method_name.startswith(f"{prefix}_") for prefix in methods_to_clear
+                        )
+                        if should_clear:
+                            try:
+                                cache_file.unlink()
+                                cleared_count += 1
+                            except Exception as exc:
+                                print(f"Warning: Failed to clear cache for {method_name}: {exc}")
+                    if cleared_count > 0:
+                        print(f"Cleared cache for {cleared_count} method(s) in {cache_dir}")
+                else:
+                    # No specific methods specified: clear entire cache
+                    import shutil
+                    print(f"Clearing entire benchmark cache: {cache_dir}")
+                    shutil.rmtree(cache_dir)
             # When force is specified, disable skip_existing unless explicitly set
             if args.skip_existing is None:
                 config.skip_existing = False

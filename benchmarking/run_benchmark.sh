@@ -47,6 +47,7 @@ show_usage() {
     echo "  --build-docker         Build Docker image before running"
     echo "  --force                Force re-run all methods (ignore cache)"
     echo "  --clean                Delete output directory before running"
+    echo "  --methods METHODS      Comma-separated list of methods to run (e.g., crispyx,pydeseq2)"
     echo "  -h, --help             Show this help message"
     echo ""
     echo "Examples:"
@@ -55,6 +56,7 @@ show_usage() {
     echo "  $0 --use-docker --build-docker config/*.yaml   # Build and run all"
     echo "  $0 config/Adamson.yaml config/Frangieh.yaml    # Multiple datasets"
     echo "  $0 config/*.yaml                               # All datasets"
+    echo "  $0 --methods crispyx,pydeseq2 config/*.yaml    # Run specific methods only"
 }
 
 # Parse arguments
@@ -85,6 +87,10 @@ while [[ $# -gt 0 ]]; do
         --clean)
             EXTRA_ARGS+=("--clean")
             shift
+            ;;
+        --methods)
+            EXTRA_ARGS+=("--methods" "$2")
+            shift 2
             ;;
         -h|--help)
             show_usage
