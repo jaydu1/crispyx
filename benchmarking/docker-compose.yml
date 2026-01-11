@@ -42,6 +42,9 @@ services:
       
       # Mount source for development (optional - comment out for production)
       - ../src:/workspace/src:ro
+      
+      # Mount host timezone so container timestamps match host time
+      - /etc/localtime:/etc/localtime:ro
     
     # Working directory
     working_dir: /workspace
@@ -72,6 +75,8 @@ services:
       - ../benchmarking:/workspace/benchmarking:rw
       - ../src:/workspace/src:rw
       - ../tests:/workspace/tests:rw
+      # Mount host timezone so container timestamps match host time
+      - /etc/localtime:/etc/localtime:ro
     
     working_dir: /workspace
     
