@@ -89,7 +89,10 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         --methods)
-            EXTRA_ARGS+=("--methods" "$2")
+            # Convert comma-separated to space-separated for Python argparse
+            METHODS_STR="${2//,/ }"
+            # shellcheck disable=SC2206
+            EXTRA_ARGS+=("--methods" $METHODS_STR)
             shift 2
             ;;
         -h|--help)

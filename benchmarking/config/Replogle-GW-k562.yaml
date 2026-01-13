@@ -14,7 +14,7 @@ qc_params: null  # Will be calculated adaptively based on data distribution
 
 # Resource limits
 resource_limits:
-  time_limit: 36000  # 10 hours per method
+  time_limit: 129600  # 36 hours per method (for NB-GLM on large dataset)
   memory_limit: 128.0  # GB per method
 
 # Parallelization configuration
@@ -25,8 +25,10 @@ parallel_config:
 force_restandardize: false  # Set to true to regenerate standardized files
 adaptive_qc_mode: conservative  # or 'aggressive'
 
-# Methods to run (null = run all available methods)
-methods_to_run: null
+# Methods to run - only crispyx NB-GLM to validate timing estimates
+methods_to_run:
+  # - crispyx_qc_filtered      # Needed for preprocessing
+  - crispyx_de_nb_glm        # Main method to benchmark
 
 # Progress and output options
 show_progress: true

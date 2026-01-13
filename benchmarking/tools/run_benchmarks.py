@@ -868,7 +868,7 @@ def run_nb_glm_base(
     control_label: str,
     output_dir: Path,
     n_jobs: int | None = None,
-    size_factor_method: str = "deseq2",
+    size_factor_method: str = "sparse",
     scale_size_factors: bool = False,
     gene_name_column: str | None = None,
     use_control_cache: bool = True,
@@ -898,7 +898,10 @@ def run_nb_glm_base(
     n_jobs
         Number of parallel jobs
     size_factor_method
-        Method for size factor calculation
+        Method for size factor calculation. Default "sparse" is optimal for
+        single-cell data. The "deseq2" method (genes expressed in ALL cells)
+        provides no benefit for sparse scRNA-seq since it falls back to "sparse"
+        when too few genes qualify.
     scale_size_factors
         Whether to scale size factors
     gene_name_column
