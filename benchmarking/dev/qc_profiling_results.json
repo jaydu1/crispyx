@@ -1,25 +1,25 @@
 {
-  "timestamp": "2026-01-11T13:34:23.920054",
+  "timestamp": "2026-01-11T14:38:47.034125",
   "results": [
     {
       "method": "scanpy",
       "substeps": {
-        "load": 0.09743866487406194,
-        "ensure_csr": 4.061614163219929e-05,
-        "filter_cells": 0.2725462911184877,
-        "filter_perturbations": 0.08678750786930323,
-        "filter_genes": 0.12643929501064122,
-        "save": 0.060917198890820146
+        "load": 0.04583210404962301,
+        "ensure_csr": 1.4021061360836029e-05,
+        "filter_cells": 0.05879157199524343,
+        "filter_perturbations": 0.01854017307050526,
+        "filter_genes": 0.05993084888905287,
+        "save": 0.05177501309663057
       },
       "memory_mb": {
-        "after_load": 53.09375,
-        "after_filter_cells": 101.99609375,
-        "after_filter_pert": 147.3828125,
-        "after_filter_genes": 102.74609375,
-        "after_save": 102.74609375
+        "after_load": 53.375,
+        "after_filter_cells": 104.0859375,
+        "after_filter_pert": 149.94140625,
+        "after_filter_genes": 102.41015625,
+        "after_save": 102.41015625
       },
-      "total_seconds": 0.6441695739049464,
-      "peak_memory_mb": 147.3828125,
+      "total_seconds": 0.23488373216241598,
+      "peak_memory_mb": 149.94140625,
       "cells_kept": 1716,
       "genes_kept": 9238,
       "dataset": "Adamson_subset"
@@ -27,25 +27,14 @@
     {
       "method": "crispyx",
       "substeps": {
-        "read_metadata": 0.02318857191130519,
-        "filter_cells_pass1": 0.20611464697867632,
-        "filter_perturbations": 0.020004213089123368,
-        "gene_count_delta": 0.00012421212159097195,
-        "delta_mode": "none",
-        "filter_genes_pass2": 0.2208559811115265,
-        "storage_mode": "sparse",
-        "write_pass3": 0.14602567511610687
+        "total_qc": 0.25260906596668065
       },
       "memory_mb": {
-        "after_metadata": 1.875,
-        "after_filter_cells": 54.63671875,
-        "after_filter_pert": 54.63671875,
-        "after_delta": 54.63671875,
-        "after_gene_filter": 191.9375,
-        "after_write": 124.83984375
+        "after_qc": 238.3203125
       },
-      "total_seconds": 0.6163133003283292,
-      "peak_memory_mb": 191.9375,
+      "storage_format": "csr",
+      "total_seconds": 0.25260906596668065,
+      "peak_memory_mb": 238.3203125,
       "cells_kept": 1716,
       "genes_kept": 9238,
       "dataset": "Adamson_subset"
@@ -53,22 +42,22 @@
     {
       "method": "scanpy",
       "substeps": {
-        "load": 0.7320279150735587,
-        "ensure_csr": 1.9220451090950519,
-        "filter_cells": 1.756663620006293,
-        "filter_perturbations": 1.0610788811463863,
-        "filter_genes": 2.6159181299153715,
-        "save": 0.3698735840152949
+        "load": 0.2592338980175555,
+        "ensure_csr": 0.9401942489203066,
+        "filter_cells": 0.5465776328928769,
+        "filter_perturbations": 0.25582160614430904,
+        "filter_genes": 0.7569819299969822,
+        "save": 0.2845008030999452
       },
       "memory_mb": {
-        "after_load": 371.09765625,
-        "after_filter_cells": 371.88671875,
-        "after_filter_pert": 815.08203125,
-        "after_filter_genes": 373.04296875,
-        "after_save": 373.04296875
+        "after_load": 441.96484375,
+        "after_filter_cells": 444.375,
+        "after_filter_pert": 887.203125,
+        "after_filter_genes": 445.16015625,
+        "after_save": 445.16015625
       },
-      "total_seconds": 8.457607239251956,
-      "peak_memory_mb": 815.08203125,
+      "total_seconds": 3.0433101190719754,
+      "peak_memory_mb": 887.203125,
       "cells_kept": 20720,
       "genes_kept": 5931,
       "dataset": "Tian-crispra"
@@ -76,25 +65,14 @@
     {
       "method": "crispyx",
       "substeps": {
-        "read_metadata": 0.03454511612653732,
-        "filter_cells_pass1": 9.443290279014036,
-        "filter_perturbations": 0.03674778784625232,
-        "gene_count_delta": 0.00013381615281105042,
-        "delta_mode": "none",
-        "filter_genes_pass2": 11.97798849386163,
-        "storage_mode": "sparse",
-        "write_pass3": 0.9081976159941405
+        "total_qc": 3.0155368889681995
       },
       "memory_mb": {
-        "after_metadata": 0.0,
-        "after_filter_cells": 4.55859375,
-        "after_filter_pert": 4.55859375,
-        "after_delta": 4.55859375,
-        "after_gene_filter": 826.203125,
-        "after_write": 464.2109375
+        "after_qc": 1332.0234375
       },
-      "total_seconds": 22.400903108995408,
-      "peak_memory_mb": 826.203125,
+      "storage_format": "csc",
+      "total_seconds": 3.0155368889681995,
+      "peak_memory_mb": 1332.0234375,
       "cells_kept": 20720,
       "genes_kept": 5931,
       "dataset": "Tian-crispra"
