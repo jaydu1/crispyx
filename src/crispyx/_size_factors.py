@@ -136,7 +136,11 @@ def _median_of_ratios_size_factors(
 
 
 def _deseq2_style_size_factors(
-    path: str | Path, *, chunk_size: int = 256, scale: bool = True
+    path: str | Path,
+    *,
+    chunk_size: int = 256,
+    scale: bool = True,
+    early_termination_threshold: int = 10,
 ) -> np.ndarray:
     """Compute DESeq2-style size factors using only genes expressed in all cells.
     
@@ -150,6 +154,10 @@ def _deseq2_style_size_factors(
     samples, but may have issues with very sparse single-cell data where few genes
     are expressed in all cells.
     
+    **Optimization (2026-01-13)**: The all_expressed check is now vectorized using
+    sparse column operations (O(n_genes) instead of O(n_cells × n_genes)), with
+    early termination when too few genes remain after initial chunks.
+    
     Parameters
     ----------
     path
@@ -158,6 +166,9 @@ def _deseq2_style_size_factors(
         Number of cells to process per chunk.
     scale
         If True, rescale size factors so their geometric mean equals 1.
+    early_termination_threshold
+        If fewer than this many genes remain after processing a chunk,
+        fall back to sparse method immediately. Default 10.
         
     Returns
     -------
@@ -171,27 +182,36 @@ def _deseq2_style_size_factors(
     n_genes = backed.n_vars
     
     # First pass: find genes expressed in all cells
+    # VECTORIZED: Use sparse column counts instead of O(n_cells × n_genes) loop
+    # A gene is expressed in ALL cells of a chunk iff its nnz == chunk_n_rows
     all_expressed = np.ones(n_genes, dtype=bool)
+    cells_processed = 0
     try:
         for _, block in iter_matrix_chunks(
             backed, axis=0, chunk_size=chunk_size, convert_to_dense=False
         ):
             csr = sp.csr_matrix(block)
-            # Check which genes have zero counts in this chunk
-            gene_has_nonzero = np.zeros(n_genes, dtype=bool)
-            if csr.nnz > 0:
-                gene_indices = csr.indices
-                gene_has_nonzero[gene_indices] = True
-            # Genes that have zeros in any chunk are not "all expressed"
-            genes_with_zeros = ~gene_has_nonzero
-            # For each row in chunk, check if gene has zero
-            for row_idx in range(csr.shape[0]):
-                start = csr.indptr[row_idx]
-                end = csr.indptr[row_idx + 1]
-                row_gene_indices = set(csr.indices[start:end])
-                for gene_idx in range(n_genes):
-                    if gene_idx not in row_gene_indices:
-                        all_expressed[gene_idx] = False
+            chunk_n_rows = csr.shape[0]
+            cells_processed += chunk_n_rows
+            
+            # VECTORIZED: Count non-zeros per gene (column) in O(nnz + n_genes) time
+            # Convert to CSC for efficient column access
+            csc = csr.tocsc()
+            nnz_per_gene = np.diff(csc.indptr)  # O(n_genes)
+            
+            # Gene is NOT expressed in all cells of this chunk if nnz < chunk_n_rows
+            genes_missing_in_chunk = nnz_per_gene < chunk_n_rows
+            all_expressed[genes_missing_in_chunk] = False
+            
+            # EARLY TERMINATION: If too few genes remain, fall back immediately
+            n_remaining = all_expressed.sum()
+            if n_remaining < early_termination_threshold:
+                logger.warning(
+                    f"Only {n_remaining} genes expressed in all cells after "
+                    f"{cells_processed:,}/{n_cells:,} cells. Falling back to sparse method."
+                )
+                backed.file.close()
+                return _median_of_ratios_size_factors(path, chunk_size=chunk_size, scale=scale)
     finally:
         backed.file.close()
     

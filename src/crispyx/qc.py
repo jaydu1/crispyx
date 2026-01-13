@@ -18,6 +18,7 @@ from .data import (
     _ensure_csr,
     calculate_optimal_chunk_size,
     ensure_gene_symbol_column,
+    get_matrix_storage_format,
     is_dense_storage,
     iter_matrix_chunks,
     read_backed,
@@ -625,97 +626,332 @@ def _filter_genes_dense_optimized(
     )
 
 
-def quality_control_summary(
+def _qc_in_memory(
     path: str | Path,
     *,
-    min_genes: int = 100,
-    min_cells_per_perturbation: int = 50,
-    min_cells_per_gene: int = 100,
+    min_genes: int,
+    min_cells_per_perturbation: int,
+    min_cells_per_gene: int,
     perturbation_column: str,
-    control_label: str | None = None,
-    gene_name_column: str | None = None,
-    chunk_size: int | None = None,
-    memory_limit_gb: float | None = None,
-    output_dir: str | Path | None = None,
-    data_name: str | None = None,
-    use_chunk_cache: bool = True,
-    delta_threshold: float = 0.3,
+    control_label: str,
+    gene_name_column: str | None,
+    output_path: Path,
 ) -> QualityControlResult:
-    """Run the full quality-control pipeline and persist the filtered AnnData object.
+    """Fast in-memory QC for small datasets (Option A).
     
-    This optimized version uses:
-    1. Fused cell+gene counting in Pass 1 (computes both genes-per-cell and
-       cells-per-gene in a single matrix scan)
-    2. Delta adjustment for gene counts after perturbation filtering (only
-       re-scans removed cells if they represent < delta_threshold of total)
-    3. Disk caching of CSR chunks to eliminate the write-phase matrix re-read
-    
-    Cache files use uncompressed np.savez (~2GB disk for 300K cells).
+    Loads entire dataset into memory, processes like Scanpy, and saves.
+    This is the fastest approach for datasets that fit in RAM.
     
     Parameters
     ----------
     path
         Path to h5ad file.
     min_genes
-        Minimum number of expressed genes per cell.
+        Minimum genes per cell.
     min_cells_per_perturbation
-        Minimum number of cells required per perturbation.
+        Minimum cells per perturbation.
     min_cells_per_gene
-        Minimum number of cells expressing each gene.
+        Minimum cells expressing each gene.
     perturbation_column
         Column in obs containing perturbation labels.
     control_label
-        Label identifying control cells. If None, auto-detected.
+        Control label (already resolved).
     gene_name_column
         Column in var containing gene names.
-    chunk_size
-        Number of cells to process per chunk. If None, automatically
-        calculated based on available memory.
-    memory_limit_gb
-        Optional memory limit in GB for chunk size calculation.
-        Only used when chunk_size is None.
-    output_dir
-        Directory for output files.
-    data_name
-        Base name for output files.
-    use_chunk_cache
-        If True, cache CSR chunk data to disk during gene filtering to
-        avoid re-reading the matrix during the write phase. Disable for
-        low-disk environments. Default True.
-    delta_threshold
-        Threshold for delta adjustment. If removed cells represent less
-        than this fraction of filtered cells, use delta adjustment instead
-        of full recompute. Default 0.3 (30%).
+    output_path
+        Path for output h5ad file.
         
     Returns
     -------
     QualityControlResult
-        Dataclass containing masks, filtered AnnData, and QC statistics.
+        QC result with masks and filtered AnnData.
     """
+    import anndata as ad
+    
+    logger.debug("Using in-memory QC path (small dataset)")
+    
+    # Load entire dataset
+    adata = ad.read_h5ad(path)
+    original_n_obs = adata.n_obs
+    original_n_vars = adata.n_vars
+    
+    # Convert to CSR if needed (handles CSC)
+    if sp.issparse(adata.X) and not sp.isspmatrix_csr(adata.X):
+        adata.X = adata.X.tocsr()
+    
+    # Get gene names before any filtering
+    gene_names = ensure_gene_symbol_column(adata, gene_name_column)
+    
+    # Compute gene counts per cell before filtering
+    if sp.issparse(adata.X):
+        gene_counts_per_cell = np.asarray(adata.X.getnnz(axis=1)).ravel()
+    else:
+        gene_counts_per_cell = np.count_nonzero(adata.X, axis=1)
+    
+    # Build cell mask (genes >= min_genes)
+    cell_mask_step1 = gene_counts_per_cell >= min_genes
+    
+    # Filter cells by gene count
+    adata_filtered = adata[cell_mask_step1].copy()
+    
+    # Filter perturbations
+    labels = adata_filtered.obs[perturbation_column].astype(str)
+    counts = labels.value_counts()
+    pert_keep = labels.eq(control_label) | counts.loc[labels].ge(min_cells_per_perturbation).to_numpy()
+    adata_filtered = adata_filtered[pert_keep].copy()
+    
+    # Compute gene cell counts after cell filtering
+    if sp.issparse(adata_filtered.X):
+        gene_cell_counts = np.asarray(adata_filtered.X.getnnz(axis=0)).ravel()
+    else:
+        gene_cell_counts = np.count_nonzero(adata_filtered.X, axis=0)
+    
+    # Build gene mask
+    gene_mask_local = gene_cell_counts >= min_cells_per_gene
+    
+    # Filter genes
+    adata_filtered = adata_filtered[:, gene_mask_local].copy()
+    
+    # Add gene_symbols to var
+    adata_filtered.var["gene_symbols"] = gene_names[gene_mask_local].to_numpy()
+    
+    # Save
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    adata_filtered.write(output_path)
+    
+    # Build masks relative to original data
+    # We need to track which cells made it through all filters
+    original_obs_names = adata.obs_names.to_numpy()
+    final_obs_names = set(adata_filtered.obs_names.to_numpy())
+    combined_cell_mask = np.array([name in final_obs_names for name in original_obs_names])
+    
+    original_var_names = adata.var_names.to_numpy()
+    final_var_names = set(adata_filtered.var_names.to_numpy())
+    gene_mask = np.array([name in final_var_names for name in original_var_names])
+    
+    # Expand gene_cell_counts to original size
+    gene_cell_counts_full = np.zeros(original_n_vars, dtype=np.int64)
+    gene_cell_counts_full[gene_mask] = gene_cell_counts[gene_mask_local]
+    
+    # Build perturbation_keep dict
+    filtered_adata_view = AnnData(output_path)
+    filtered_labels = filtered_adata_view.obs[perturbation_column].astype(str)
+    perturbation_keep = {
+        label: (label == control_label) or (filtered_labels[filtered_labels == label].shape[0] >= min_cells_per_perturbation)
+        for label in filtered_labels.unique()
+    }
+    
+    return QualityControlResult(
+        cell_mask=combined_cell_mask,
+        gene_mask=gene_mask,
+        perturbation_keep=perturbation_keep,
+        filtered=filtered_adata_view,
+        cell_gene_counts=gene_counts_per_cell,
+        gene_cell_counts=gene_cell_counts_full,
+    )
+
+
+def _qc_column_oriented(
+    path: str | Path,
+    *,
+    min_genes: int,
+    min_cells_per_perturbation: int,
+    min_cells_per_gene: int,
+    perturbation_column: str,
+    control_label: str,
+    gene_name_column: str | None,
+    chunk_size: int,
+    output_path: Path,
+) -> QualityControlResult:
+    """Column-oriented QC for large CSC datasets (Option B).
+    
+    Iterates by column chunks (fast for CSC) and accumulates per-cell nnz.
+    This maintains O(1) memory relative to data size while being efficient
+    for CSC-stored files.
+    
+    Parameters
+    ----------
+    path
+        Path to h5ad file.
+    min_genes
+        Minimum genes per cell.
+    min_cells_per_perturbation
+        Minimum cells per perturbation.
+    min_cells_per_gene
+        Minimum cells expressing each gene.
+    perturbation_column
+        Column in obs containing perturbation labels.
+    control_label
+        Control label (already resolved).
+    gene_name_column
+        Column in var containing gene names.
+    chunk_size
+        Number of columns to process per chunk.
+    output_path
+        Path for output h5ad file.
+        
+    Returns
+    -------
+    QualityControlResult
+        QC result with masks and filtered AnnData.
+    """
+    logger.debug("Using column-oriented QC path (large CSC dataset)")
+    
+    # Read metadata
+    backed = read_backed(path)
+    try:
+        n_obs, n_vars = backed.n_obs, backed.n_vars
+        gene_names = ensure_gene_symbol_column(backed, gene_name_column)
+        labels = backed.obs[perturbation_column].astype(str).to_numpy()
+    finally:
+        backed.file.close()
+    
+    # Pass 1: Iterate by columns to compute both metrics
+    # - genes_per_cell: nnz count per row, accumulated across column chunks
+    # - cells_per_gene: nnz count per column, computed per chunk
+    genes_per_cell = np.zeros(n_obs, dtype=np.int64)
+    cells_per_gene_all = np.zeros(n_vars, dtype=np.int64)
+    
+    backed = read_backed(path)
+    try:
+        for col_start in range(0, n_vars, chunk_size):
+            col_end = min(col_start + chunk_size, n_vars)
+            # Column slice is O(1) for CSC
+            block = backed.X[:, col_start:col_end]
+            
+            if sp.issparse(block):
+                # Per-row nnz for this column chunk
+                genes_per_cell += np.asarray(block.getnnz(axis=1)).ravel()
+                # Per-column nnz
+                cells_per_gene_all[col_start:col_end] = np.asarray(block.getnnz(axis=0)).ravel()
+            else:
+                genes_per_cell += np.count_nonzero(block, axis=1)
+                cells_per_gene_all[col_start:col_end] = np.count_nonzero(block, axis=0)
+    finally:
+        backed.file.close()
+    
+    gene_counts_per_cell = genes_per_cell
+    
+    # Cell filtering
+    cell_mask = genes_per_cell >= min_genes
+    
+    # Perturbation filtering (metadata only)
+    label_series = pd.Series(labels)
+    counts = label_series[cell_mask].value_counts()
+    count_per_cell = label_series.map(counts).fillna(0).to_numpy()
+    is_control = labels == control_label
+    has_enough = count_per_cell >= min_cells_per_perturbation
+    combined_cell_mask = (is_control | has_enough) & cell_mask
+    
+    # Recompute cells_per_gene for filtered cells if needed
+    # (only if perturbation filtering removed cells)
+    removed_cells = cell_mask & ~combined_cell_mask
+    if removed_cells.any():
+        # Subtract counts from removed cells using column-oriented pass
+        backed = read_backed(path)
+        try:
+            for col_start in range(0, n_vars, chunk_size):
+                col_end = min(col_start + chunk_size, n_vars)
+                block = backed.X[:, col_start:col_end]
+                selected = block[removed_cells]
+                if sp.issparse(selected):
+                    cells_per_gene_all[col_start:col_end] -= np.asarray(selected.getnnz(axis=0)).ravel()
+                else:
+                    cells_per_gene_all[col_start:col_end] -= np.count_nonzero(selected, axis=0)
+        finally:
+            backed.file.close()
+    
+    gene_cell_counts = cells_per_gene_all
+    gene_mask = gene_cell_counts >= min_cells_per_gene
+    
+    # Write filtered subset using existing function
+    write_filtered_subset(
+        path,
+        cell_mask=combined_cell_mask,
+        gene_mask=gene_mask,
+        output_path=output_path,
+        chunk_size=chunk_size,
+        var_assignments={"gene_symbols": gene_names[gene_mask]},
+    )
+    
+    filtered = AnnData(output_path)
+    filtered_labels = filtered.obs[perturbation_column].astype(str)
+    perturbation_keep = {
+        label: (label == control_label) or (filtered_labels[filtered_labels == label].shape[0] >= min_cells_per_perturbation)
+        for label in filtered_labels.unique()
+    }
+    
+    return QualityControlResult(
+        cell_mask=combined_cell_mask,
+        gene_mask=gene_mask,
+        perturbation_keep=perturbation_keep,
+        filtered=filtered,
+        cell_gene_counts=gene_counts_per_cell,
+        gene_cell_counts=gene_cell_counts,
+    )
+
+
+def _qc_row_oriented(
+    path: str | Path,
+    *,
+    min_genes: int,
+    min_cells_per_perturbation: int,
+    min_cells_per_gene: int,
+    perturbation_column: str,
+    control_label: str,
+    gene_name_column: str | None,
+    chunk_size: int,
+    output_path: Path,
+    use_chunk_cache: bool = True,
+    delta_threshold: float = 0.3,
+) -> QualityControlResult:
+    """Row-oriented streaming QC for large CSR/dense datasets.
+    
+    This is the original streaming implementation optimized for row-oriented
+    access patterns (CSR format or dense arrays).
+    
+    Parameters
+    ----------
+    path
+        Path to h5ad file.
+    min_genes
+        Minimum genes per cell.
+    min_cells_per_perturbation
+        Minimum cells per perturbation.
+    min_cells_per_gene
+        Minimum cells expressing each gene.
+    perturbation_column
+        Column in obs containing perturbation labels.
+    control_label
+        Control label (already resolved).
+    gene_name_column
+        Column in var containing gene names.
+    chunk_size
+        Number of cells to process per chunk.
+    output_path
+        Path for output h5ad file.
+    use_chunk_cache
+        If True, cache CSR chunks for write phase.
+    delta_threshold
+        Threshold for delta adjustment.
+        
+    Returns
+    -------
+    QualityControlResult
+        QC result with masks and filtered AnnData.
+    """
+    logger.debug("Using row-oriented streaming QC path (large CSR/dense dataset)")
+    
+    # Read metadata
     backed = read_backed(path)
     try:
         gene_names = ensure_gene_symbol_column(backed, gene_name_column)
         n_obs, n_vars = backed.n_obs, backed.n_vars
-        if perturbation_column not in backed.obs.columns:
-            raise KeyError(
-                f"Perturbation column '{perturbation_column}' was not found in adata.obs. Available columns: {list(backed.obs.columns)}"
-            )
         labels = backed.obs[perturbation_column].astype(str).to_numpy()
-        control_label = resolve_control_label(labels, control_label)
     finally:
         backed.file.close()
 
-    # Determine chunk size: explicit user choice overrides auto-detection
-    if chunk_size is None:
-        chunk_size = calculate_optimal_chunk_size(
-            n_obs, n_vars, available_memory_gb=memory_limit_gb
-        )
-
-    # Resolve output path early for cache directory
-    filtered_path = resolve_output_path(path, suffix="filtered", output_dir=output_dir, data_name=data_name)
-
     # Pass 1: Filter cells by gene count AND compute cells-per-gene for all cells
-    # This fuses two separate passes into one
     cell_filter_result = filter_cells_by_gene_count(
         path,
         min_genes=min_genes,
@@ -738,17 +974,14 @@ def quality_control_summary(
     combined_cell_mask = cell_mask & perturbation_mask
     
     # Compute gene counts for filtered cells using delta adjustment
-    # Cells removed by perturbation filter: passed gene filter but failed perturbation filter
     removed_cell_mask = cell_mask & ~perturbation_mask
     n_removed = int(removed_cell_mask.sum())
     n_filtered = int(combined_cell_mask.sum())
     
     if n_removed == 0:
-        # No cells removed by perturbation filter, use all-cell counts directly
         gene_cell_counts = gene_cell_counts_all
         logger.debug("No cells removed by perturbation filter, using all-cell gene counts")
     elif n_filtered > 0 and n_removed / n_filtered < delta_threshold:
-        # Few cells removed, use delta adjustment (faster)
         logger.debug(
             "Using delta adjustment: %d removed cells (%.1f%% of %d filtered)",
             n_removed, 100 * n_removed / n_filtered, n_filtered
@@ -761,14 +994,13 @@ def quality_control_summary(
         )
         gene_cell_counts = gene_cell_counts_all - delta_counts
     else:
-        # Many cells removed, full recompute is faster
         logger.debug(
             "Using full recompute: %d removed cells (%.1f%% of %d filtered)",
             n_removed, 100 * n_removed / n_filtered if n_filtered > 0 else 0, n_filtered
         )
         _, gene_cell_counts = filter_genes_by_cell_count(
             path,
-            min_cells=0,  # We just want the counts
+            min_cells=0,
             cell_mask=combined_cell_mask,
             gene_name_column=gene_name_column,
             chunk_size=chunk_size,
@@ -776,13 +1008,10 @@ def quality_control_summary(
         )
     
     # Pass 2: Gene filtering with nnz counting
-    # Choose optimized path based on data storage format
     is_dense = is_dense_storage(path)
     gene_mask = gene_cell_counts >= min_cells_per_gene
     
     if is_dense:
-        # Dense storage: use optimized path that avoids CSR conversion
-        # This is ~5x faster for dense data (skips expensive dense→CSR conversion)
         logger.debug("Using dense-optimized path (source stored as dense array)")
         gene_filter_result = _filter_genes_dense_optimized(
             path,
@@ -793,9 +1022,8 @@ def quality_control_summary(
             gene_name_column=gene_name_column,
             chunk_size=chunk_size,
         )
-        chunk_cache = None  # No caching for dense path
+        chunk_cache = None
     else:
-        # Sparse storage: use CSR caching for write phase optimization
         logger.debug("Using CSR cache path (source stored as sparse)")
         gene_filter_result = _filter_genes_with_cache(
             path,
@@ -804,20 +1032,18 @@ def quality_control_summary(
             gene_cell_counts=gene_cell_counts,
             gene_name_column=gene_name_column,
             chunk_size=chunk_size,
-            output_path=filtered_path if use_chunk_cache else None,
+            output_path=output_path if use_chunk_cache else None,
         )
         chunk_cache = gene_filter_result.chunk_cache
     
     gene_mask = gene_filter_result.gene_mask
     
     try:
-        # Pass 3: Write filtered subset
-        # Uses cache if available, otherwise reads from source
         write_filtered_subset(
             path,
             cell_mask=combined_cell_mask,
             gene_mask=gene_mask,
-            output_path=filtered_path,
+            output_path=output_path,
             chunk_size=chunk_size,
             var_assignments={"gene_symbols": gene_names[gene_mask]},
             row_nnz=gene_filter_result.row_nnz,
@@ -826,15 +1052,14 @@ def quality_control_summary(
             chunk_cache=chunk_cache,
         )
     finally:
-        # Always cleanup cache
         if chunk_cache is not None:
             chunk_cache.cleanup()
 
-    filtered = AnnData(filtered_path)
-    labels = filtered.obs[perturbation_column].astype(str)
+    filtered = AnnData(output_path)
+    filtered_labels = filtered.obs[perturbation_column].astype(str)
     perturbation_keep = {
-        label: (label == control_label) or (labels[labels == label].shape[0] >= min_cells_per_perturbation)
-        for label in labels.unique()
+        label: (label == control_label) or (filtered_labels[filtered_labels == label].shape[0] >= min_cells_per_perturbation)
+        for label in filtered_labels.unique()
     }
 
     return QualityControlResult(
@@ -845,4 +1070,151 @@ def quality_control_summary(
         cell_gene_counts=gene_counts_per_cell,
         gene_cell_counts=gene_cell_counts,
     )
+
+
+def quality_control_summary(
+    path: str | Path,
+    *,
+    min_genes: int = 100,
+    min_cells_per_perturbation: int = 50,
+    min_cells_per_gene: int = 100,
+    perturbation_column: str,
+    control_label: str | None = None,
+    gene_name_column: str | None = None,
+    chunk_size: int | None = None,
+    memory_limit_gb: float | None = None,
+    output_dir: str | Path | None = None,
+    data_name: str | None = None,
+    use_chunk_cache: bool = True,
+    delta_threshold: float = 0.3,
+    force_streaming: bool = False,
+) -> QualityControlResult:
+    """Run QC with automatic strategy selection for optimal performance.
+    
+    This function automatically selects the best QC strategy based on:
+    1. Small data (any format): In-memory processing (fastest)
+    2. Large CSC data: Column-oriented streaming (memory efficient for CSC)
+    3. Large CSR/dense data: Row-oriented streaming (current behavior)
+    
+    Parameters
+    ----------
+    path
+        Path to h5ad file.
+    min_genes
+        Minimum number of expressed genes per cell.
+    min_cells_per_perturbation
+        Minimum number of cells required per perturbation.
+    min_cells_per_gene
+        Minimum number of cells expressing each gene.
+    perturbation_column
+        Column in obs containing perturbation labels.
+    control_label
+        Label identifying control cells. If None, auto-detected.
+    gene_name_column
+        Column in var containing gene names.
+    chunk_size
+        Number of cells to process per chunk. If None, automatically
+        calculated based on available memory.
+    memory_limit_gb
+        Optional memory limit in GB for strategy selection and chunk size.
+        If None, auto-detected from system memory.
+    output_dir
+        Directory for output files.
+    data_name
+        Base name for output files.
+    use_chunk_cache
+        If True, cache CSR chunk data during gene filtering for row-oriented
+        streaming. Default True.
+    delta_threshold
+        Threshold for delta adjustment in row-oriented streaming.
+        Default 0.3 (30%).
+    force_streaming
+        If True, always use streaming path regardless of data size.
+        Useful for testing or memory-constrained environments.
+        
+    Returns
+    -------
+    QualityControlResult
+        Dataclass containing masks, filtered AnnData, and QC statistics.
+    """
+    path = Path(path)
+    
+    # Read metadata and resolve control label
+    backed = read_backed(path)
+    try:
+        n_obs, n_vars = backed.n_obs, backed.n_vars
+        if perturbation_column not in backed.obs.columns:
+            raise KeyError(
+                f"Perturbation column '{perturbation_column}' was not found in adata.obs. "
+                f"Available columns: {list(backed.obs.columns)}"
+            )
+        labels = backed.obs[perturbation_column].astype(str).to_numpy()
+        control_label_resolved = resolve_control_label(labels, control_label)
+    finally:
+        backed.file.close()
+    
+    # Detect storage format and file size
+    storage_format = get_matrix_storage_format(path)
+    file_size_gb = path.stat().st_size / 1e9
+    
+    # Determine available memory
+    if memory_limit_gb is None:
+        try:
+            import psutil
+            memory_limit_gb = psutil.virtual_memory().available / 1e9 * 0.5  # Use 50% of available
+        except ImportError:
+            memory_limit_gb = 8.0
+    
+    # Estimate memory needed (rough: 2x file size for safety with in-memory processing)
+    estimated_memory_gb = file_size_gb * 2
+    
+    # Determine chunk size for streaming paths
+    if chunk_size is None:
+        chunk_size = calculate_optimal_chunk_size(
+            n_obs, n_vars, available_memory_gb=memory_limit_gb
+        )
+    
+    # Resolve output path
+    filtered_path = resolve_output_path(
+        path, suffix="filtered", output_dir=output_dir, data_name=data_name
+    )
+    
+    # Common kwargs for all strategies
+    common_kwargs = {
+        "min_genes": min_genes,
+        "min_cells_per_perturbation": min_cells_per_perturbation,
+        "min_cells_per_gene": min_cells_per_gene,
+        "perturbation_column": perturbation_column,
+        "control_label": control_label_resolved,
+        "gene_name_column": gene_name_column,
+        "output_path": filtered_path,
+    }
+    
+    # Select strategy
+    if not force_streaming and estimated_memory_gb < memory_limit_gb:
+        # Option A: In-memory for small datasets
+        logger.info(
+            f"Using in-memory QC (file: {file_size_gb:.2f}GB, limit: {memory_limit_gb:.2f}GB)"
+        )
+        return _qc_in_memory(path, **common_kwargs)
+    
+    elif storage_format == 'csc':
+        # Option B: Column-oriented for large CSC
+        logger.info(
+            f"Using column-oriented streaming QC (CSC format, {file_size_gb:.2f}GB)"
+        )
+        return _qc_column_oriented(path, chunk_size=chunk_size, **common_kwargs)
+    
+    else:
+        # Row-oriented streaming for large CSR/dense
+        logger.info(
+            f"Using row-oriented streaming QC ({storage_format} format, {file_size_gb:.2f}GB)"
+        )
+        return _qc_row_oriented(
+            path,
+            chunk_size=chunk_size,
+            use_chunk_cache=use_chunk_cache,
+            delta_threshold=delta_threshold,
+            **common_kwargs,
+        )
 

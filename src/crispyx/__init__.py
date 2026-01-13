@@ -21,6 +21,7 @@ from .data import (
     read_backed,
     resolve_control_label,
     resolve_output_path,
+    sort_by_perturbation,
 )
 from .de import (
     RankGenesGroupsResult,
