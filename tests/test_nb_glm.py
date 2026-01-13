@@ -484,7 +484,7 @@ def test_nb_glm_profiling_output(tmp_path):
     assert profiling_data is not None
     assert profiling_data != "NA"
     assert "profiling_enabled" in profiling_data
-    assert profiling_data["profiling_enabled"] is True
+    assert profiling_data["profiling_enabled"] == True  # noqa: E712 - allow np.True_ comparison
     assert "fit_seconds" in profiling_data
     assert profiling_data["fit_seconds"] >= 0
 

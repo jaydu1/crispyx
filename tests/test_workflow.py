@@ -126,7 +126,11 @@ def test_quality_control_sparse_roundtrip(tmp_path):
     expected = adata[result.cell_mask, result.gene_mask]
     np.testing.assert_array_equal(filtered.X.toarray(), expected.X.toarray())
     with h5py.File(result.filtered_path) as handle:
-        assert handle["X"].attrs["encoding-type"] == b"csr_matrix"
+        encoding = handle["X"].attrs["encoding-type"]
+        # Handle both bytes and string representations
+        if isinstance(encoding, bytes):
+            encoding = encoding.decode()
+        assert encoding == "csr_matrix"
     result.filtered.close()
 
 
