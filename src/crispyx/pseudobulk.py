@@ -11,11 +11,13 @@ import pandas as pd
 
 from .data import (
     AnnData,
+    calculate_optimal_chunk_size,
     ensure_gene_symbol_column,
     iter_matrix_chunks,
     normalize_total_block,
     read_backed,
     resolve_control_label,
+    resolve_data_path,
     resolve_output_path,
 )
 
@@ -33,20 +35,24 @@ def _resolve_candidates(
 
 
 def compute_average_log_expression(
-    path: str | Path,
+    data: str | Path | AnnData | ad.AnnData,
     *,
     perturbation_column: str,
     control_label: str | None = None,
     gene_name_column: str | None = None,
     perturbations: Iterable[str] | None = None,
-    chunk_size: int = 2048,
+    chunk_size: int | None = None,
     output_dir: str | Path | None = None,
     data_name: str | None = None,
 ) -> AnnData:
     """Compute average log-normalised expression per perturbation relative to control."""
 
+    path = resolve_data_path(data)
     backed = read_backed(path)
     try:
+        # Calculate adaptive chunk_size if not provided
+        if chunk_size is None:
+            chunk_size = calculate_optimal_chunk_size(backed.n_obs, backed.n_vars)
         gene_symbols = ensure_gene_symbol_column(backed, gene_name_column)
         if perturbation_column not in backed.obs.columns:
             raise KeyError(
@@ -112,14 +118,14 @@ def compute_average_log_expression(
 
 
 def compute_pseudobulk_expression(
-    path: str | Path,
+    data: str | Path | AnnData | ad.AnnData,
     *,
     perturbation_column: str,
     control_label: str | None = None,
     gene_name_column: str | None = None,
     perturbations: Iterable[str] | None = None,
     baseline_count: float = 1.0,
-    chunk_size: int = 2048,
+    chunk_size: int | None = None,
     output_dir: str | Path | None = None,
     data_name: str | None = None,
 ) -> AnnData:
@@ -128,8 +134,12 @@ def compute_pseudobulk_expression(
     if baseline_count <= 0:
         raise ValueError("baseline_count must be positive")
 
+    path = resolve_data_path(data)
     backed = read_backed(path)
     try:
+        # Calculate adaptive chunk_size if not provided
+        if chunk_size is None:
+            chunk_size = calculate_optimal_chunk_size(backed.n_obs, backed.n_vars)
         gene_symbols = ensure_gene_symbol_column(backed, gene_name_column)
         if perturbation_column not in backed.obs.columns:
             raise KeyError(

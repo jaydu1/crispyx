@@ -334,6 +334,69 @@ def read_backed(path: str | Path) -> ad.AnnData:
     return ad.read_h5ad(str(path), backed="r")
 
 
+def resolve_data_path(
+    data: str | Path | "AnnData" | ad.AnnData,
+    *,
+    require_exists: bool = True,
+) -> Path:
+    """Resolve the on-disk path for a backed AnnData object or path-like input.
+    
+    This utility supports flexible input types for crispyx functions, allowing
+    users to pass either a file path or an AnnData object.
+    
+    Parameters
+    ----------
+    data
+        One of:
+        - A string or Path to an h5ad file
+        - A crispyx.AnnData wrapper (has .path attribute)
+        - A backed anndata.AnnData object (has .filename attribute)
+    require_exists
+        If True (default), verify the resolved path exists.
+        
+    Returns
+    -------
+    Path
+        The resolved file path.
+        
+    Raises
+    ------
+    TypeError
+        If data is an in-memory (non-backed) AnnData or unsupported type.
+    FileNotFoundError
+        If require_exists is True and the path does not exist.
+        
+    Examples
+    --------
+    >>> from crispyx.data import resolve_data_path
+    >>> path = resolve_data_path("data/counts.h5ad")
+    >>> path = resolve_data_path(adata_wrapper)
+    >>> path = resolve_data_path(backed_adata)
+    """
+    if isinstance(data, (str, Path)):
+        result = Path(data)
+    elif isinstance(data, AnnData):
+        result = data.path
+    elif isinstance(data, ad.AnnData):
+        filename = getattr(data, "filename", None)
+        if filename:
+            result = Path(filename)
+        else:
+            raise TypeError(
+                "Operations in crispyx expect a backed AnnData object or file path. "
+                "The provided AnnData appears to be in-memory (no .filename attribute)."
+            )
+    else:
+        raise TypeError(
+            f"Expected a path-like value or backed AnnData; received {type(data)!r}."
+        )
+    
+    if require_exists and not result.exists():
+        raise FileNotFoundError(f"Data file not found: {result}")
+    
+    return result
+
+
 def resolve_output_path(
     input_path: str | Path,
     *,
@@ -865,13 +928,230 @@ def write_filtered_subset(
                 backed.file.close()
 
 
+def normalize_total_log1p(
+    data: str | Path | "AnnData" | ad.AnnData,
+    output_path: str | Path | None = None,
+    *,
+    normalize: bool = True,
+    log1p: bool = True,
+    target_sum: float = 1e4,
+    chunk_size: int = 4096,
+    output_dir: str | Path | None = None,
+    data_name: str | None = None,
+    verbose: bool = True,
+) -> "AnnData":
+    """Stream normalize and/or log-transform an h5ad file without loading it fully into memory.
+    
+    This function processes the source file in chunks, optionally applying:
+    1. Total-count normalization (scanpy.pp.normalize_total equivalent)
+    2. Log1p transformation (scanpy.pp.log1p equivalent)
+    
+    The output is written as a sparse CSR matrix. This is the streaming equivalent
+    of calling ``scanpy.pp.normalize_total`` followed by ``scanpy.pp.log1p``.
+    
+    Parameters
+    ----------
+    data
+        Path to source h5ad file, or a backed AnnData object.
+    output_path
+        Path for output h5ad file. If None, uses output_dir/data_name pattern.
+    normalize
+        Whether to apply total-count normalization. Default True.
+    log1p
+        Whether to apply log1p transformation. Default True.
+    target_sum
+        Target total counts per cell after normalization. Default 1e4.
+        Only used if normalize=True.
+    chunk_size
+        Number of cells to process per chunk. Default 4096.
+    output_dir
+        Directory for output file. Defaults to input file's directory.
+    data_name
+        Custom name for output file. If None, uses "normalized" suffix.
+    verbose
+        Print progress information.
+    
+    Returns
+    -------
+    AnnData
+        Read-only AnnData wrapper pointing to the output file.
+    
+    Examples
+    --------
+    >>> # Full normalization + log1p (default)
+    >>> adata_norm = cx.pp.normalize_total_log1p(adata_ro, output_dir=OUTPUT_DIR, data_name="normalized")
+    
+    >>> # Only log1p (no normalization)
+    >>> adata_log = cx.pp.normalize_total_log1p(adata_ro, normalize=False, output_dir=OUTPUT_DIR)
+    
+    >>> # Only normalization (no log1p)
+    >>> adata_norm = cx.pp.normalize_total_log1p(adata_ro, log1p=False, output_dir=OUTPUT_DIR)
+    
+    >>> # Use explicit output path
+    >>> adata_norm = cx.pp.normalize_total_log1p(adata_ro, "results/normalized.h5ad")
+    """
+    if not normalize and not log1p:
+        raise ValueError("At least one of normalize or log1p must be True")
+    
+    # Resolve input path from various input types
+    source_path = resolve_data_path(data, require_exists=True)
+    
+    # Resolve output path
+    if output_path is not None:
+        output_path = Path(output_path)
+    else:
+        # Build suffix based on options
+        if normalize and log1p:
+            suffix = "normalized_log1p"
+        elif normalize:
+            suffix = "normalized"
+        else:
+            suffix = "log1p"
+        output_path = resolve_output_path(
+            source_path,
+            suffix=suffix,
+            output_dir=output_dir,
+            data_name=data_name,
+        )
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    ops = []
+    if normalize:
+        ops.append("normalize")
+    if log1p:
+        ops.append("log1p")
+    if verbose:
+        print(f"Generating preprocessed dataset (streaming, {'+'.join(ops)}): {output_path}")
+    
+    # First pass: count non-zeros and get metadata
+    backed = read_backed(source_path)
+    try:
+        n_obs = backed.n_obs
+        n_vars = backed.n_vars
+        obs = backed.obs.copy()
+        var = backed.var.copy()
+        obs.index = obs.index.astype(str)
+        var.index = var.index.astype(str)
+        
+        # Count non-zeros per row (after normalization, same sparsity as input)
+        row_nnz = np.zeros(n_obs, dtype=np.int64)
+        total_nnz = 0
+        
+        row_offset = 0
+        for slc, block in iter_matrix_chunks(
+            backed, axis=0, chunk_size=chunk_size, convert_to_dense=False
+        ):
+            csr = _ensure_csr(block)
+            counts = np.diff(csr.indptr)
+            row_nnz[row_offset : row_offset + len(counts)] = counts
+            total_nnz += int(csr.nnz)
+            row_offset += len(counts)
+    finally:
+        backed.file.close()
+    
+    if total_nnz == 0:
+        # Empty matrix: write placeholder
+        placeholder = sp.csr_matrix((n_obs, n_vars), dtype=np.float32)
+        adata = ad.AnnData(placeholder, obs=obs, var=var)
+        adata.write(output_path)
+        return output_path
+    
+    # Compute indptr
+    indptr = np.zeros(n_obs + 1, dtype=np.int64)
+    np.cumsum(row_nnz, out=indptr[1:])
+    
+    # HDF5 chunk sizing
+    hdf5_chunk_size = min(262144, max(8192, total_nnz // 16))
+    
+    # Create output file with placeholder
+    placeholder = sp.csr_matrix((n_obs, n_vars), dtype=np.float32)
+    adata = ad.AnnData(placeholder, obs=obs, var=var)
+    adata.write(output_path)
+    
+    # Second pass: normalize, log1p, and write
+    with h5py.File(output_path, "r+", libver='latest') as dest:
+        if "X" in dest:
+            del dest["X"]
+        grp = dest.create_group("X")
+        grp.attrs["encoding-type"] = np.bytes_("csr_matrix")
+        grp.attrs["encoding-version"] = np.bytes_("0.1.0")
+        
+        data_ds = grp.create_dataset(
+            "data",
+            shape=(total_nnz,),
+            dtype=np.float32,
+            chunks=(hdf5_chunk_size,) if total_nnz >= hdf5_chunk_size else None,
+        )
+        indices_ds = grp.create_dataset(
+            "indices",
+            shape=(total_nnz,),
+            dtype=np.int32,
+            chunks=(hdf5_chunk_size,) if total_nnz >= hdf5_chunk_size else None,
+        )
+        grp.create_dataset("indptr", data=indptr)
+        grp.attrs["shape"] = np.array([n_obs, n_vars], dtype=np.int64)
+        
+        backed = read_backed(source_path)
+        try:
+            offset = 0
+            for slc, block in iter_matrix_chunks(
+                backed, axis=0, chunk_size=chunk_size, convert_to_dense=False
+            ):
+                csr = _ensure_csr(block)
+                
+                # Start with original data
+                processed_data = csr.data.astype(np.float32)
+                
+                # Apply normalization if requested
+                if normalize:
+                    # Library size per cell
+                    lib_sizes = np.asarray(csr.sum(axis=1)).ravel()
+                    # Avoid division by zero
+                    scale = np.divide(
+                        target_sum, lib_sizes,
+                        out=np.zeros_like(lib_sizes, dtype=np.float64),
+                        where=lib_sizes > 0,
+                    )
+                    
+                    # Apply normalization to data (CSR stores data in row-major order)
+                    # For each row i, data[indptr[i]:indptr[i+1]] are the values
+                    for i in range(csr.shape[0]):
+                        start_idx = csr.indptr[i]
+                        end_idx = csr.indptr[i + 1]
+                        processed_data[start_idx:end_idx] = (
+                            processed_data[start_idx:end_idx].astype(np.float64) * scale[i]
+                        ).astype(np.float32)
+                
+                # Apply log1p if requested
+                if log1p:
+                    processed_data = np.log1p(processed_data)
+                
+                # Write to HDF5
+                nnz = len(processed_data)
+                if nnz:
+                    data_ds[offset : offset + nnz] = processed_data
+                    indices_ds[offset : offset + nnz] = csr.indices.astype(np.int32)
+                    offset += nnz
+        finally:
+            backed.file.close()
+    
+    if verbose:
+        print(f"  ✓ Preprocessed dataset written: {n_obs} cells × {n_vars} genes")
+    
+    return AnnData(output_path)
+
+
+# Alias for backward compatibility
+write_normalized_log1p = normalize_total_log1p
+
+
 def calculate_optimal_chunk_size(
     n_obs: int,
     n_vars: int,
     available_memory_gb: float | None = None,
-    safety_factor: float = 4.0,
+    safety_factor: float = 8.0,
     min_chunk: int = 512,
-    max_chunk: int = 8192,
+    max_chunk: int = 4096,
 ) -> int:
     """Calculate optimal chunk size based on dataset dimensions and available memory.
     
@@ -884,11 +1164,11 @@ def calculate_optimal_chunk_size(
     available_memory_gb
         Available memory in gigabytes. If None, auto-detects using psutil.
     safety_factor
-        Safety multiplier to account for overhead (default 4.0 for backed operations).
+        Safety multiplier to account for overhead (default 8.0 for backed operations).
     min_chunk
         Minimum chunk size to return (default 512).
     max_chunk
-        Maximum chunk size to return (default 8192).
+        Maximum chunk size to return (default 4096).
     
     Returns
     -------
@@ -898,7 +1178,7 @@ def calculate_optimal_chunk_size(
     Examples
     --------
     >>> calculate_optimal_chunk_size(100000, 20000, available_memory_gb=32)
-    2048
+    2000
     """
     if available_memory_gb is None:
         try:
@@ -922,6 +1202,74 @@ def calculate_optimal_chunk_size(
     
     logger.info(
         f"Calculated chunk size: {chunk_size} "
+        f"(dataset: {n_obs} cells × {n_vars} genes, "
+        f"available memory: {available_memory_gb:.1f}GB)"
+    )
+    
+    return chunk_size
+
+
+def calculate_optimal_gene_chunk_size(
+    n_obs: int,
+    n_vars: int,
+    available_memory_gb: float | None = None,
+    safety_factor: float = 8.0,
+    min_chunk: int = 128,
+    max_chunk: int = 1024,
+) -> int:
+    """Calculate optimal gene chunk size for column-wise operations.
+    
+    For operations that iterate over genes (columns), such as Wilcoxon tests,
+    each chunk loads all cells for a subset of genes. Memory usage is dominated
+    by n_obs × chunk_size rather than chunk_size × n_vars.
+    
+    Parameters
+    ----------
+    n_obs
+        Number of observations (cells) in the dataset.
+    n_vars
+        Number of variables (genes) in the dataset.
+    available_memory_gb
+        Available memory in gigabytes. If None, auto-detects using psutil.
+    safety_factor
+        Safety multiplier to account for overhead (default 8.0).
+    min_chunk
+        Minimum chunk size to return (default 128).
+    max_chunk
+        Maximum chunk size to return (default 1024).
+    
+    Returns
+    -------
+    int
+        Recommended gene chunk size, clamped to [min_chunk, max_chunk].
+    
+    Examples
+    --------
+    >>> calculate_optimal_gene_chunk_size(100000, 20000, available_memory_gb=32)
+    400
+    """
+    if available_memory_gb is None:
+        try:
+            import psutil
+            available_memory_gb = psutil.virtual_memory().available / 1e9
+        except ImportError:
+            logger.warning(
+                "psutil not installed, using default 16GB for chunk size calculation. "
+                "Install with: pip install psutil"
+            )
+            available_memory_gb = 16.0
+    
+    # Calculate chunk size based on memory
+    # Each chunk uses approximately: n_obs * chunk_size * 8 bytes (float64)
+    # Multiply by safety_factor for overhead (copies, intermediate results)
+    bytes_per_gene = n_obs * 8 * safety_factor
+    max_chunk_from_memory = int((available_memory_gb * 1e9) / bytes_per_gene)
+    
+    # Clamp to reasonable range
+    chunk_size = max(min_chunk, min(max_chunk, max_chunk_from_memory))
+    
+    logger.info(
+        f"Calculated gene chunk size: {chunk_size} "
         f"(dataset: {n_obs} cells × {n_vars} genes, "
         f"available memory: {available_memory_gb:.1f}GB)"
     )
@@ -1077,6 +1425,9 @@ def standardize_dataset(
     - control labels standardized to 'control'
     - gene_name_column set as var.index if specified
     
+    This function uses a streaming approach to avoid loading the X matrix
+    into memory, making it suitable for very large datasets (>1M cells).
+    
     Standardized files are cached in {output_dir}/.cache/ and reused
     unless force=True.
     
@@ -1112,6 +1463,7 @@ def standardize_dataset(
     ... )
     """
     import datetime
+    import shutil
     
     dataset_path = Path(dataset_path)
     output_dir = Path(output_dir)
@@ -1128,11 +1480,6 @@ def standardize_dataset(
     logger.info(f"Standardizing dataset: {dataset_path.name}")
     logger.info(f"  - Perturbation column: '{perturbation_column}' → 'perturbation'")
     
-    # Load dataset
-    adata = ad.read_h5ad(dataset_path, backed='r')
-    adata_mem = adata.to_memory()
-    adata.file.close()
-    
     # Track standardization metadata
     metadata = {
         "original_path": str(dataset_path),
@@ -1141,24 +1488,31 @@ def standardize_dataset(
         "label_mappings": {},
     }
     
-    # Standardize perturbation column
+    # Read obs/var metadata only (without loading X into memory)
+    adata = ad.read_h5ad(dataset_path, backed='r')
+    obs_df = adata.obs.copy()
+    var_df = adata.var.copy()
+    uns_dict = dict(adata.uns)  # shallow copy of uns
+    adata.file.close()
+    
+    # Standardize perturbation column in obs
     if perturbation_column != "perturbation":
-        if perturbation_column not in adata_mem.obs.columns:
+        if perturbation_column not in obs_df.columns:
             raise KeyError(
                 f"Perturbation column '{perturbation_column}' not found. "
-                f"Available: {list(adata_mem.obs.columns)}"
+                f"Available: {list(obs_df.columns)}"
             )
-        adata_mem.obs.rename(columns={perturbation_column: "perturbation"}, inplace=True)
+        obs_df.rename(columns={perturbation_column: "perturbation"}, inplace=True)
         metadata["column_mappings"]["perturbation"] = perturbation_column
         logger.info(f"  - Renamed '{perturbation_column}' → 'perturbation'")
     
     # Standardize control label
-    labels = adata_mem.obs["perturbation"].astype(str).to_numpy()
+    labels = obs_df["perturbation"].astype(str).to_numpy()
     detected_control = resolve_control_label(labels, control_label, verbose=False)
     
     if detected_control != "control":
-        adata_mem.obs["perturbation"] = (
-            adata_mem.obs["perturbation"]
+        obs_df["perturbation"] = (
+            obs_df["perturbation"]
             .astype(str)
             .replace({detected_control: "control"})
         )
@@ -1167,11 +1521,11 @@ def standardize_dataset(
     else:
         logger.info(f"  - Control label already standardized: 'control'")
     
-    # Standardize gene names
+    # Standardize gene names in var
     if gene_name_column is not None:
-        if gene_name_column in adata_mem.var.columns:
-            if not (adata_mem.var.index == adata_mem.var[gene_name_column]).all():
-                adata_mem.var.index = adata_mem.var[gene_name_column].values
+        if gene_name_column in var_df.columns:
+            if not (var_df.index == var_df[gene_name_column]).all():
+                var_df.index = var_df[gene_name_column].values
                 metadata["column_mappings"]["var.index"] = gene_name_column
                 logger.info(f"  - Set var.index from '{gene_name_column}'")
         else:
@@ -1181,15 +1535,123 @@ def standardize_dataset(
             )
     
     # Store metadata
-    if "standardization_metadata" not in adata_mem.uns:
-        adata_mem.uns["standardization_metadata"] = {}
-    adata_mem.uns["standardization_metadata"].update(metadata)
+    if "standardization_metadata" not in uns_dict:
+        uns_dict["standardization_metadata"] = {}
+    uns_dict["standardization_metadata"].update(metadata)
     
-    # Save standardized dataset
-    adata_mem.write(standardized_path)
+    # Copy h5ad file at filesystem level (streaming - no memory load)
+    logger.info(f"  - Copying dataset (streaming, no X matrix load)...")
+    shutil.copy2(dataset_path, standardized_path)
+    
+    # Modify obs/var/uns in-place using h5py
+    logger.info(f"  - Updating metadata in copied file...")
+    with h5py.File(standardized_path, 'r+') as f:
+        # Update obs - need to rewrite the obs group
+        # Read current obs structure and update
+        _update_h5ad_dataframe(f, 'obs', obs_df)
+        
+        # Update var - need to rewrite the var group
+        _update_h5ad_dataframe(f, 'var', var_df)
+        
+        # Update uns - handle the standardization_metadata key
+        _update_h5ad_uns(f, 'uns', uns_dict)
+    
     logger.info(f"Saved standardized dataset: {standardized_path}")
     
     return standardized_path
+
+
+def _update_h5ad_dataframe(h5file: h5py.File, group_name: str, df: pd.DataFrame) -> None:
+    """Update obs or var DataFrame in an h5ad file in-place.
+    
+    This function handles the anndata HDF5 format where DataFrames are stored
+    as groups with individual columns as datasets.
+    """
+    if group_name not in h5file:
+        return
+    
+    grp = h5file[group_name]
+    
+    # Update the index (stored as _index attribute or separate dataset)
+    index_key = grp.attrs.get('_index', '_index')
+    if isinstance(index_key, bytes):
+        index_key = index_key.decode('utf-8')
+    
+    if index_key in grp:
+        del grp[index_key]
+    # Store index as variable-length strings
+    index_vals = df.index.astype(str).values
+    grp.create_dataset(index_key, data=index_vals.astype('O'), dtype=h5py.special_dtype(vlen=str))
+    
+    # Update column names (stored as 'column-order' attribute)
+    col_names = list(df.columns)
+    grp.attrs['column-order'] = np.array(col_names, dtype=object)
+    
+    # Update each column
+    for col in df.columns:
+        if col in grp:
+            del grp[col]
+        
+        col_data = df[col]
+        
+        # Handle categorical columns
+        if hasattr(col_data, 'cat'):
+            # Store as categorical (anndata format)
+            cat_grp = grp.create_group(col)
+            cat_grp.attrs['encoding-type'] = 'categorical'
+            cat_grp.attrs['encoding-version'] = '0.2.0'
+            cat_grp.attrs['ordered'] = col_data.cat.ordered  # Required for anndata
+            
+            # Store categories
+            categories = col_data.cat.categories.astype(str).values
+            cat_grp.create_dataset('categories', data=categories.astype('O'), 
+                                   dtype=h5py.special_dtype(vlen=str))
+            
+            # Store codes
+            cat_grp.create_dataset('codes', data=col_data.cat.codes.values)
+        elif col_data.dtype == object or col_data.dtype.kind in ('U', 'S'):
+            # String column - store as variable-length strings
+            str_vals = col_data.astype(str).values
+            grp.create_dataset(col, data=str_vals.astype('O'), 
+                               dtype=h5py.special_dtype(vlen=str))
+        else:
+            # Numeric column
+            grp.create_dataset(col, data=col_data.values)
+
+
+def _update_h5ad_uns(h5file: h5py.File, group_name: str, uns_dict: dict) -> None:
+    """Update uns dict in an h5ad file in-place.
+    
+    Only updates the standardization_metadata key to avoid breaking other uns data.
+    """
+    if group_name not in h5file:
+        h5file.create_group(group_name)
+    
+    grp = h5file[group_name]
+    
+    # Only update standardization_metadata to be safe
+    key = 'standardization_metadata'
+    if key in uns_dict:
+        if key in grp:
+            del grp[key]
+        
+        # Store as a group with string datasets for each subkey
+        meta_grp = grp.create_group(key)
+        meta_grp.attrs['encoding-type'] = 'dict'
+        meta_grp.attrs['encoding-version'] = '0.1.0'
+        
+        for subkey, subval in uns_dict[key].items():
+            if isinstance(subval, dict):
+                # Nested dict - store as JSON string
+                import json
+                meta_grp.create_dataset(subkey, data=json.dumps(subval),
+                                        dtype=h5py.special_dtype(vlen=str))
+            elif isinstance(subval, str):
+                meta_grp.create_dataset(subkey, data=subval,
+                                        dtype=h5py.special_dtype(vlen=str))
+            else:
+                meta_grp.create_dataset(subkey, data=str(subval),
+                                        dtype=h5py.special_dtype(vlen=str))
 
 
 def needs_sorting_for_nbglm(

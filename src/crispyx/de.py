@@ -31,12 +31,15 @@ from scipy.stats import norm, rankdata, t as t_dist
 
 from .data import (
     AnnData,
+    calculate_optimal_chunk_size,
+    calculate_optimal_gene_chunk_size,
     ensure_gene_symbol_column,
     get_perturbation_slice,
     iter_matrix_chunks,
     needs_sorting_for_nbglm,
     read_backed,
     resolve_control_label,
+    resolve_data_path,
     resolve_output_path,
     sort_by_perturbation,
 )
@@ -342,14 +345,14 @@ def _write_rank_genes_groups_hdf5(
 
 
 def t_test(
-    path: str | Path,
+    data: str | Path | AnnData | ad.AnnData,
     *,
     perturbation_column: str,
     control_label: str | None = None,
     gene_name_column: str | None = None,
     perturbations: Iterable[str] | None = None,
     min_cells_expressed: int = 0,
-    cell_chunk_size: int = 2048,
+    cell_chunk_size: int | None = None,
     output_dir: str | Path | None = None,
     data_name: str | None = None,
     n_jobs: int | None = None,
@@ -375,8 +378,9 @@ def t_test(
     
     Parameters
     ----------
-    path
-        Path to an h5ad file containing log-transformed expression data.
+    data
+        Path to an h5ad file, or a crispyx/anndata AnnData object containing
+        log-transformed expression data.
     perturbation_column
         Column in `adata.obs` indicating perturbation labels.
     control_label
@@ -419,9 +423,12 @@ def t_test(
         path is available at `result.result_path`.
     """
 
-
+    path = resolve_data_path(data)
     backed = read_backed(path)
     try:
+        # Calculate adaptive chunk_size if not provided
+        if cell_chunk_size is None:
+            cell_chunk_size = calculate_optimal_chunk_size(backed.n_obs, backed.n_vars)
         gene_symbols = ensure_gene_symbol_column(backed, gene_name_column)
         if perturbation_column not in backed.obs.columns:
             raise KeyError(
@@ -791,7 +798,7 @@ def t_test(
 
 
 def nb_glm_test(
-    path: str | Path,
+    data: str | Path | AnnData | ad.AnnData,
     *,
     # ---- Data parameters ----
     perturbation_column: str,
@@ -858,8 +865,9 @@ def nb_glm_test(
     
     **Data parameters**
     
-    path
-        Path to an h5ad file containing raw count data.
+    data
+        Path to an h5ad file, or a crispyx/anndata AnnData object containing
+        raw count data.
     perturbation_column
         Column in `adata.obs` indicating perturbation labels.
     control_label
@@ -1096,7 +1104,7 @@ def nb_glm_test(
     # Check if dataset needs sorting for efficient I/O
     # Large datasets with many perturbations benefit from having cells sorted
     # by perturbation label, enabling contiguous reads instead of random access
-    path = Path(path)
+    path = resolve_data_path(data)
     if needs_sorting_for_nbglm(path, perturbation_column=perturbation_column):
         sorted_path = path.parent / f"{path.stem}_sorted.h5ad"
         if not sorted_path.exists():
@@ -2745,14 +2753,14 @@ def nb_glm_test(
 
 
 def wilcoxon_test(
-    path: str | Path,
+    data: str | Path | AnnData | ad.AnnData,
     *,
     perturbation_column: str,
     control_label: str | None = None,
     gene_name_column: str | None = None,
     perturbations: Iterable[str] | None = None,
     min_cells_expressed: int = 0,
-    chunk_size: int = 2048,
+    chunk_size: int | None = None,
     tie_correct: bool = True,
     corr_method: Literal["benjamini-hochberg", "bonferroni"] = "benjamini-hochberg",
     output_dir: str | Path | None = None,
@@ -2773,8 +2781,9 @@ def wilcoxon_test(
     
     Parameters
     ----------
-    path
-        Path to an h5ad file containing normalised, log-transformed data.
+    data
+        Path to an h5ad file, or a crispyx/anndata AnnData object containing
+        normalised, log-transformed data.
     perturbation_column
         Column in `adata.obs` indicating perturbation labels.
     control_label
@@ -2824,8 +2833,13 @@ def wilcoxon_test(
         path is available at `result.result_path`.
     """
 
+    path = resolve_data_path(data)
     backed = read_backed(path)
     try:
+        # Calculate adaptive gene chunk_size if not provided
+        # Wilcoxon iterates over genes (columns), so use gene chunk calculator
+        if chunk_size is None:
+            chunk_size = calculate_optimal_gene_chunk_size(backed.n_obs, backed.n_vars)
         gene_symbols = ensure_gene_symbol_column(backed, gene_name_column)
         if perturbation_column not in backed.obs.columns:
             raise KeyError(
@@ -3178,7 +3192,7 @@ def wilcoxon_test(
 
 
 def shrink_lfc(
-    path: str | Path,
+    data: str | Path | AnnData | ad.AnnData,
     *,
     output_dir: str | Path | None = None,
     data_name: str | None = None,
@@ -3216,9 +3230,10 @@ def shrink_lfc(
     
     Parameters
     ----------
-    path
-        Path to an h5ad file containing NB-GLM results from `nb_glm_test`.
-        Must have required layers and metadata in `uns`.
+    data
+        Path to an h5ad file, or a crispyx/anndata AnnData object containing
+        NB-GLM results from `nb_glm_test`. Must have required layers and
+        metadata in `uns`.
     output_dir
         Directory for output h5ad file. Defaults to input file's directory.
     data_name
@@ -3293,7 +3308,7 @@ def shrink_lfc(
     >>> # Then apply shrinkage as a separate step
     >>> shrunk_result = crispyx.de.shrink_lfc(result.result_path)
     """
-    path = Path(path)
+    path = resolve_data_path(data)
     
     # Validate min_mu parameter
     if min_mu < 0:

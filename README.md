@@ -5,6 +5,7 @@ A lightweight toolkit for streaming CRISPR screen analysis that processes large 
 ## Features
 
 - **Streaming QC** – Filters low-quality cells, perturbations, and genes with automatic control label detection and adaptive thresholds
+- **Streaming preprocessing** – Normalize and log-transform large datasets without loading into memory
 - **Scanpy-style API** – Familiar `cx.pp`, `cx.pb`, and `cx.tl` namespaces for quality control, pseudo-bulk, and differential expression
 - **Pseudo-bulk aggregation** – Average log expression and pseudo-bulk counts for effect size estimation
 - **Differential expression** – t-test, Wilcoxon, and negative binomial GLM tests with multi-core support
@@ -22,6 +23,13 @@ import crispyx as cx
 
 # Open dataset without loading into memory
 adata = cx.read_h5ad_ondisk("data/demo_benchmark.h5ad")
+
+# Streaming normalization + log1p (for t-test/Wilcoxon)
+adata_norm = cx.pp.normalize_total_log1p(
+    adata,  # Pass AnnData object directly
+    output_dir="results/",
+    data_name="normalized",
+)
 
 # Quality control with adaptive thresholds
 adata = cx.pp.qc_summary(

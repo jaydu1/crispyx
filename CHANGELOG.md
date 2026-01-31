@@ -2,6 +2,65 @@
 
 All notable changes to crispyx are documented here.
 
+## [0.7.2] - 2026-01-20
+
+### Added
+- **Streaming preprocessing with `cx.pp.normalize_total_log1p()`**: New function for 
+  normalizing and log-transforming large h5ad files without loading them into memory.
+  - Processes data in chunks (default 4096 cells per chunk)
+  - Equivalent to `scanpy.pp.normalize_total()` + `scanpy.pp.log1p()`
+  - Supports separate `normalize` and `log1p` flags for flexibility
+  - Custom `target_sum` parameter (default 1e4)
+  - Scanpy-style API: accepts AnnData objects or paths, returns AnnData wrapper
+  - Example: `adata_norm = cx.pp.normalize_total_log1p(adata_ro, output_dir=OUTPUT_DIR)`
+  - Also available as direct function: `from crispyx.data import normalize_total_log1p`
+  - Required for t-test and Wilcoxon on large datasets that would OOM during preprocessing
+
+- **Unified input resolution with `resolve_data_path()`**: New utility function in
+  `crispyx.data` that standardizes input handling across all main crispyx functions.
+  - Accepts `str | Path | crispyx.AnnData | anndata.AnnData`
+  - Raises clear `TypeError` for in-memory (non-backed) AnnData objects
+  - Optional `require_exists` parameter for path validation
+  - All QC, DE, and pseudobulk functions now accept AnnData objects directly
+
+### Changed
+- **Flexible input types for all main functions**: The following functions now accept
+  either a file path or an AnnData object as their first argument:
+  - QC: `filter_cells_by_gene_count()`, `filter_perturbations_by_cell_count()`,
+    `filter_genes_by_cell_count()`, `quality_control_summary()`
+  - DE: `t_test()`, `wilcoxon_test()`, `nb_glm_test()`, `shrink_lfc()`
+  - Pseudobulk: `compute_average_log_expression()`, `compute_pseudobulk_expression()`
+  - Preprocessing: `normalize_total_log1p()`
+
+### Fixed
+- **Singularity cgroups v2 compatibility**: Removed `--memory` flag from Singularity exec 
+  in SLURM scripts. Many HPC clusters don't support cgroups v2 in unified mode. Memory 
+  limits are now enforced by SLURM's `--mem` allocation instead.
+
+## [0.7.1] - 2026-01-14
+
+### Fixed
+- **QC in-memory path memory optimization**: Reduced peak memory for `_qc_in_memory()` 
+  by eliminating intermediate copies. Previously made 3 sequential `.copy()` calls 
+  (cell filter → perturbation filter → gene filter); now builds combined masks first 
+  and performs a single copy at the end. This matches Scanpy's memory efficiency for 
+  in-memory QC operations.
+
+### Changed
+- **Adaptive chunk size defaults**: Updated `calculate_optimal_chunk_size()` defaults 
+  for more conservative memory usage:
+  - `max_chunk`: 8192 → 4096 (halved for smaller memory footprint per chunk)
+  - `safety_factor`: 4.0 → 8.0 (doubled for more headroom)
+- **New `calculate_optimal_gene_chunk_size()`**: Added function for column-based 
+  operations (e.g., Wilcoxon test) with gene-aware chunking strategy.
+- **Pseudobulk and DE use adaptive chunk sizes**: `average_log_expression()`, `t_test()`, 
+  and `wilcoxon_test()` now use `calculate_optimal_chunk_size()` when chunk_size is None, 
+  instead of hardcoded defaults.
+
+### Improved
+- **Code organization**: Moved inline imports (`gc`, `anndata`, `Counter`) to module-level 
+  imports in `qc.py` for cleaner code structure.
+
 ## [0.7.0] - 2026-01
 
 ### Added

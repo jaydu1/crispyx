@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Literal
 
 import anndata as ad
 import numpy as np
@@ -16,10 +16,14 @@ except PackageNotFoundError:
 
 from .data import (
     AnnData,
+    calculate_optimal_chunk_size,
+    calculate_optimal_gene_chunk_size,
     ensure_gene_symbol_column,
+    normalize_total_log1p,
     read_h5ad_ondisk,
     read_backed,
     resolve_control_label,
+    resolve_data_path,
     resolve_output_path,
     sort_by_perturbation,
 )
@@ -49,23 +53,8 @@ from .qc import (
 )
 
 
-def _resolve_backed_path(data: str | Path | ad.AnnData | AnnData) -> Path:
-    """Return the on-disk path for a backed AnnData object or path-like input."""
-
-    if isinstance(data, (str, Path)):
-        return Path(data)
-    if isinstance(data, AnnData):
-        return data.path
-    if isinstance(data, ad.AnnData):
-        filename = getattr(data, "filename", None)
-        if filename:
-            return Path(filename)
-        raise TypeError(
-            "Operations in streamlined_crispr expect a backed AnnData object or file path."
-        )
-    raise TypeError(
-        f"Expected a path-like value or backed AnnData; received {type(data)!r}."
-    )
+# Alias for backward compatibility
+_resolve_backed_path = resolve_data_path
 
 
 def _infer_control_label(
@@ -245,6 +234,7 @@ class _PreprocessingNamespace:
         chunk_size: int = 2048,
         output_dir: str | Path | None = None,
         data_name: str | None = None,
+        cache_mode: Literal['memory', 'memmap', 'none'] = 'memmap',
     ):
         path = _resolve_backed_path(data)
         result = quality_control_summary(
@@ -258,8 +248,65 @@ class _PreprocessingNamespace:
             chunk_size=chunk_size,
             output_dir=output_dir,
             data_name=data_name,
+            cache_mode=cache_mode,
         )
         return result.filtered
+
+    def normalize_total_log1p(
+        self,
+        data: str | Path | ad.AnnData,
+        output_path: str | Path | None = None,
+        *,
+        normalize: bool = True,
+        log1p: bool = True,
+        target_sum: float = 1e4,
+        chunk_size: int = 4096,
+        output_dir: str | Path | None = None,
+        data_name: str | None = None,
+        verbose: bool = True,
+    ) -> AnnData:
+        """Stream normalize and/or log-transform an h5ad file.
+        
+        This is the streaming equivalent of calling ``scanpy.pp.normalize_total``
+        followed by ``scanpy.pp.log1p``. Processes data in chunks to avoid OOM.
+        
+        Parameters
+        ----------
+        data
+            Path to h5ad file or backed AnnData.
+        output_path
+            Path for output. If None, uses output_dir/data_name pattern.
+        normalize
+            Apply total-count normalization. Default True.
+        log1p
+            Apply log1p transformation. Default True.
+        target_sum
+            Target counts per cell. Default 1e4.
+        chunk_size
+            Cells per chunk. Default 4096.
+        output_dir
+            Output directory. Defaults to input file's directory.
+        data_name
+            Custom output name suffix.
+        verbose
+            Print progress.
+        
+        Returns
+        -------
+        AnnData
+            Read-only AnnData wrapper pointing to output file.
+        """
+        return normalize_total_log1p(
+            data,
+            output_path,
+            normalize=normalize,
+            log1p=log1p,
+            target_sum=target_sum,
+            chunk_size=chunk_size,
+            output_dir=output_dir,
+            data_name=data_name,
+            verbose=verbose,
+        )
 
 
 class _PseudobulkNamespace:
@@ -526,6 +573,9 @@ __all__ = [
     "read_backed",
     "resolve_control_label",
     "resolve_output_path",
+    "calculate_optimal_chunk_size",
+    "calculate_optimal_gene_chunk_size",
+    "normalize_total_log1p",
     # Profiling utilities
     "Profiler",
     "MemoryProfiler",
