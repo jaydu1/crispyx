@@ -68,6 +68,7 @@ from crispyx.data import (
     resolve_control_label,
     calculate_adaptive_qc_thresholds,
     standardize_dataset,
+    normalize_total_log1p,
 )
 from crispyx.de import t_test, wilcoxon_test, nb_glm_test, shrink_lfc
 from .comparison import DE_METRIC_KEYS, compute_de_comparison_metrics
@@ -473,8 +474,7 @@ def run_edger_de(
     # Configure R
     env_config = get_global_env_config()
     r_home = env_config.r_home if env_config else None
-    if r_home is None and 'R_HOME' not in os.environ:
-        r_home = '/data/miniforge3/envs/pert/lib/R'
+    # Let auto-detection find R_HOME instead of using hardcoded path
     configure_r_environment(r_home)
     
     import scanpy as sc
@@ -4237,18 +4237,15 @@ def create_benchmark_suite(
     de_dir = output_dir / "de"
     de_dir.mkdir(parents=True, exist_ok=True)
 
-    # Create preprocessed dataset for t-test benchmarks
+    # Create preprocessed dataset for t-test benchmarks using streaming
     preprocessed_path = preprocessing_dir / f"preprocessed_{dataset_path.name}"
     if not preprocessed_path.exists():
-        import scanpy as sc
-        import scipy.sparse as sp
-        print(f"Generating preprocessed dataset for t-test benchmarks: {preprocessed_path}")
-        adata_pp = sc.read_h5ad(dataset_path)
-        sc.pp.normalize_total(adata_pp)
-        sc.pp.log1p(adata_pp)
-        if not sp.issparse(adata_pp.X):
-            adata_pp.X = sp.csr_matrix(adata_pp.X)
-        adata_pp.write(preprocessed_path)
+        normalize_total_log1p(
+            dataset_path,
+            preprocessed_path,
+            chunk_size=final_chunk_size,
+            verbose=True,
+        )
 
     methods = {
         "crispyx_qc_filtered": BenchmarkMethod(
