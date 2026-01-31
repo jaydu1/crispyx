@@ -1,5 +1,5 @@
 #!/bin/bash
-# Dataset Inspection Script for CRISPyx
+# Dataset Inspection Script for crispyx
 # Auto-detects dataset structures and generates individual config files
 #
 # Usage:

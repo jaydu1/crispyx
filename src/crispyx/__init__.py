@@ -41,6 +41,16 @@ from .profiling import (
     TimingProfiler,
     plot_benchmark_comparison,
 )
+from .plotting import (
+    materialize_rank_genes_groups,
+    plot_ma,
+    plot_qc_perturbation_counts,
+    plot_qc_summary,
+    plot_top_genes_bar,
+    plot_volcano,
+    rank_genes_groups as plot_rank_genes_groups,
+    rank_genes_groups_df,
+)
 from .pseudobulk import (
     compute_average_log_expression,
     compute_pseudobulk_expression,
@@ -547,15 +557,44 @@ class _ToolsNamespace:
         )
 
 
+class _PlottingNamespace:
+    """Scanpy-style plotting entry points for crispyx."""
+
+    def rank_genes_groups(self, data, **kwargs):
+        return plot_rank_genes_groups(data, **kwargs)
+
+    def rank_genes_groups_df(self, data, group, **kwargs):
+        return rank_genes_groups_df(data, group, **kwargs)
+
+    def volcano(self, **kwargs):
+        return plot_volcano(**kwargs)
+
+    def ma(self, **kwargs):
+        return plot_ma(**kwargs)
+
+    def top_genes_bar(self, **kwargs):
+        return plot_top_genes_bar(**kwargs)
+
+    def qc_perturbation_counts(self, **kwargs):
+        return plot_qc_perturbation_counts(**kwargs)
+
+    def qc_summary(self, qc_result, **kwargs):
+        return plot_qc_summary(qc_result, **kwargs)
+
+    def materialize_rank_genes_groups(self, data, **kwargs):
+        return materialize_rank_genes_groups(data, **kwargs)
+
 pp = _PreprocessingNamespace()
 pb = _PseudobulkNamespace()
 tl = _ToolsNamespace()
+pl = _PlottingNamespace()
 
 __all__ = [
     "__version__",
     "pp",
     "pb",
     "tl",
+    "pl",
     "filter_cells_by_gene_count",
     "filter_genes_by_cell_count",
     "filter_perturbations_by_cell_count",
@@ -581,4 +620,12 @@ __all__ = [
     "MemoryProfiler",
     "TimingProfiler",
     "plot_benchmark_comparison",
+    # Plotting utilities
+    "materialize_rank_genes_groups",
+    "rank_genes_groups_df",
+    "plot_volcano",
+    "plot_ma",
+    "plot_top_genes_bar",
+    "plot_qc_perturbation_counts",
+    "plot_qc_summary",
 ]

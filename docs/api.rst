@@ -16,6 +16,11 @@ API Reference
    :undoc-members:
    :show-inheritance:
 
+.. automodule:: crispyx.plotting
+   :members:
+   :undoc-members:
+   :show-inheritance:
+
 .. automodule:: crispyx.glm
    :members:
    :undoc-members:

@@ -7,6 +7,7 @@ A lightweight toolkit for streaming CRISPR screen analysis that processes large 
 - **Streaming QC** – Filters low-quality cells, perturbations, and genes with automatic control label detection and adaptive thresholds
 - **Streaming preprocessing** – Normalize and log-transform large datasets without loading into memory
 - **Scanpy-style API** – Familiar `cx.pp`, `cx.pb`, and `cx.tl` namespaces for quality control, pseudo-bulk, and differential expression
+- **Scanpy-style plotting** – `cx.pl` helpers for rank genes groups, volcano/MA plots, and QC summaries without loading counts
 - **Pseudo-bulk aggregation** – Average log expression and pseudo-bulk counts for effect size estimation
 - **Differential expression** – t-test, Wilcoxon, and negative binomial GLM tests with multi-core support
 - **LFC shrinkage** – apeGLM adaptive shrinkage for more accurate log-fold change estimates
@@ -71,6 +72,19 @@ result = cx.nb_glm_test(
 # Access results
 print(adata.uns["rank_genes_groups"])
 de_results = adata.uns["rank_genes_groups"].load()
+
+# Plotting (Scanpy-style)
+cx.pl.rank_genes_groups(adata, n_genes=20, sharey=False)
+df = cx.pl.rank_genes_groups_df(adata, group="perturbation_A", n_genes=200)
+cx.pl.volcano(de_df=df, group="perturbation_A")
+cx.pl.ma(
+    data=adata,
+    de_result=adata,
+    group="perturbation_A",
+    reference="control",
+    perturbation_column="perturbation",
+    mean_mode="raw",
+)
 ```
 
 ## Installation

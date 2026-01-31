@@ -1,5 +1,5 @@
 #!/bin/bash
-# CRISPyx Benchmark Runner
+# crispyx Benchmark Runner
 # Runs benchmarks on one or more datasets with optional Docker support
 #
 # Usage:

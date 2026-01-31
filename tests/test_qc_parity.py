@@ -143,7 +143,7 @@ def test_qc_row_oriented_basic(tmp_output_dir):
         gene_name_column=None,
         chunk_size=1024,
         output_path=output_path,
-        use_chunk_cache=True,
+        cache_mode="memmap",
         delta_threshold=0.3,
         **QC_PARAMS,
     )
@@ -193,7 +193,7 @@ def test_qc_strategy_parity_csr(tmp_output_dir):
         dataset["path"],
         output_path=tmp_output_dir / "row.h5ad",
         chunk_size=1024,
-        use_chunk_cache=True,
+        cache_mode="memmap",
         delta_threshold=0.3,
         **common_kwargs,
     )
@@ -261,7 +261,7 @@ def test_qc_strategy_parity_csc(tmp_output_dir):
         dataset["path"],
         output_path=tmp_output_dir / "row.h5ad",
         chunk_size=1024,
-        use_chunk_cache=True,
+        cache_mode="memmap",
         delta_threshold=0.3,
         **common_kwargs,
     )

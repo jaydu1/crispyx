@@ -99,6 +99,50 @@ returned :class:`cx.AnnData` wrapper stores previews of the results in
 ``.uns`` so printing ``adata.uns["rank_genes_groups"]`` shows the top genes
 per perturbation while ``.load()`` retrieves the full tables on demand.
 
+Plotting
+--------
+
+crispyx provides Scanpy-style plotting helpers under ``cx.pl`` that work with
+on-disk results. The plotting functions materialise only the metadata needed
+for plotting, keeping the expression matrix on disk.
+
+.. code-block:: python
+
+   # Rank genes groups plot (Scanpy-style)
+   cx.pl.rank_genes_groups(adata_de, n_genes=20, sharey=False)
+
+   # Convert DE results into a tidy DataFrame for custom plots
+   df = cx.pl.rank_genes_groups_df(adata_de, group="perturbation_A", n_genes=200)
+
+   # Volcano and top-genes plots
+   cx.pl.volcano(de_df=df, group="perturbation_A")
+   cx.pl.top_genes_bar(de_df=df, group="perturbation_A", topn=15)
+
+   # MA plot using raw counts or normalized log1p means
+   cx.pl.ma(
+       data=adata_ro,  # raw counts
+       de_result=adata_de,
+       group="perturbation_A",
+       reference="control",
+       perturbation_column="perturbation",
+       mean_mode="raw",  # or "log1p"
+   )
+
+   # QC plotting (composition + summary distributions)
+   qc = cx.pp.qc_summary(
+       adata_ro,
+       perturbation_column="perturbation",
+       min_genes=100,
+       min_cells_per_perturbation=15,
+       min_cells_per_gene=10,
+   )
+   cx.pl.qc_perturbation_counts(
+       data=adata_ro,
+       perturbation_column="perturbation",
+       cell_mask=qc.cell_mask,
+   )
+   cx.pl.qc_summary(qc, min_genes=100, min_cells_per_gene=10)
+
 NB-GLM options
 ~~~~~~~~~~~~~~
 

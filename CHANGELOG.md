@@ -2,6 +2,14 @@
 
 All notable changes to crispyx are documented here.
 
+## [0.7.3] - 2026-01-31
+
+### Added
+- **Scanpy-style plotting namespace (`cx.pl`)** with on-disk safe helpers for DE and QC plots.
+- **On-demand materialization of `uns['rank_genes_groups']`** for plotting without loading counts.
+- **DE plotting utilities**: rank-genes plot wrapper, volcano, MA (raw or normalized log1p means), and top-genes bar plots.
+- **QC plotting utilities**: perturbation composition and QC summary distributions from `QualityControlResult`.
+
 ## [0.7.2] - 2026-01-20
 
 ### Added
