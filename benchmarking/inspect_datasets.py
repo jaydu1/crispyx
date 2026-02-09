@@ -384,9 +384,9 @@ def main():
         "Adamson", "Frangieh",
         "Replogle-GW-k562", "Replogle-E-k562", "Replogle-E-rpe1",
         "Tian-crispra", "Tian-crispri",
-        # "Huang-HCT116", "Huang-HEK293T",
         "Nadig-HEPG2", "Nadig-JURKAT",
-        "Feng-ts", "Feng-gwsf", "Feng-gwsnf"
+        "Feng-ts", "Feng-gwsf", "Feng-gwsnf",
+        "Huang-HCT116", "Huang-HEK293T",
     ]
     
     data_dir = Path("/data/projects/SeqExpDesign/data/origin/")
