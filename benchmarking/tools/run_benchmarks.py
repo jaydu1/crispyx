@@ -943,7 +943,7 @@ def run_nb_glm_base(
     # Run NB-GLM base fitting with profiling (no shrinkage)
     t_base_start = time.perf_counter()
     base_result = nb_glm_test(
-        path=path,
+        data=path,
         perturbation_column=perturbation_column,
         control_label=control_label,
         output_dir=output_dir,
@@ -1037,7 +1037,7 @@ def run_lfcshrink(
     
     t_start = time.perf_counter()
     shrunk_result = shrink_lfc(
-        path=base_result_path,
+        data=base_result_path,
         output_dir=output_dir,
         data_name=data_name,
         profiling=profiling,
@@ -4253,7 +4253,7 @@ def create_benchmark_suite(
             description="Streaming quality control filters",
             function=quality_control_summary,
             kwargs={
-                "path": dataset_path,
+                "data": dataset_path,
                 "min_genes": min_genes,
                 "min_cells_per_perturbation": min_cells_per_perturbation,
                 "min_cells_per_gene": min_cells_per_gene,
@@ -4269,7 +4269,7 @@ def create_benchmark_suite(
             description="Average log-normalised expression per perturbation",
             function=compute_average_log_expression,
             kwargs={
-                "path": dataset_path,
+                "data": dataset_path,
                 **shared_kwargs,
                 "output_dir": preprocessing_dir,
                 "data_name": "pb_avg_log",
@@ -4281,7 +4281,7 @@ def create_benchmark_suite(
             description="Pseudo-bulk log fold-change per perturbation",
             function=compute_pseudobulk_expression,
             kwargs={
-                "path": dataset_path,
+                "data": dataset_path,
                 **shared_kwargs,
                 "output_dir": preprocessing_dir,
                 "data_name": "pb_pseudobulk",
@@ -4293,7 +4293,7 @@ def create_benchmark_suite(
             description="t-test differential expression test",
             function=t_test,
             kwargs={
-                "path": preprocessed_path,
+                "data": preprocessed_path,
                 **shared_kwargs,
                 "output_dir": de_dir,
                 "data_name": "de_t_test",
@@ -4306,7 +4306,7 @@ def create_benchmark_suite(
             description="Wilcoxon rank-sum differential expression",
             function=wilcoxon_test,
             kwargs={
-                "path": preprocessed_path,
+                "data": preprocessed_path,
                 **shared_kwargs,
                 "output_dir": de_dir,
                 "data_name": "de_wilcoxon",

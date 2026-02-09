@@ -1585,7 +1585,8 @@ def _update_h5ad_dataframe(h5file: h5py.File, group_name: str, df: pd.DataFrame)
     
     # Update column names (stored as 'column-order' attribute)
     col_names = list(df.columns)
-    grp.attrs['column-order'] = np.array(col_names, dtype=object)
+    # HDF5 attributes don't support object dtype; encode strings as bytes
+    grp.attrs['column-order'] = np.array([c.encode('utf-8') for c in col_names])
     
     # Update each column
     for col in df.columns:
