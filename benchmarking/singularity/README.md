@@ -11,34 +11,38 @@ cd /path/to/Streamlining-CRISPR-Screen-Analysis
 DOCKER_BUILDKIT=1 docker build -t crispyx-benchmark -f benchmarking/Dockerfile .
 ```
 
-### 2. Convert to Singularity (Local Machine)
+### 2. Convert to Singularity
 
-**Option A: If Singularity is installed locally:**
+**Option A: Build SIF locally (if Singularity is installed):**
 
 ```bash
 chmod +x benchmarking/singularity/build_singularity.sh
 ./benchmarking/singularity/build_singularity.sh
 ```
 
-This creates `benchmarking/singularity/crispyx-benchmark.sif`
+This creates `benchmarking/singularity/crispyx-benchmark.sif` directly.
 
-**Option B: If Singularity is NOT installed locally:**
-
-Save Docker image as tarball and convert on HPC:
+**Option B: Export Docker tarball, convert on HPC (recommended for most setups):**
 
 ```bash
-# On local machine - save Docker image
-docker save crispyx-benchmark:latest -o crispyx-benchmark.tar
+# 1. On local machine - export Docker image to tarball
+docker save crispyx-benchmark:latest -o benchmarking/singularity/crispyx-benchmark.tar
 
-# Transfer to HPC
-scp crispyx-benchmark.tar user@hpc:/path/to/destination/
+# Check size (typically 3-5 GB)
+ls -lh benchmarking/singularity/crispyx-benchmark.tar
 
-# On HPC - convert to SIF
+# 2. Transfer tarball to HPC
+scp benchmarking/singularity/crispyx-benchmark.tar user@hpc:/path/to/project/benchmarking/singularity/
+
+# 3. On HPC - convert tarball to SIF
+cd /path/to/project/benchmarking/singularity
 singularity build crispyx-benchmark.sif docker-archive://crispyx-benchmark.tar
 
-# Clean up tarball (optional)
+# 4. Clean up tarball to save space (optional)
 rm crispyx-benchmark.tar
 ```
+
+**Note:** Option B is useful when Singularity isn't available locally but is installed on the HPC cluster.
 
 ### 3. Transfer to HPC
 
@@ -84,6 +88,8 @@ benchmarking/singularity/
 ├── build_singularity.sh   # Script to build SIF from Docker image
 ├── run_singularity.sh     # Script to run benchmarks with Singularity
 ├── slurm_benchmark.sh     # SLURM job submission script
+├── submit_benchmark.sh    # Batch submission helper
+├── crispyx-benchmark.tar  # Docker image tarball (for HPC transfer)
 └── crispyx-benchmark.sif  # Singularity image (after building)
 ```
 

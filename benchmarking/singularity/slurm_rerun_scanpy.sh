@@ -1,24 +1,19 @@
 #!/bin/bash
-#SBATCH --job-name=crispyx-bench
+#SBATCH --job-name=rerun-scanpy
 #SBATCH --partition=intel
 #
-# SLURM job script for running CRISPYx benchmarks with Singularity
+# SLURM job script for rerunning Scanpy methods with Singularity
 #
-# IMPORTANT: Use submit_benchmark.sh to auto-configure resources from config:
-#   ./submit_benchmark.sh Adamson_subset.yaml
-#   ./submit_benchmark.sh Replogle-GW-k562.yaml
+# IMPORTANT: Use submit_rerun_scanpy.sh to auto-configure resources from config:
+#   ./submit_rerun_scanpy.sh Adamson_subset.yaml
+#   ./submit_rerun_scanpy.sh Replogle-GW-k562.yaml
 #
-# Log files are named: {dataset}_{YYYYMMDD_HHMMSS}.out/.err
-#
-# Or override manually:
-#   sbatch --time=24:00:00 --mem=256G --cpus-per-task=32 slurm_benchmark.sh config.yaml
+# Log files are named: rerun_scanpy_{dataset}_{YYYYMMDD_HHMMSS}.out/.err
 
 set -e
 
 # ============================================================================
 # IMPORTANT: Set PROJECT_ROOT to the absolute path of your project on HPC
-# This is required because SLURM copies scripts to a spool directory,
-# breaking relative path resolution.
 # ============================================================================
 PROJECT_ROOT="${PROJECT_ROOT:-/lustre1/g/ids_du/Streamlining-CRISPR-Screen-Analysis}"
 
@@ -27,8 +22,8 @@ SINGULARITY_DIR="$PROJECT_ROOT/benchmarking/singularity"
 
 # Configuration
 CONFIG_FILE="${1:-Adamson_subset.yaml}"
-MEMORY_LIMIT_GB="${2:-128}"  # Memory limit in GB for Singularity (from submit_benchmark.sh)
-BENCHMARK_ARGS="${3:-}"      # Additional benchmark args (e.g., --force --clean)
+MEMORY_LIMIT_GB="${2:-128}"
+EXTRA_ARGS="${3:-}"
 SIF_FILE="${CRISPYX_SIF:-$SINGULARITY_DIR/crispyx-benchmark.sif}"
 DATA_DIR="${DATA_DIR:-$PROJECT_ROOT/data}"
 RESULTS_DIR="${RESULTS_DIR:-$PROJECT_ROOT/benchmarking/results}"
@@ -38,20 +33,19 @@ CONFIG_DIR="${CONFIG_DIR:-$PROJECT_ROOT/benchmarking/config}"
 # Use SLURM-allocated resources
 N_CORES="${SLURM_CPUS_PER_TASK:-8}"
 
-# Create output directories (using absolute paths)
+# Create output directories
 mkdir -p "$RESULTS_DIR" "$LOGS_DIR"
 
 # Print job info
 echo "========================================"
-echo "CRISPYx Benchmark - SLURM Job"
+echo "Rerun Scanpy - SLURM Job"
 echo "========================================"
 echo "Job ID: $SLURM_JOB_ID"
 echo "Node: $SLURMD_NODENAME"
 echo "CPUs: $N_CORES"
 echo "SLURM Memory: $((SLURM_MEM_PER_NODE / 1024))G"
-echo "Container Memory Limit: ${MEMORY_LIMIT_GB}G"
 echo "Config: $CONFIG_FILE"
-[ -n "$BENCHMARK_ARGS" ] && echo "Benchmark args: $BENCHMARK_ARGS"
+[ -n "$EXTRA_ARGS" ] && echo "Extra args: $EXTRA_ARGS"
 echo "Start time: $(date)"
 echo "========================================"
 
@@ -61,22 +55,10 @@ if [ ! -f "$SIF_FILE" ]; then
     exit 1
 fi
 
-# Paths are already absolute, no need to resolve
-# Just verify they exist
 if [ ! -d "$DATA_DIR" ]; then
     echo "ERROR: Data directory not found: $DATA_DIR"
     exit 1
 fi
-
-# Debug: List contents of data directory
-echo "Data directory contents:"
-ls -la "$DATA_DIR"
-echo ""
-
-# Check if the specific data file exists (extract from config if possible)
-echo "Checking for h5ad files:"
-ls -la "$DATA_DIR"/*.h5ad 2>/dev/null || echo "No .h5ad files found in $DATA_DIR"
-echo ""
 
 # Set thread limits
 export OMP_NUM_THREADS=$N_CORES
@@ -84,24 +66,10 @@ export MKL_NUM_THREADS=$N_CORES
 export OPENBLAS_NUM_THREADS=$N_CORES
 export NUMBA_NUM_THREADS=$N_CORES
 
-# Run benchmark
-# Debug: Test if bind mount works by listing the data dir inside container
-echo "Testing bind mount inside container:"
-singularity exec \
-    --bind "$DATA_DIR:/workspace/data:ro" \
-    "$SIF_FILE" \
-    ls -la /workspace/data/
-echo ""
-
-# Note: We bind the entire PROJECT_ROOT to /workspace to preserve relative paths
-# This is simpler and more reliable than binding individual subdirectories
-# Memory limits are enforced by SLURM (--mem flag in sbatch), not Singularity
-# Singularity's --memory flag requires cgroups v2 in unified mode, which many
-# HPC clusters don't support. SLURM's memory enforcement is sufficient.
-# Build command with optional benchmark args
-CMD="python -m benchmarking.tools.run_benchmarks --config benchmarking/config/$CONFIG_FILE"
-if [ -n "$BENCHMARK_ARGS" ]; then
-    CMD="$CMD $BENCHMARK_ARGS"
+# Build command with optional extra args
+CMD="python -m benchmarking.tools.rerun_scanpy --config benchmarking/config/$CONFIG_FILE"
+if [ -n "$EXTRA_ARGS" ]; then
+    CMD="$CMD $EXTRA_ARGS"
 fi
 
 echo "Running: $CMD"

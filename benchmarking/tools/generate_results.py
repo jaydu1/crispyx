@@ -1125,17 +1125,25 @@ def evaluate_benchmarks(output_dir: Path) -> None:
             return None
     
     # Explicitly collect all DE methods for heatmaps (base results)
+    # Also check for outputs from reference extraction (no cache entry but file exists)
     for method_name in ALL_DE_METHODS_FOR_HEATMAP:
+        if method_name in de_results_for_heatmaps:
+            continue  # Already loaded
+        
         method_res = df[df["method"] == method_name]
-        if method_res.empty:
-            continue
-        row = method_res.iloc[0]
-        if not has_valid_result(row, output_dir):
-            continue
-        result_path_val = row.get("result_path")
-        # Now _load_de_result handles fallback, so we can always try to load
-        if method_name not in de_results_for_heatmaps:
-            method_df = _load_de_result(method_name, result_path_val)
+        if not method_res.empty:
+            row = method_res.iloc[0]
+            if has_valid_result(row, output_dir):
+                result_path_val = row.get("result_path")
+                method_df = _load_de_result(method_name, result_path_val)
+                if method_df is not None:
+                    de_results_for_heatmaps[method_name] = method_df
+                    continue
+        
+        # No cache entry or invalid - check for output file directly (reference extraction)
+        resolved_path = resolve_result_path(method_name, None, output_dir)
+        if resolved_path is not None:
+            method_df = _load_de_result(method_name, str(resolved_path))
             if method_df is not None:
                 de_results_for_heatmaps[method_name] = method_df
     
@@ -1147,86 +1155,108 @@ def evaluate_benchmarks(output_dir: Path) -> None:
         method_a_res = df[df["method"] == method_a_name]
         method_b_res = df[df["method"] == method_b_name]
         
-        if method_a_res.empty or method_b_res.empty:
-            # Track skipped comparison due to missing method
-            missing = []
-            if method_a_res.empty:
-                missing.append(method_a_name)
-            if method_b_res.empty:
-                missing.append(method_b_name)
-            skipped_comparisons.append({
-                "method_a": method_a_name,
-                "method_b": method_b_name,
-                "comp_type": comp_type,
-                "reason": f"method(s) not run: {', '.join(missing)}",
-            })
-            continue
+        # Check if reference outputs exist even without cache entries
+        # This allows accuracy comparison with outputs from reference extraction
+        method_a_has_output = False
+        method_b_has_output = False
+        method_a_resolved = None
+        method_b_resolved = None
         
-        a_row = method_a_res.iloc[0]
-        b_row = method_b_res.iloc[0]
-        
-        # Check if both methods have valid results (success or skipped_existing with file)
-        if not has_valid_result(a_row, output_dir) or not has_valid_result(b_row, output_dir):
-            # Track skipped comparison due to invalid results
-            error_methods = []
-            if not has_valid_result(a_row, output_dir):
-                a_status = a_row.get("status", "unknown")
-                a_error = a_row.get("error", "")
-                error_methods.append(f"{method_a_name} ({a_status})")
-            if not has_valid_result(b_row, output_dir):
-                b_status = b_row.get("status", "unknown")
-                b_error = b_row.get("error", "")
-                error_methods.append(f"{method_b_name} ({b_status})")
-            skipped_comparisons.append({
-                "method_a": method_a_name,
-                "method_b": method_b_name,
-                "comp_type": comp_type,
-                "reason": f"method error: {', '.join(error_methods)}",
-            })
-            continue
-        
-        # For all methods, use elapsed_seconds directly
-        # (base NB-GLM and lfcShrink methods are now separate with their own timings)
-        a_time = a_row.get("elapsed_seconds", np.nan)
-        b_time = b_row.get("elapsed_seconds", np.nan)
-        
-        a_mem = a_row.get("peak_memory_mb", np.nan)
-        b_mem = b_row.get("peak_memory_mb", np.nan)
-        
-        comp = {
-            "comparison": f"{method_a_name} vs {method_b_name}",
-            "comp_type": comp_type,  # Store comparison type for display
-            "method_a_time_s": a_time,
-            "method_b_time_s": b_time,
-            "time_diff_s": a_time - b_time if is_scalar_notna(a_time) and is_scalar_notna(b_time) else None,
-            "time_pct": (a_time / b_time * 100) if is_scalar_notna(a_time) and is_scalar_notna(b_time) and b_time > 0 else None,
-            "method_a_mem_mb": a_mem,
-            "method_b_mem_mb": b_mem,
-            "mem_diff_mb": a_mem - b_mem if is_scalar_notna(a_mem) and is_scalar_notna(b_mem) else None,
-            "mem_pct": (a_mem / b_mem * 100) if is_scalar_notna(a_mem) and is_scalar_notna(b_mem) and b_mem > 0 else None,
-        }
-        perf_comp_results.append(comp)
-        
-        try:
-            # For all comparison types, use result_path directly
-            # (standalone lfcShrink methods now have their own result_path)
+        if not method_a_res.empty:
             method_a_path_val = method_a_res.iloc[0].get("result_path")
-            method_b_path_val = method_b_res.iloc[0].get("result_path")
-            
-            # Use resolve_result_path for fallback - don't skip based on cached value alone
             method_a_resolved = resolve_result_path(method_a_name, method_a_path_val, output_dir)
+            method_a_has_output = method_a_resolved is not None
+        else:
+            # No cache entry - check for output file directly (from reference extraction)
+            method_a_resolved = resolve_result_path(method_a_name, None, output_dir)
+            method_a_has_output = method_a_resolved is not None
+        
+        if not method_b_res.empty:
+            method_b_path_val = method_b_res.iloc[0].get("result_path")
             method_b_resolved = resolve_result_path(method_b_name, method_b_path_val, output_dir)
+            method_b_has_output = method_b_resolved is not None
+        else:
+            # No cache entry - check for output file directly (from reference extraction)
+            method_b_resolved = resolve_result_path(method_b_name, None, output_dir)
+            method_b_has_output = method_b_resolved is not None
+        
+        # Determine if we can proceed with comparison
+        # For accuracy comparison: we only need output files to exist
+        # For performance comparison: we need cache entries with timing data
+        can_compare_accuracy = method_a_has_output and method_b_has_output
+        can_compare_performance = (
+            not method_a_res.empty and not method_b_res.empty and
+            has_valid_result(method_a_res.iloc[0], output_dir) and
+            has_valid_result(method_b_res.iloc[0], output_dir)
+        )
+        
+        if not can_compare_accuracy:
+            # Track skipped comparison due to missing output
+            missing = []
+            if not method_a_has_output:
+                if method_a_res.empty:
+                    missing.append(f"{method_a_name} (not run, no output)")
+                else:
+                    missing.append(f"{method_a_name} (no output file)")
+            if not method_b_has_output:
+                if method_b_res.empty:
+                    missing.append(f"{method_b_name} (not run, no output)")
+                else:
+                    missing.append(f"{method_b_name} (no output file)")
+            skipped_comparisons.append({
+                "method_a": method_a_name,
+                "method_b": method_b_name,
+                "comp_type": comp_type,
+                "reason": f"missing output: {', '.join(missing)}",
+            })
+            continue
+        
+        # Get row data for methods that have cache entries
+        a_row = method_a_res.iloc[0] if not method_a_res.empty else None
+        b_row = method_b_res.iloc[0] if not method_b_res.empty else None
+        
+        # Performance comparison only if we have cache entries with timing data
+        if can_compare_performance:
+            a_time = a_row.get("elapsed_seconds", np.nan) if a_row is not None else np.nan
+            b_time = b_row.get("elapsed_seconds", np.nan) if b_row is not None else np.nan
+            
+            a_mem = a_row.get("peak_memory_mb", np.nan) if a_row is not None else np.nan
+            b_mem = b_row.get("peak_memory_mb", np.nan) if b_row is not None else np.nan
+            
+            comp = {
+                "comparison": f"{method_a_name} vs {method_b_name}",
+                "comp_type": comp_type,
+                "method_a_time_s": a_time,
+                "method_b_time_s": b_time,
+                "time_diff_s": a_time - b_time if is_scalar_notna(a_time) and is_scalar_notna(b_time) else None,
+                "time_pct": (a_time / b_time * 100) if is_scalar_notna(a_time) and is_scalar_notna(b_time) and b_time > 0 else None,
+                "method_a_mem_mb": a_mem,
+                "method_b_mem_mb": b_mem,
+                "mem_diff_mb": a_mem - b_mem if is_scalar_notna(a_mem) and is_scalar_notna(b_mem) else None,
+                "mem_pct": (a_mem / b_mem * 100) if is_scalar_notna(a_mem) and is_scalar_notna(b_mem) and b_mem > 0 else None,
+            }
+            perf_comp_results.append(comp)
+        
+        # Accuracy comparison uses the resolved paths (can work from reference extraction)
+        try:
+            # Use already-resolved paths (handles cache entry or direct file detection)
+            method_a_path_val = str(method_a_resolved) if method_a_resolved else None
+            method_b_path_val = str(method_b_resolved) if method_b_resolved else None
             
             if method_a_resolved is None or method_b_resolved is None:
                 print(f"Skipping comparison {method_a_name} vs {method_b_name}: missing result file")
                 continue
             
             if comp_type == "qc":
+                # QC comparison requires cache entries with cells_kept/genes_kept
+                if a_row is None or b_row is None:
+                    print(f"Skipping QC comparison {method_a_name} vs {method_b_name}: missing cache data")
+                    continue
                 acc = {
                     "comparison": f"{method_a_name} vs {method_b_name}",
                     "comp_type": comp_type,
-                    "cells_diff": float(method_a_res.iloc[0]["cells_kept"] - method_b_res.iloc[0]["cells_kept"]),
-                    "genes_diff": float(method_a_res.iloc[0]["genes_kept"] - method_b_res.iloc[0]["genes_kept"]),
+                    "cells_diff": float(a_row["cells_kept"] - b_row["cells_kept"]),
+                    "genes_diff": float(a_row["genes_kept"] - b_row["genes_kept"]),
                 }
                 accuracy_results.append(acc)
                 

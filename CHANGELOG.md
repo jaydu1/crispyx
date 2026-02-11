@@ -2,6 +2,44 @@
 
 All notable changes to crispyx are documented here.
 
+## [0.7.4] - 2026-02-11
+
+
+### Fixed
+- **Wilcoxon OOM on large datasets with many perturbation groups**: Enhanced 
+  `calculate_optimal_gene_chunk_size()` to account for the number of perturbation 
+  groups (`n_groups`), which significantly impacts memory due to output array allocation.
+  - Added `n_groups` parameter to scale chunk sizes based on group count
+  - Added `memory_fraction` parameter (default 0.5) to leave headroom for memmaps
+  - Reduced default `max_chunk` from 1024 → 512 for more conservative memory usage
+  - Added dynamic scaling: >10K groups → max 128, >5K → 256, >2K → 384
+  - Datasets like Huang-HEK293T (4.5M cells, 18K groups) now use 128 genes/chunk 
+    instead of ~440, reducing peak memory by ~50%
+  - Fixes OOM errors on Feng-gwsf, Feng-gwsnf, Huang-HCT116, Huang-HEK293T datasets
+
+
+### Added
+- **Rerun Scanpy script (`rerun_scanpy.py`)**: New tool to run Scanpy QC, t-test, 
+  and Wilcoxon methods without time/memory limits for datasets where they fail 
+  in the main benchmark.
+  - Run AFTER benchmarks to extract Scanpy outputs for accuracy comparison
+  - Automatically regenerates benchmark reports with updated accuracy tables
+  - Does NOT modify .benchmark_cache (preserves benchmark integrity)
+  - Usage: `./run_rerun_scanpy.sh config/Replogle-GW-k562.yaml`
+  - SLURM submission: `./submit_rerun_scanpy.sh Replogle-GW-k562.yaml`
+
+- **SLURM support for rerun_scanpy**: Added `slurm_rerun_scanpy.sh` and 
+  `submit_rerun_scanpy.sh` for running on HPC clusters with Singularity.
+
+### Changed
+- **`generate_results.py` now detects reference outputs**: Accuracy comparisons 
+  work even when Scanpy failed in benchmark but succeeded via rerun_scanpy.
+- **Fixed Scanpy DE file extensions in cache.py**: Corrected expected output 
+  paths from `.h5ad` to `.csv` for scanpy_de_t_test and scanpy_de_wilcoxon.
+- **`wilcoxon_test()` now passes `n_groups` to chunk calculator**: The function now 
+  determines the number of perturbation groups before calculating chunk size, enabling 
+  group-aware memory optimization.
+
 ## [0.7.3] - 2026-01-31
 
 ### Added
@@ -9,6 +47,9 @@ All notable changes to crispyx are documented here.
 - **On-demand materialization of `uns['rank_genes_groups']`** for plotting without loading counts.
 - **DE plotting utilities**: rank-genes plot wrapper, volcano, MA (raw or normalized log1p means), and top-genes bar plots.
 - **QC plotting utilities**: perturbation composition and QC summary distributions from `QualityControlResult`.
+
+### Fixed
+- **Layer naming consistency for DE results**: Fixed inconsistent HDF5 layer naming where some layers were named `logfoldchange` instead of `logfoldchanges`. All differential expression output now uses standardized layer names for consistency with Scanpy conventions and internal API expectations.
 
 ## [0.7.2] - 2026-01-20
 

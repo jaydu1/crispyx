@@ -244,7 +244,7 @@ def _load_existing_nb_glm_result(
     statistic_matrix = np.array(adata.layers["z_score"])
     pvalue_matrix = np.array(adata.layers["pvalue"])
     pvalue_adj_matrix = np.array(adata.layers["pvalue_adj"])
-    logfc_matrix = np.array(adata.layers["logfoldchange"])
+    logfc_matrix = np.array(adata.layers["logfoldchanges"])
     effect_matrix = logfc_matrix.copy()  # effect_size equals logfc for NB-GLM
     pts_matrix = np.array(adata.layers.get("pts", np.zeros_like(effect_matrix, dtype=np.float32)))
     pts_rest_matrix = np.array(adata.layers.get("pts_rest", np.zeros_like(effect_matrix, dtype=np.float32)))
@@ -773,7 +773,7 @@ def t_test(
     adata.layers["z_score"] = stat_matrix  # t-statistic (converges to z for large n)
     adata.layers["pvalue"] = pval_matrix
     adata.layers["pvalue_adj"] = pval_adj_matrix
-    adata.layers["logfoldchange"] = lfc_matrix
+    adata.layers["logfoldchanges"] = lfc_matrix
     adata.layers["pts"] = pts_matrix
     adata.layers["pts_rest"] = pts_rest_matrix
     adata.uns["method"] = "t_test"
@@ -2672,7 +2672,7 @@ def nb_glm_test(
     adata.layers["z_score"] = statistic_matrix
     adata.layers["pvalue"] = pvalue_matrix
     adata.layers["pvalue_adj"] = pvalue_adj_matrix
-    adata.layers["logfoldchange"] = logfc_matrix
+    adata.layers["logfoldchanges"] = logfc_matrix
     adata.layers["logfoldchange_raw"] = logfc_raw_matrix
     adata.layers["logfoldchange_raw_ln"] = logfc_raw_ln_matrix  # Always ln-scale for shrink_lfc
     adata.layers["intercept"] = intercept_matrix  # MLE intercept (ln-scale) for shrink_lfc
@@ -2836,10 +2836,6 @@ def wilcoxon_test(
     path = resolve_data_path(data)
     backed = read_backed(path)
     try:
-        # Calculate adaptive gene chunk_size if not provided
-        # Wilcoxon iterates over genes (columns), so use gene chunk calculator
-        if chunk_size is None:
-            chunk_size = calculate_optimal_gene_chunk_size(backed.n_obs, backed.n_vars)
         gene_symbols = ensure_gene_symbol_column(backed, gene_name_column)
         if perturbation_column not in backed.obs.columns:
             raise KeyError(
@@ -2857,6 +2853,14 @@ def wilcoxon_test(
         for label, mask in pert_masks.items():
             if not np.any(mask):
                 raise ValueError(f"Perturbation '{label}' contains no cells")
+        
+        # Calculate adaptive gene chunk_size if not provided
+        # Wilcoxon iterates over genes (columns), so use gene chunk calculator
+        # Pass n_groups to account for output array memory scaling
+        if chunk_size is None:
+            chunk_size = calculate_optimal_gene_chunk_size(
+                backed.n_obs, backed.n_vars, n_groups=len(candidates)
+            )
     finally:
         backed.file.close()
 
@@ -3164,7 +3168,7 @@ def wilcoxon_test(
     adata.layers["z_score"] = z_arr
     adata.layers["pvalue"] = pval_arr
     adata.layers["pvalue_adj"] = pval_adj_arr
-    adata.layers["logfoldchange"] = lfc_arr
+    adata.layers["logfoldchanges"] = lfc_arr
     adata.layers["u_statistic"] = u_arr
     adata.layers["pts"] = pts_arr
     adata.layers["pts_rest"] = pts_rest_arr
@@ -3620,7 +3624,7 @@ def shrink_lfc(
         shrunk_se = shrunk_se / ln2
     
     # Update layers
-    adata.layers["logfoldchange"] = shrunk_lfc
+    adata.layers["logfoldchanges"] = shrunk_lfc
     adata.layers["standard_error"] = shrunk_se  # Posterior SE
     adata.X = shrunk_lfc  # Update effect_size matrix
     

@@ -67,6 +67,47 @@ The benchmarking tools are organized into focused modules:
 - `visualization.py`: Overlap heatmap generation
 - `run_benchmarks.py`: Main benchmark runner
 - `generate_results.py`: Report generation from cached results
+- `rerun_scanpy.py`: Rerun Scanpy methods without resource limits
+
+## Rerun Scanpy (for Large Datasets)
+
+For large datasets where Scanpy times out or runs out of memory during benchmarks,
+use the rerun_scanpy script AFTER benchmarks complete:
+
+```bash
+# Native mode - rerun Scanpy methods for one dataset
+./run_rerun_scanpy.sh config/Replogle-GW-k562.yaml
+
+# Rerun specific methods only
+./run_rerun_scanpy.sh --methods scanpy_de_wilcoxon config/Feng-ts.yaml
+
+# Force re-run even if outputs exist
+./run_rerun_scanpy.sh --force config/Replogle-GW-k562.yaml
+
+# Skip report regeneration
+./run_rerun_scanpy.sh --no-report config/Replogle-GW-k562.yaml
+```
+
+**SLURM submission (HPC):**
+
+```bash
+cd benchmarking/singularity
+
+# Submit single dataset
+./submit_rerun_scanpy.sh Replogle-GW-k562.yaml
+
+# Submit with options
+./submit_rerun_scanpy.sh Feng-ts.yaml --force
+
+# Submit all large datasets (default)
+./submit_rerun_scanpy.sh
+```
+
+**Key features:**
+- No time/memory limits (methods run to completion)
+- Outputs saved to same locations as benchmarks
+- Does NOT modify .benchmark_cache
+- Automatically regenerates reports with accuracy comparisons
 
 ## Docker
 

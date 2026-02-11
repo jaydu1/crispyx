@@ -1212,10 +1212,12 @@ def calculate_optimal_chunk_size(
 def calculate_optimal_gene_chunk_size(
     n_obs: int,
     n_vars: int,
+    n_groups: int | None = None,
     available_memory_gb: float | None = None,
     safety_factor: float = 8.0,
-    min_chunk: int = 128,
-    max_chunk: int = 1024,
+    memory_fraction: float = 0.5,
+    min_chunk: int = 32,
+    max_chunk: int = 512,
 ) -> int:
     """Calculate optimal gene chunk size for column-wise operations.
     
@@ -1223,20 +1225,29 @@ def calculate_optimal_gene_chunk_size(
     each chunk loads all cells for a subset of genes. Memory usage is dominated
     by n_obs × chunk_size rather than chunk_size × n_vars.
     
+    Enhanced to account for the number of perturbation groups, which significantly
+    impacts memory usage due to output array allocation.
+    
     Parameters
     ----------
     n_obs
         Number of observations (cells) in the dataset.
     n_vars
         Number of variables (genes) in the dataset.
+    n_groups
+        Number of perturbation groups. If provided, used to estimate memory
+        for output arrays. Large group counts require smaller chunks.
     available_memory_gb
         Available memory in gigabytes. If None, auto-detects using psutil.
     safety_factor
         Safety multiplier to account for overhead (default 8.0).
+    memory_fraction
+        Fraction of available memory to use (default 0.5). Leave headroom
+        for memory-mapped arrays and system overhead.
     min_chunk
-        Minimum chunk size to return (default 128).
+        Minimum chunk size to return (default 32).
     max_chunk
-        Maximum chunk size to return (default 1024).
+        Maximum chunk size to return (default 512).
     
     Returns
     -------
@@ -1246,7 +1257,9 @@ def calculate_optimal_gene_chunk_size(
     Examples
     --------
     >>> calculate_optimal_gene_chunk_size(100000, 20000, available_memory_gb=32)
-    400
+    512
+    >>> calculate_optimal_gene_chunk_size(4000000, 38000, n_groups=18000, available_memory_gb=128)
+    64
     """
     if available_memory_gb is None:
         try:
@@ -1259,18 +1272,39 @@ def calculate_optimal_gene_chunk_size(
             )
             available_memory_gb = 16.0
     
-    # Calculate chunk size based on memory
-    # Each chunk uses approximately: n_obs * chunk_size * 8 bytes (float64)
-    # Multiply by safety_factor for overhead (copies, intermediate results)
-    bytes_per_gene = n_obs * 8 * safety_factor
-    max_chunk_from_memory = int((available_memory_gb * 1e9) / bytes_per_gene)
+    # Usable memory = fraction of available (default 50%)
+    usable_memory_bytes = available_memory_gb * memory_fraction * 1e9
+    
+    # Base memory: dense conversion of n_obs × chunk_size (float64)
+    base_memory_per_gene = n_obs * 8
+    
+    # Group memory: output arrays of n_groups × chunk_size (float64) × ~8 arrays
+    # (effect, u_stat, pvalue, z_score, lfc, pts, pts_rest, order)
+    group_memory_per_gene = (n_groups * 8 * 8) if n_groups else 0
+    
+    # Total memory per gene with safety factor
+    total_memory_per_gene = (base_memory_per_gene + group_memory_per_gene) * safety_factor
+    
+    # Calculate max chunk from memory
+    max_chunk_from_memory = int(usable_memory_bytes / total_memory_per_gene) if total_memory_per_gene > 0 else max_chunk
+    
+    # Dynamic max_chunk based on n_groups (datasets with many groups need smaller chunks)
+    effective_max_chunk = max_chunk
+    if n_groups is not None:
+        if n_groups > 10000:
+            effective_max_chunk = min(effective_max_chunk, 128)
+        elif n_groups > 5000:
+            effective_max_chunk = min(effective_max_chunk, 256)
+        elif n_groups > 2000:
+            effective_max_chunk = min(effective_max_chunk, 384)
     
     # Clamp to reasonable range
-    chunk_size = max(min_chunk, min(max_chunk, max_chunk_from_memory))
+    chunk_size = max(min_chunk, min(effective_max_chunk, max_chunk_from_memory))
     
     logger.info(
         f"Calculated gene chunk size: {chunk_size} "
         f"(dataset: {n_obs} cells × {n_vars} genes, "
+        f"groups: {n_groups or 'unknown'}, "
         f"available memory: {available_memory_gb:.1f}GB)"
     )
     
