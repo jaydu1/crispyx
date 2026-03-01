@@ -387,6 +387,88 @@ def run_scanpy_qc(
         "save_seconds": t_save_end - t_save_start,
     }
 
+def run_preprocess(
+    input_path: Path,
+    output_path: Path,
+    *,
+    chunk_size: int | None = None,
+) -> Dict[str, Any]:
+    """Normalize QC-filtered data (total-count normalization + log1p).
+
+    Runs as a timed benchmark step so its wall-clock time is captured.
+    Input must be the crispyx QC-filtered h5ad produced by crispyx_qc_filtered.
+
+    The output is regenerated whenever the input file is newer than the output
+    file (stale-cache detection).  This prevents a prior preprocessing result
+    from silently masking a freshly-generated QC-filtered file.
+    """
+    import time
+
+    t_start = time.perf_counter()
+    needs_run = not output_path.exists()
+    if not needs_run and input_path.exists():
+        # Re-run when the QC-filtered input has been updated more recently than
+        # the previously cached preprocessed output.
+        if input_path.stat().st_mtime > output_path.stat().st_mtime:
+            needs_run = True
+    if needs_run:
+        normalize_total_log1p(
+            input_path,
+            output_path,
+            chunk_size=chunk_size,
+            verbose=True,
+        )
+    return {
+        "result_path": str(output_path),
+        "process_seconds": time.perf_counter() - t_start,
+    }
+
+
+def run_preprocess_csc(
+    input_path: Path,
+    output_path: Path,
+    *,
+    chunk_size: int | None = None,
+) -> Dict[str, Any]:
+    """Convert the preprocessed CSR file to CSC for efficient Wilcoxon column access.
+
+    If ``input_path`` is already stored as CSC the conversion is skipped and
+    the original path is returned unchanged.  Stale-cache detection mirrors
+    ``run_preprocess``: if ``input_path`` is newer than ``output_path`` the
+    conversion is re-run.
+    """
+    import time
+
+    from crispyx.data import convert_to_csc, get_matrix_storage_format
+
+    t_start = time.perf_counter()
+
+    # If source is already CSC, nothing to do.
+    if get_matrix_storage_format(input_path) == "csc":
+        return {
+            "result_path": str(input_path),
+            "process_seconds": time.perf_counter() - t_start,
+            "was_already_csc": True,
+        }
+
+    needs_run = not output_path.exists()
+    if not needs_run and input_path.exists():
+        if input_path.stat().st_mtime > output_path.stat().st_mtime:
+            needs_run = True
+    if needs_run:
+        convert_to_csc(
+            input_path,
+            output_path=output_path,
+            chunk_size=chunk_size,
+            verbose=True,
+        )
+    return {
+        "result_path": str(output_path),
+        "process_seconds": time.perf_counter() - t_start,
+        "was_already_csc": False,
+    }
+
+
 def run_scanpy_de(
     dataset_path: Path,
     *,
@@ -418,7 +500,7 @@ def run_scanpy_de(
     if preprocess:
         sc.pp.normalize_total(adata)
         sc.pp.log1p(adata)
-    
+
     # DE
     sc.tl.rank_genes_groups(
         adata,
@@ -730,8 +812,8 @@ def run_pydeseq2_integrated(
         # PyDESeq2 requires dense matrix with integer counts
         if sp.issparse(adata_subset.X):
             adata_subset.X = np.asarray(adata_subset.X.todense())
-        # Ensure integer counts
-        adata_subset.X = np.round(adata_subset.X).astype(int)
+        # Ensure integer counts (int32 saves ~50% memory vs int64)
+        adata_subset.X = np.round(adata_subset.X).astype(np.int32)
         
         # Reorder categories so perturbation is first (becomes reference)
         # This allows us to shrink the control coefficient and then negate
@@ -1010,6 +1092,7 @@ def run_lfcshrink(
     data_name: str = "de_nb_glm_shrunk",
     prior_scale_mode: str = "global",
     profiling: bool = True,
+    memory_limit_gb: float | None = None,
 ) -> Dict[str, Any]:
     """Run lfcShrink on existing NB-GLM results.
     
@@ -1028,6 +1111,8 @@ def run_lfcshrink(
         Prior scale estimation mode: "global" or "per_comparison"
     profiling
         If True, enable profiling in shrink_lfc
+    memory_limit_gb
+        Optional memory budget in GB passed to shrink_lfc.
         
     Returns
     -------
@@ -1042,6 +1127,7 @@ def run_lfcshrink(
         data_name=data_name,
         profiling=profiling,
         prior_scale_mode=prior_scale_mode,
+        memory_limit_gb=memory_limit_gb,
         method="stats",  # Use stats-based shrinkage (Gaussian approx) - more accurate than "full"
         # Note: "full" re-fits with NB likelihood using stored dispersion, which can
         # diverge from PyDESeq2 due to different dispersion estimation methods.
@@ -1139,8 +1225,8 @@ def run_pydeseq2_base(
         # PyDESeq2 requires dense matrix with integer counts
         if sp.issparse(adata_subset.X):
             adata_subset.X = np.asarray(adata_subset.X.todense())
-        # Ensure integer counts
-        adata_subset.X = np.round(adata_subset.X).astype(int)
+        # Ensure integer counts (int32 saves ~50% memory vs int64)
+        adata_subset.X = np.round(adata_subset.X).astype(np.int32)
         
         # Reorder categories so perturbation is first (becomes reference)
         try:
@@ -1266,7 +1352,8 @@ def run_pydeseq2_lfcshrink(
         # PyDESeq2 requires dense matrix with integer counts
         if sp.issparse(adata_subset.X):
             adata_subset.X = np.asarray(adata_subset.X.todense())
-        adata_subset.X = np.round(adata_subset.X).astype(int)
+        # Ensure integer counts (int32 saves ~50% memory vs int64)
+        adata_subset.X = np.round(adata_subset.X).astype(np.int32)
         
         try:
             adata_subset.obs[perturbation_column] = adata_subset.obs[perturbation_column].cat.reorder_categories([pert, control_label])
@@ -1617,12 +1704,15 @@ def _format_timing_summary(timings: Mapping[str, float]) -> str | None:
     return "; ".join(parts)
 
 
-def _method_sort_key(method: BenchmarkMethod) -> tuple[int, str]:
-    """Return a stable sort key that groups methods by task prefix."""
+def _method_sort_key(method: BenchmarkMethod) -> tuple[int, int, str]:
+    """Return a stable sort key that groups methods by task prefix.
+
+    Within DE methods, t-test and wilcoxon run before nb-glm tests.
+    """
 
     # Extract task order from method name
     name = method.name
-    if "_qc_" in name:
+    if "_qc_" in name or "_preprocess" in name:
         task_order = 0
     elif "_pb_" in name:
         task_order = 1
@@ -1630,7 +1720,19 @@ def _method_sort_key(method: BenchmarkMethod) -> tuple[int, str]:
         task_order = 2
     else:
         task_order = 3
-    return (task_order, name)
+
+    # Sub-order within DE: t-test/wilcoxon first, then nb-glm/lfcshrink last
+    if task_order == 2:
+        if "_t_test" in name or "_wilcoxon" in name:
+            sub_order = 0
+        elif "_nb_glm" in name or "_lfcshrink" in name:
+            sub_order = 2
+        else:
+            sub_order = 1  # edger, pydeseq2, etc.
+    else:
+        sub_order = 0
+
+    return (task_order, sub_order, name)
 
 
 def _postprocess_results(df: pd.DataFrame) -> pd.DataFrame:
@@ -3326,6 +3428,18 @@ def _is_cgroups_available() -> bool:
     return _CGROUPS_AVAILABLE
 
 
+def _uses_mmap_backed_files(method: "BenchmarkMethod") -> bool:
+    """Return True if ``method`` is known to use mmap-backed files.
+
+    crispyx DE methods (wilcoxon, t-test, nb_glm) and QC/preprocess open
+    large h5ad files via AnnData backing (mmap) and create numpy memmaps
+    for result arrays.  Their virtual address space (VSZ) is typically 2–4×
+    their actual RSS, making RLIMIT_AS an unreliable enforcement mechanism.
+    """
+    name = method.name.lower()
+    return "crispyx" in name
+
+
 # ============================================================================
 # Docker-based Execution
 # ============================================================================
@@ -3634,7 +3748,57 @@ class DockerRunner:
             
             # Build docker run command
             memory_bytes = int(self.memory_limit_gb * 1024 * 1024 * 1024)
-            
+
+            # Detect symlinks inside the workspace that point to external
+            # filesystems.  Docker's -v bind-mount does NOT follow symlinks,
+            # so if e.g. "benchmarking/results" is a symlink to /data/... the
+            # container would see a broken symlink at /workspace/benchmarking/results.
+            # Fix: for every Path in method.kwargs, walk its components and
+            # detect intermediate symlinks whose targets lie outside workspace_root.
+            # Add each unique real target as an explicit bind mount (at its own
+            # absolute path) so the container can dereference the symlink.
+            extra_mounts: list[str] = []
+            _seen_mounts: set[str] = set()
+            for _kw_value in method.kwargs.values():
+                if not isinstance(_kw_value, Path):
+                    continue
+                # Case 1: absolute path entirely outside workspace (e.g. /data1/origin/).
+                # Mount it read-only at the same absolute path so the container can
+                # resolve it without any path translation.
+                try:
+                    _kw_value.relative_to(self.workspace_root)
+                except ValueError:
+                    _real = _kw_value.resolve()
+                    # Mount the closest existing ancestor (the file may not exist yet)
+                    _mount_src = _real
+                    while not _mount_src.exists() and _mount_src.parent != _mount_src:
+                        _mount_src = _mount_src.parent
+                    if _mount_src.exists():
+                        _spec = f"{_mount_src}:{_mount_src}:ro"
+                        if _spec not in _seen_mounts:
+                            extra_mounts.extend(["-v", _spec])
+                            _seen_mounts.add(_spec)
+                    continue  # no symlink walk needed for external paths
+                # Case 2: path inside workspace — detect symlinks that point outside.
+                _current = Path("/")
+                for _part in _kw_value.parts[1:]:
+                    _current = _current / _part
+                    try:
+                        _current.relative_to(self.workspace_root)
+                    except ValueError:
+                        continue  # still building up to workspace_root, keep walking
+                    if _current.is_symlink():
+                        _real = _current.resolve()
+                        try:
+                            _real.relative_to(self.workspace_root)
+                        except ValueError:
+                            # Symlink target is outside workspace → expose it
+                            _spec = f"{_real}:{_real}:rw"
+                            if _spec not in _seen_mounts:
+                                extra_mounts.extend(["-v", _spec])
+                                _seen_mounts.add(_spec)
+                        break  # no need to go deeper once symlink found
+
             cmd = [
                 "docker", "run", "--rm",
                 f"--name={container_name}",  # Named container for cleanup
@@ -3643,6 +3807,8 @@ class DockerRunner:
                 f"--cpus={self.n_cores}",
                 # Mount workspace
                 "-v", f"{self.workspace_root}:/workspace:rw",
+                # Extra mounts for symlinked directories inside the workspace
+                *extra_mounts,
                 # Mount temp directory for IPC
                 "-v", f"{temp_dir}:/ipc:rw",
                 # Mount host timezone so container timestamps match host time
@@ -3881,11 +4047,34 @@ def _worker(
     set_thread_env_vars(n_threads)
 
     # Apply resource limits
-    # Skip RLIMIT_AS if cgroups memory control is being used externally,
-    # as RLIMIT_AS limits virtual address space (including memmaps) not RSS
-    if not use_cgroups_memory:
+    # RLIMIT_AS limits *virtual address space* (VSZ), NOT physical RSS.
+    # crispyx methods use mmap-backed h5ad files (10–40 GB mapped) plus
+    # numpy memmaps for result arrays, Numba thread stacks, etc.  These
+    # inflate VSZ far beyond actual RAM consumption, causing spurious
+    # SIGKILL even when RSS is well within the budget.  For example,
+    # Feng-gwsf runs at ~6 GB RSS but 42 GB VSZ.
+    #
+    # Skip RLIMIT_AS when:
+    # (a) cgroups memory control is being used externally, or
+    # (b) the method is a crispyx method that uses memmaps / backed files.
+    #
+    # Memory enforcement still works via parent-process RSS sampling
+    # (sample_subprocess_memory) which tracks actual physical memory.
+    skip_rlimit_as = use_cgroups_memory or _uses_mmap_backed_files(method)
+    if not skip_rlimit_as:
         _apply_resource_limit(memory_limit, resource.RLIMIT_AS, "virtual memory")
-    _apply_resource_limit(time_limit, resource.RLIMIT_CPU, "CPU time")
+
+    # RLIMIT_CPU is NOT used for any method.
+    #
+    # RLIMIT_CPU counts CPU time summed across ALL pthreads in the process.
+    # Even "single-threaded" methods (scanpy, pertpy) use multi-threaded BLAS
+    # (OpenBLAS / MKL) and may use n_cores threads. With 32 threads, the
+    # effective wall-clock limit becomes time_limit / n_threads ≈ 675 s —
+    # far below the intended 6-hour per-method budget.
+    #
+    # Wall-clock enforcement is already handled correctly by the parent process
+    # via process.join(timeout=join_timeout) followed by process.terminate().
+    # RLIMIT_CPU is therefore both redundant and incorrect as a wall-clock proxy.
 
     # Note: Numba JIT compilation is cached to disk (cache=True in decorators).
     # First run after code changes may be slower, but subsequent runs use cache.
@@ -3963,7 +4152,7 @@ def _worker(
     # We need a small delay to allow the multiprocessing Queue's background thread
     # to send the result data to the parent process before we force-exit.
     import time as _time
-    _time.sleep(0.5)  # Allow queue to flush
+    _time.sleep(1.0)  # Allow queue to flush (increased from 0.5s for large results)
     
     import os as _os
     _os._exit(0)
@@ -4102,16 +4291,49 @@ def _run_with_limits(
             "error": f"Exceeded time limit of {time_limit} seconds",
         }
 
-    if not queue.empty():
-        payload = queue.get()
+    # Check process exit code and read result from queue
+    # Handle EOFError which occurs when subprocess crashes during queue.put()
+    payload = None
+    if process.exitcode != 0:
+        # Process failed - try to get any partial result but expect failure
+        try:
+            if not queue.empty():
+                payload = queue.get(timeout=2.0)
+        except (EOFError, Exception):
+            pass  # Expected - subprocess crashed
+        
+        if payload is None:
+            payload = {
+                "status": "error",
+                "elapsed_seconds": parent_elapsed_time,
+                "peak_memory_mb": None,
+                "avg_memory_mb": None,
+                "error": f"Worker process crashed (exitcode={process.exitcode})",
+            }
     else:
-        payload = {
-            "status": "error",
-            "elapsed_seconds": parent_elapsed_time,
-            "peak_memory_mb": None,
-            "avg_memory_mb": None,
-            "error": f"Process exited with code {process.exitcode}",
-        }
+        # Process succeeded - read from queue
+        try:
+            if not queue.empty():
+                payload = queue.get(timeout=5.0)
+            else:
+                raise queue.Empty()
+        except queue.Empty:
+            payload = {
+                "status": "error",
+                "elapsed_seconds": parent_elapsed_time,
+                "peak_memory_mb": None,
+                "avg_memory_mb": None,
+                "error": f"Process exited normally but no result in queue",
+            }
+        except EOFError:
+            # Queue data was corrupted - process may have died during transmission
+            payload = {
+                "status": "error",
+                "elapsed_seconds": parent_elapsed_time,
+                "peak_memory_mb": None,
+                "avg_memory_mb": None,
+                "error": f"Result transmission failed (corrupted queue data)",
+            }
 
     payload.setdefault("summary", {})
     
@@ -4237,15 +4459,13 @@ def create_benchmark_suite(
     de_dir = output_dir / "de"
     de_dir.mkdir(parents=True, exist_ok=True)
 
-    # Create preprocessed dataset for t-test benchmarks using streaming
+    # preprocessed_path: QC-filtered then normalized — created by crispyx_preprocess
+    # which depends on crispyx_qc_filtered. All t-test and Wilcoxon DE methods use it.
+    qc_filtered_path = preprocessing_dir / "crispyx_qc_filtered.h5ad"
     preprocessed_path = preprocessing_dir / f"preprocessed_{dataset_path.name}"
-    if not preprocessed_path.exists():
-        normalize_total_log1p(
-            dataset_path,
-            preprocessed_path,
-            chunk_size=final_chunk_size,
-            verbose=True,
-        )
+    # preprocessed_csc_path: CSC conversion of preprocessed_path — created by
+    # crispyx_preprocess_csc.  Used by crispyx_de_wilcoxon for fast column access.
+    preprocessed_csc_path = preprocessing_dir / f"preprocessed_csc_{dataset_path.name}"
 
     methods = {
         "crispyx_qc_filtered": BenchmarkMethod(
@@ -4258,11 +4478,36 @@ def create_benchmark_suite(
                 "min_cells_per_perturbation": min_cells_per_perturbation,
                 "min_cells_per_gene": min_cells_per_gene,
                 "chunk_size": final_chunk_size,
+                "memory_limit_gb": memory_limit_gb,
                 **shared_kwargs,
                 "output_dir": preprocessing_dir,
                 "data_name": "qc_filtered",
             },
             summary=_summarise_quality_control,
+        ),
+        "crispyx_preprocess": BenchmarkMethod(
+            name="crispyx_preprocess",
+            description="Normalize QC-filtered data (total-count + log1p)",
+            function=run_preprocess,
+            kwargs={
+                "input_path": qc_filtered_path,
+                "output_path": preprocessed_path,
+                "chunk_size": final_chunk_size,
+            },
+            summary=_summarise_runner_result,
+            depends_on="crispyx_qc_filtered",
+        ),
+        "crispyx_preprocess_csc": BenchmarkMethod(
+            name="crispyx_preprocess_csc",
+            description="Convert preprocessed CSR to CSC for fast Wilcoxon column access",
+            function=run_preprocess_csc,
+            kwargs={
+                "input_path": preprocessed_path,
+                "output_path": preprocessed_csc_path,
+                "chunk_size": final_chunk_size,
+            },
+            summary=_summarise_runner_result,
+            depends_on="crispyx_preprocess",
         ),
         "crispyx_pb_avg_log": BenchmarkMethod(
             name="crispyx_pb_avg_log",
@@ -4298,21 +4543,25 @@ def create_benchmark_suite(
                 "output_dir": de_dir,
                 "data_name": "de_t_test",
                 "n_jobs": n_cores,
+                "memory_limit_gb": memory_limit_gb,
             },
             summary=_summarise_de_mapping,
+            depends_on="crispyx_preprocess",
         ),
         "crispyx_de_wilcoxon": BenchmarkMethod(
             name="crispyx_de_wilcoxon",
             description="Wilcoxon rank-sum differential expression",
             function=wilcoxon_test,
             kwargs={
-                "data": preprocessed_path,
+                "data": preprocessed_csc_path,
                 **shared_kwargs,
                 "output_dir": de_dir,
                 "data_name": "de_wilcoxon",
                 "n_jobs": n_cores,
+                "memory_limit_gb": memory_limit_gb,
             },
             summary=_summarise_de_mapping,
+            depends_on="crispyx_preprocess_csc",
         ),
         "crispyx_de_nb_glm": BenchmarkMethod(
             name="crispyx_de_nb_glm",
@@ -4363,6 +4612,7 @@ def create_benchmark_suite(
                 "output_dir": de_dir,
                 "data_name": "de_nb_glm_shrunk",
                 "prior_scale_mode": "global",
+                "memory_limit_gb": memory_limit_gb,
             },
             summary=_summarise_runner_result,
             depends_on="crispyx_de_nb_glm",
@@ -4377,6 +4627,7 @@ def create_benchmark_suite(
                 "output_dir": de_dir,
                 "data_name": "de_nb_glm_shrunk_pydeseq2",
                 "prior_scale_mode": "per_comparison",
+                "memory_limit_gb": memory_limit_gb,
             },
             summary=_summarise_runner_result,
             depends_on="crispyx_de_nb_glm_pydeseq2",
@@ -4409,19 +4660,22 @@ def create_benchmark_suite(
                 "preprocess": False,
             },
             summary=_summarise_runner_result,
+            depends_on="crispyx_preprocess",
         ),
         "scanpy_de_wilcoxon": BenchmarkMethod(
             name="scanpy_de_wilcoxon",
             description="Differential expression using Scanpy (Wilcoxon)",
             function=run_scanpy_de,
             kwargs={
-                "dataset_path": dataset_path,
+                "dataset_path": preprocessed_path,
                 "perturbation_column": shared_kwargs["perturbation_column"],
                 "control_label": shared_kwargs["control_label"],
                 "method": "wilcoxon",
                 "output_dir": de_dir,
+                "preprocess": False,
             },
             summary=_summarise_runner_result,
+            depends_on="crispyx_preprocess",
         ),
         "edger_de_glm": BenchmarkMethod(
             name="edger_de_glm",
@@ -4441,20 +4695,21 @@ def create_benchmark_suite(
             description="PyDESeq2 base fitting (no shrinkage)",
             function=run_pydeseq2_base,
             kwargs={
-                "dataset_path": dataset_path,
+                "dataset_path": qc_filtered_path,
                 "perturbation_column": shared_kwargs["perturbation_column"],
                 "control_label": shared_kwargs["control_label"],
                 "output_dir": de_dir,
                 "n_jobs": n_cores,
             },
             summary=_summarise_runner_result,
+            depends_on="crispyx_qc_filtered",
         ),
         "pertpy_de_lfcshrink": BenchmarkMethod(
             name="pertpy_de_lfcshrink",
             description="PyDESeq2 apeGLM LFC shrinkage",
             function=run_pydeseq2_lfcshrink,
             kwargs={
-                "dataset_path": dataset_path,
+                "dataset_path": qc_filtered_path,
                 "perturbation_column": shared_kwargs["perturbation_column"],
                 "control_label": shared_kwargs["control_label"],
                 "output_dir": de_dir,

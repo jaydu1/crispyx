@@ -318,6 +318,9 @@ def _anndata_to_de_dict(adata) -> Dict[str, Any]:
             
             if "logfoldchange" in adata.layers:
                 effect_size_values = _extract_row(adata.layers["logfoldchange"], idx)
+            elif "logfoldchanges" in adata.layers:
+                # crispyx t-test/Wilcoxon store LFCs in "logfoldchanges" (plural)
+                effect_size_values = _extract_row(adata.layers["logfoldchanges"], idx)
             elif adata.X is not None:
                 effect_size_values = _extract_row(adata.X, idx)
             else:
@@ -395,6 +398,9 @@ def _anndata_to_de_dict_raw(adata) -> Dict[str, Any]:
                 effect_size_values = _extract_row(adata.layers["logfoldchange_raw"], idx)
             elif "logfoldchange" in adata.layers:
                 effect_size_values = _extract_row(adata.layers["logfoldchange"], idx)
+            elif "logfoldchanges" in adata.layers:
+                # crispyx t-test/Wilcoxon store LFCs in "logfoldchanges" (plural)
+                effect_size_values = _extract_row(adata.layers["logfoldchanges"], idx)
             elif adata.X is not None:
                 effect_size_values = _extract_row(adata.X, idx)
             else:
@@ -524,6 +530,16 @@ def _generate_improved_markdown(
             else:
                 cols = ["Package", "Method", "status", "elapsed_seconds", "peak_memory_mb", "groups", "genes"]
             
+            # Add rerun columns if any row in this category has rerun data
+            has_rerun = (
+                "rerun_elapsed_seconds" in cat_df.columns
+                and cat_df["rerun_elapsed_seconds"].notna().any()
+            )
+            if has_rerun:
+                cols.append("rerun_elapsed_seconds")
+                if "rerun_peak_memory_mb" in cat_df.columns and cat_df["rerun_peak_memory_mb"].notna().any():
+                    cols.append("rerun_peak_memory_mb")
+            
             cols = [c for c in cols if c in cat_df.columns]
             display_df = cat_df[cols].copy()
             
@@ -535,6 +551,8 @@ def _generate_improved_markdown(
                 "genes_kept": "Genes",
                 "groups": "Groups",
                 "genes": "Genes",
+                "rerun_elapsed_seconds": "Rerun (s)",
+                "rerun_peak_memory_mb": "Rerun Mem (MB)",
             }
             display_df = display_df.rename(columns={k: v for k, v in rename_map.items() if k in display_df.columns})
             
@@ -1060,6 +1078,31 @@ def evaluate_benchmarks(output_dir: Path) -> None:
     perf_df = df[[c for c in perf_cols if c in df.columns]].copy()
     if "method" in perf_df.columns:
         perf_df = perf_df.sort_values("method")
+    
+    # Load reference extraction marker to annotate rerun data
+    marker_path = output_dir / ".reference_extracted"
+    rerun_marker: Dict[str, Any] = {}
+    if marker_path.exists():
+        try:
+            with open(marker_path, 'r') as f:
+                rerun_marker = json.load(f).get("extracted_methods", {})
+        except (json.JSONDecodeError, OSError):
+            pass
+    
+    # Annotate performance rows for methods that were rerun without limits
+    if rerun_marker and "method" in perf_df.columns and "status" in perf_df.columns:
+        for idx, row in perf_df.iterrows():
+            method = row["method"]
+            status = row.get("status", "")
+            if method in rerun_marker and status in ("timeout", "error", "memory_limit"):
+                rerun_info = rerun_marker[method]
+                perf_df.at[idx, "status"] = f"{status} (rerun: no limits)"
+                rerun_time = rerun_info.get("elapsed_seconds")
+                rerun_mem = rerun_info.get("peak_memory_mb")
+                if rerun_time is not None:
+                    perf_df.at[idx, "rerun_elapsed_seconds"] = rerun_time
+                if rerun_mem is not None:
+                    perf_df.at[idx, "rerun_peak_memory_mb"] = rerun_mem
     
     accuracy_results = []
     perf_comp_results = []

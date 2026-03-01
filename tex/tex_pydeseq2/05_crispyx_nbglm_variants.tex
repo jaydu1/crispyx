@@ -1,0 +1,298 @@
+\documentclass{article}
+\usepackage{amsmath, amssymb}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{listings}
+
+% Code listing settings
+\lstset{
+    language=Python,
+    basicstyle=\ttfamily\small,
+    keywordstyle=\color{blue},
+    commentstyle=\color{gray},
+    stringstyle=\color{orange},
+    showstringspaces=false,
+    frame=single,
+    breaklines=true,
+    backgroundcolor=\color{gray!10}
+}
+
+\title{CRISPYx NB-GLM Variants: Default vs PyDESeq2-Parity Mode}
+\author{CRISPYx Development Team}
+\date{January 2026}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+CRISPYx provides two modes for its Negative Binomial Generalized Linear Model (NB-GLM) differential expression analysis: a \textbf{default production mode} optimized for speed and robustness, and a \textbf{PyDESeq2-parity mode} designed for validation against PyDESeq2 results. This document details the key differences between these two modes, their performance characteristics, and recommendations for when to use each.
+\end{abstract}
+
+\section{Introduction}
+
+The CRISPYx NB-GLM implementation offers flexibility in how size factors, dispersions, and standard errors are computed. The default settings are optimized for production use in large-scale CRISPR screen analysis, while the PyDESeq2-parity mode replicates the exact behavior of PyDESeq2 for validation purposes.
+
+The two modes differ in three key parameters:
+\begin{itemize}
+    \item \textbf{Size Factor Scope}: How size factors (normalization factors) are computed
+    \item \textbf{Dispersion Scope}: How gene-wise dispersions are estimated (the key difference)
+    \item \textbf{Standard Error Method}: How standard errors for LFC estimates are computed
+\end{itemize}
+
+\section{Key Differences}
+
+\begin{table}[h]
+\centering
+\caption{Summary of differences between NB-GLM variants}
+\label{tab:summary}
+\begin{tabular}{lccc}
+\toprule
+\textbf{Parameter} & \textbf{NB-GLM (default)} & \textbf{NB-GLM (pydeseq2)} \\
+\midrule
+Size Factor Scope & \texttt{global} & \texttt{per\_comparison} \\
+Dispersion Scope & \texttt{global} & \texttt{per\_comparison} \\
+SE Method & \texttt{sandwich} (robust) & \texttt{fisher} (standard) \\
+Purpose & Production use & PyDESeq2 parity testing \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Detailed Parameter Explanations}
+
+\subsection{Size Factor Scope}
+
+Size factors are normalization constants that account for differences in sequencing depth across cells.
+
+\paragraph{Global (\texttt{size\_factor\_scope="global"}):}
+\begin{itemize}
+    \item Computes size factors \textbf{once} using all cells in the dataset
+    \item Stored in \texttt{adata.obs["size\_factors"]} and reused for all comparisons
+    \item More efficient: avoids redundant computation
+    \item Recommended for consistency across comparisons
+\end{itemize}
+
+\paragraph{Per-Comparison (\texttt{size\_factor\_scope="per\_comparison"}):}
+\begin{itemize}
+    \item Computes size factors \textbf{separately} for each control + perturbation pair
+    \item Matches PyDESeq2 behavior exactly, which creates a separate DESeqDataSet for each comparison
+    \item Size factors are specific to the cells included in each comparison
+    \item Required for exact numerical parity with PyDESeq2
+\end{itemize}
+
+The mathematical formulation for size factors uses the median-of-ratios method:
+\begin{equation}
+    s_j = \text{median}_i \frac{K_{ij}}{\left(\prod_{j'=1}^{n} K_{ij'}\right)^{1/n}}
+\end{equation}
+where $K_{ij}$ is the count for gene $i$ in cell $j$, and $n$ is the number of cells in the scope.
+
+\subsection{Dispersion Scope (Key Difference)}
+
+Dispersion parameters model the overdispersion in count data relative to a Poisson distribution. \textbf{This is the most impactful difference between the two variants.}
+
+\paragraph{Global (\texttt{dispersion\_scope="global"}):}
+\begin{itemize}
+    \item Uses \texttt{precompute\_global\_dispersion()} with \texttt{fast\_mode=True}
+    \item Estimation pipeline: MoM (Method of Moments) $\rightarrow$ Trend fitting
+    \item Computes dispersions once using all cells
+    \item Stored in \texttt{adata.var["dispersion"]} for reuse
+    \item Produces \textbf{moderate shrinkage} of LFC estimates
+    \item Dispersion range typically 0.0 -- 10.0
+\end{itemize}
+
+\paragraph{Per-Comparison (\texttt{dispersion\_scope="per\_comparison"}):}
+\begin{itemize}
+    \item Estimates dispersions independently for each perturbation vs. control comparison
+    \item Full estimation pipeline: MoM $\rightarrow$ Trend $\rightarrow$ MAP (Maximum a Posteriori)
+    \item Matches PyDESeq2's per-comparison dispersion estimation
+    \item Can produce \textbf{extreme dispersion values} (e.g., 0.07 -- 966)
+    \item Results in \textbf{stronger shrinkage} of LFC estimates
+\end{itemize}
+
+The dispersion trend is modeled as:
+\begin{equation}
+    \alpha_{\text{trend}}(\mu) = \frac{a_0}{\mu} + a_\infty
+\end{equation}
+where $a_0$ and $a_\infty$ are fitted parameters.
+
+\subsubsection{Impact on Shrinkage Strength}
+
+Empirical analysis on the Adamson dataset shows significant differences in shrinkage behavior:
+
+\begin{table}[h]
+\centering
+\caption{Shrinkage strength comparison (shrunk/raw LFC ratio, lower = more shrinkage)}
+\label{tab:shrinkage}
+\begin{tabular}{lccc}
+\toprule
+\textbf{Perturbation} & \textbf{Default} & \textbf{Pydeseq2} & \textbf{Difference} \\
+\midrule
+AARS & 0.595 & 0.532 & Pydeseq2 shrinks 15.6\% more \\
+AMIGO3 & 0.630 & 0.359 & Pydeseq2 shrinks 73.3\% more \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+This difference in shrinkage strength explains why the pydeseq2 variant may show lower overlap with PyDESeq2's lfcShrink results---see Section~\ref{sec:paradox}.
+
+\subsection{Standard Error Method}
+
+The standard error method affects confidence intervals and p-values for LFC estimates.
+
+\paragraph{Sandwich (\texttt{se\_method="sandwich"}):}
+\begin{itemize}
+    \item Uses the robust sandwich (Huber-White) variance estimator
+    \item Robust to model misspecification (e.g., incorrect dispersion estimates)
+    \item Provides valid inference even when the NB model is slightly wrong
+    \item Default for production use
+\end{itemize}
+
+The sandwich estimator is:
+\begin{equation}
+    \text{Var}(\hat{\beta})_{\text{sandwich}} = (X^T W X)^{-1} X^T \text{diag}(r_i^2) X (X^T W X)^{-1}
+\end{equation}
+where $W$ is the weight matrix and $r_i$ are the Pearson residuals.
+
+\paragraph{Fisher (\texttt{se\_method="fisher"}):}
+\begin{itemize}
+    \item Uses the Fisher information matrix (inverse of expected Hessian)
+    \item Assumes the model is correctly specified
+    \item Matches PyDESeq2's standard error computation exactly
+    \item Required for exact numerical parity with PyDESeq2
+\end{itemize}
+
+The Fisher information estimator is:
+\begin{equation}
+    \text{Var}(\hat{\beta})_{\text{fisher}} = (X^T W X)^{-1}
+\end{equation}
+
+\section{Performance Comparison}
+
+We benchmarked both modes on the Adamson subset dataset (1,716 cells, 11,630 genes, 3 perturbations).
+
+\begin{table}[h]
+\centering
+\caption{Performance comparison on Adamson subset dataset}
+\label{tab:performance}
+\begin{tabular}{lccc}
+\toprule
+\textbf{Metric} & \textbf{NB-GLM (default)} & \textbf{NB-GLM (pydeseq2)} & \textbf{Ratio} \\
+\midrule
+Runtime & $\sim$20 s & $\sim$36 s & 1.8$\times$ slower \\
+Peak Memory & 1,400 MB & 1,526 MB & 1.09$\times$ more \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Why Default is Faster}
+
+The default mode achieves better performance through:
+
+\begin{enumerate}
+    \item \textbf{Global precomputation}: Size factors and dispersions are computed once and reused for all $N$ perturbation comparisons, reducing redundant calculations.
+    
+    \item \textbf{Fast dispersion mode}: Skips the MAP shrinkage step, using trend-fitted dispersions directly.
+    
+    \item \textbf{No per-comparison subsetting}: Avoids creating separate data subsets for each comparison.
+\end{enumerate}
+
+For a dataset with $N$ perturbations:
+\begin{itemize}
+    \item \textbf{Default}: $O(1)$ dispersion estimation + $O(N)$ GLM fitting
+    \item \textbf{PyDESeq2-parity}: $O(N)$ dispersion estimation + $O(N)$ GLM fitting
+\end{itemize}
+
+The speedup becomes more pronounced as $N$ increases.
+
+\section{The Overlap Paradox}
+\label{sec:paradox}
+
+Counterintuitively, the pydeseq2 variant sometimes shows \textbf{lower overlap} with PyDESeq2's lfcShrink results than the default variant. This is explained by:
+
+\begin{enumerate}
+    \item \textbf{PyDESeq2 produces aberrant shrinkage}: As documented in \texttt{pydeseq2\_shrinkage\_aberration.tex}, PyDESeq2's apeGLM shrinkage can \emph{inflate} LFC magnitudes (22.5\% of genes for AARS).
+    
+    \item \textbf{CRISPYx pydeseq2 variant shrinks correctly but more aggressively}: The per-comparison dispersion estimation produces stronger (but correct) shrinkage.
+    
+    \item \textbf{Coincidental alignment}: The default variant's weaker shrinkage happens to produce values closer to PyDESeq2's aberrantly inflated LFCs.
+\end{enumerate}
+
+\textbf{Conclusion}: Lower overlap with PyDESeq2 does not indicate worse quality---both CRISPYx variants produce correct shrinkage (0\% inflation), while PyDESeq2's aberrant results coincidentally align better with weaker shrinkage.
+
+\section{Recommendations}
+
+\begin{table}[h]
+\centering
+\caption{When to use each NB-GLM variant}
+\label{tab:recommendations}
+\begin{tabular}{lc}
+\toprule
+\textbf{Use Case} & \textbf{Recommended Mode} \\
+\midrule
+Production analysis & NB-GLM (default) \\
+Comparing with PyDESeq2 results & NB-GLM (pydeseq2) \\
+Large datasets (many perturbations) & NB-GLM (default) \\
+Replicating published PyDESeq2 analysis & NB-GLM (pydeseq2) \\
+Robust inference with uncertain dispersions & NB-GLM (default) \\
+Validation/testing against PyDESeq2 & NB-GLM (pydeseq2) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Summary}
+
+\begin{itemize}
+    \item Use \textbf{NB-GLM (default)} for day-to-day CRISPR screen analysis. It is faster, uses less memory, and provides robust standard errors.
+    
+    \item Use \textbf{NB-GLM (pydeseq2)} when you need exact numerical agreement with PyDESeq2, such as for benchmarking or validating results against published analyses.
+\end{itemize}
+
+\section{Configuration Examples}
+
+\subsection{Benchmarking Configuration}
+
+In the CRISPYx benchmarking framework, the two modes are configured as follows:
+
+\begin{lstlisting}[caption={Benchmarking configuration for NB-GLM variants}]
+# Default NB-GLM (implicit settings)
+"crispyx_de_nb_glm": {}
+
+# PyDESeq2-parity NB-GLM
+"crispyx_de_nb_glm_pydeseq2": {
+    "size_factor_scope": "per_comparison",
+    "dispersion_scope": "per_comparison",
+    "se_method": "fisher",
+}
+\end{lstlisting}
+
+\subsection{Python API Usage}
+
+\begin{lstlisting}[caption={Direct Python API usage}]
+import crispyx as cx
+
+# Default mode (recommended for production)
+cx.de.nb_glm(
+    adata,
+    size_factor_scope="global",      # default
+    dispersion_scope="global",       # default
+    se_method="sandwich",            # default
+)
+
+# PyDESeq2-parity mode (for validation)
+cx.de.nb_glm(
+    adata,
+    size_factor_scope="per_comparison",
+    dispersion_scope="per_comparison",
+    se_method="fisher",
+)
+\end{lstlisting}
+
+\section{Conclusion}
+
+CRISPYx provides two NB-GLM modes to serve different needs: a fast, robust default mode for production use, and a PyDESeq2-parity mode for validation and comparison. The default mode is approximately 1.8$\times$ faster and uses 9\% less memory, making it ideal for large-scale CRISPR screen analysis. The key difference is the \textbf{dispersion scope}: global estimation produces moderate shrinkage while per-comparison estimation can produce stronger shrinkage due to more variable dispersion estimates.
+
+The PyDESeq2-parity mode ensures methodological alignment with PyDESeq2, which is essential for benchmarking and reproducing published results---though as documented, PyDESeq2's lfcShrink can produce aberrant results, so exact numerical agreement is not always desirable.
+
+\end{document}

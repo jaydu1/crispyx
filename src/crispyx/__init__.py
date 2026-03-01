@@ -18,6 +18,7 @@ from .data import (
     AnnData,
     calculate_optimal_chunk_size,
     calculate_optimal_gene_chunk_size,
+    convert_to_csc,
     ensure_gene_symbol_column,
     normalize_total_log1p,
     read_h5ad_ondisk,
@@ -44,9 +45,13 @@ from .profiling import (
 from .plotting import (
     materialize_rank_genes_groups,
     plot_ma,
+    plot_pca,
+    plot_pca_loadings,
+    plot_pca_variance_ratio,
     plot_qc_perturbation_counts,
     plot_qc_summary,
     plot_top_genes_bar,
+    plot_umap,
     plot_volcano,
     rank_genes_groups as plot_rank_genes_groups,
     rank_genes_groups_df,
@@ -262,6 +267,50 @@ class _PreprocessingNamespace:
         )
         return result.filtered
 
+    def convert_to_csc(
+        self,
+        data: str | Path | ad.AnnData,
+        *,
+        output_path: str | Path | None = None,
+        chunk_size: int = 4096,
+        output_dir: str | Path | None = None,
+        data_name: str | None = None,
+        verbose: bool = True,
+    ) -> AnnData:
+        """Convert a backed h5ad file's matrix to CSC format for fast column access.
+
+        If the file is already CSC, returns it unchanged.  Otherwise performs a
+        two-pass streaming CSR→CSC conversion and writes the result to disk.
+
+        Parameters
+        ----------
+        data
+            Path to h5ad file or backed AnnData.
+        output_path
+            Explicit output path.  If None, derived from output_dir/data_name.
+        chunk_size
+            Rows per streaming chunk.  Default 4096.
+        output_dir
+            Output directory.  Defaults to input file's directory.
+        data_name
+            Custom name suffix.
+        verbose
+            Print progress.
+
+        Returns
+        -------
+        AnnData
+            Backed AnnData pointing to the CSC output file.
+        """
+        return convert_to_csc(
+            data,
+            output_path=output_path,
+            chunk_size=chunk_size,
+            output_dir=output_dir,
+            data_name=data_name,
+            verbose=verbose,
+        )
+
     def normalize_total_log1p(
         self,
         data: str | Path | ad.AnnData,
@@ -316,6 +365,139 @@ class _PreprocessingNamespace:
             output_dir=output_dir,
             data_name=data_name,
             verbose=verbose,
+        )
+
+    def pca(
+        self,
+        data: str | Path | ad.AnnData,
+        n_comps: int = 50,
+        method: str = "auto",
+        use_highly_variable: bool = True,
+        chunk_size: int | None = None,
+        random_state: int = 0,
+        copy: bool = False,
+        show_progress: bool = True,
+    ) -> ad.AnnData | None:
+        """Compute streaming PCA on backed AnnData.
+        
+        Memory-efficient PCA that works with on-disk data. Automatically
+        selects optimal method based on dataset characteristics.
+        
+        Parameters
+        ----------
+        data
+            Path to h5ad file or backed AnnData.
+        n_comps
+            Number of principal components. Default 50.
+        method
+            'auto', 'sparse_cov', or 'incremental'. Default 'auto'.
+        use_highly_variable
+            Use only HVGs if available. Default True.
+        chunk_size
+            Cells per chunk. Auto-calculated if None.
+        random_state
+            Random seed (for API compatibility).
+        copy
+            If True, return copy with results instead of in-place.
+        show_progress
+            Show progress bars.
+        
+        Returns
+        -------
+        AnnData or None
+            Modified AnnData if copy=True, else None.
+        
+        Stores
+        ------
+        obsm['X_pca'] : PCA-transformed data
+        varm['PCs'] : Principal components
+        uns['pca'] : Variance/metadata dict
+        """
+        from .dimred import pca as _pca
+        
+        # Handle both path and AnnData
+        if isinstance(data, (str, Path)):
+            adata = ad.read_h5ad(data, backed='r')
+        else:
+            adata = data
+        
+        return _pca(
+            adata,
+            n_comps=n_comps,
+            method=method,
+            use_highly_variable=use_highly_variable,
+            chunk_size=chunk_size,
+            random_state=random_state,
+            copy=copy,
+            show_progress=show_progress,
+        )
+
+    def neighbors(
+        self,
+        data: str | Path | ad.AnnData,
+        n_neighbors: int = 15,
+        n_pcs: int | None = None,
+        use_rep: str = "X_pca",
+        metric: str = "euclidean",
+        method: str = "umap",
+        random_state: int = 0,
+        copy: bool = False,
+        show_progress: bool = True,
+    ) -> ad.AnnData | None:
+        """Compute k-nearest neighbors graph from embeddings.
+        
+        Uses pre-computed embeddings (typically PCA) to build a KNN graph.
+        
+        Parameters
+        ----------
+        data
+            Path to h5ad file or backed AnnData with PCA results.
+        n_neighbors
+            Number of neighbors. Default 15.
+        n_pcs
+            Number of PCs to use. Default None uses all.
+        use_rep
+            Key in .obsm for embeddings. Default 'X_pca'.
+        metric
+            Distance metric. Default 'euclidean'.
+        method
+            'umap' (fast, pynndescent) or 'sklearn' (exact).
+        random_state
+            Random seed.
+        copy
+            If True, return copy with results.
+        show_progress
+            Show progress.
+        
+        Returns
+        -------
+        AnnData or None
+            Modified AnnData if copy=True, else None.
+        
+        Stores
+        ------
+        obsp['distances'] : Sparse distance matrix
+        obsp['connectivities'] : Sparse connectivity matrix  
+        uns['neighbors'] : Parameters dict
+        """
+        from .dimred import neighbors as _neighbors
+        
+        # Handle both path and AnnData
+        if isinstance(data, (str, Path)):
+            adata = ad.read_h5ad(data, backed='r')
+        else:
+            adata = data
+        
+        return _neighbors(
+            adata,
+            n_neighbors=n_neighbors,
+            n_pcs=n_pcs,
+            use_rep=use_rep,
+            metric=metric,
+            method=method,
+            random_state=random_state,
+            copy=copy,
+            show_progress=show_progress,
         )
 
 
@@ -374,7 +556,67 @@ class _PseudobulkNamespace:
 
 
 class _ToolsNamespace:
-    """Differential expression entry points mirroring Scanpy's ``tl`` API."""
+    """Differential expression and analysis entry points mirroring Scanpy's ``tl`` API."""
+
+    def umap(
+        self,
+        data: str | Path | ad.AnnData,
+        min_dist: float = 0.5,
+        spread: float = 1.0,
+        n_components: int = 2,
+        neighbors_key: str = "neighbors",
+        random_state: int = 0,
+        copy: bool = False,
+    ) -> ad.AnnData | None:
+        """Compute UMAP embedding from pre-computed neighbor graph.
+        
+        Memory-efficient UMAP that loads only the neighbor graph into memory,
+        not the full expression matrix.
+        
+        Parameters
+        ----------
+        data
+            Path to h5ad file or backed AnnData with neighbors computed.
+        min_dist
+            Minimum distance between embedded points. Default 0.5.
+        spread
+            Effective scale of embedded points. Default 1.0.
+        n_components
+            Number of UMAP dimensions. Default 2.
+        neighbors_key
+            Key in .uns for neighbor graph. Default 'neighbors'.
+        random_state
+            Random seed.
+        copy
+            Return copy with results instead of in-place.
+        
+        Returns
+        -------
+        AnnData or None
+            Modified AnnData if copy=True, else None.
+        
+        Stores
+        ------
+        obsm['X_umap'] : UMAP embedding (n_obs × n_components)
+        uns['umap'] : Parameters dict
+        """
+        from .dimred import umap as _umap
+        
+        # Handle both path and AnnData
+        if isinstance(data, (str, Path)):
+            adata = ad.read_h5ad(data, backed='r')
+        else:
+            adata = data
+        
+        return _umap(
+            adata,
+            min_dist=min_dist,
+            spread=spread,
+            n_components=n_components,
+            neighbors_key=neighbors_key,
+            random_state=random_state,
+            copy=copy,
+        )
 
     def rank_genes_groups(
         self,
@@ -416,7 +658,7 @@ class _ToolsNamespace:
         )
 
         if normalised == "wilcoxon":
-            allowed = {"min_cells_expressed", "chunk_size", "tie_correct", "n_jobs"}
+            allowed = {"min_cells_expressed", "chunk_size", "tie_correct", "n_jobs", "memory_limit_gb"}
             unexpected = set(kwargs) - allowed
             if unexpected:
                 raise TypeError(
@@ -466,7 +708,7 @@ class _ToolsNamespace:
             return result.result
 
         if normalised == "t_test":
-            allowed = {"min_cells_expressed", "cell_chunk_size", "n_jobs"}
+            allowed = {"min_cells_expressed", "cell_chunk_size", "n_jobs", "memory_limit_gb"}
             unexpected = set(kwargs) - allowed
             if unexpected:
                 raise TypeError(
@@ -514,6 +756,7 @@ class _ToolsNamespace:
         n_jobs: int = -1,
         batch_size: int = 128,
         profiling: bool = False,
+        memory_limit_gb: float | None = None,
     ):
         """Apply apeGLM LFC shrinkage to NB-GLM results.
 
@@ -537,6 +780,9 @@ class _ToolsNamespace:
             Number of genes per batch.
         profiling
             Enable timing/memory profiling.
+        memory_limit_gb
+            Optional memory budget in GB. When method="full", limits
+            parallel n_jobs. None auto-detects via psutil.
 
         Returns
         -------
@@ -554,6 +800,7 @@ class _ToolsNamespace:
             n_jobs=n_jobs,
             batch_size=batch_size,
             profiling=profiling,
+            memory_limit_gb=memory_limit_gb,
         )
 
 
@@ -583,6 +830,22 @@ class _PlottingNamespace:
 
     def materialize_rank_genes_groups(self, data, **kwargs):
         return materialize_rank_genes_groups(data, **kwargs)
+
+    def pca(self, data, **kwargs):
+        """Plot PCA scatter. Wrapper around scanpy.pl.pca."""
+        return plot_pca(data, **kwargs)
+
+    def pca_variance_ratio(self, data, **kwargs):
+        """Plot PCA variance ratio. Wrapper around scanpy.pl.pca_variance_ratio."""
+        return plot_pca_variance_ratio(data, **kwargs)
+
+    def pca_loadings(self, data, **kwargs):
+        """Plot PCA loadings. Wrapper around scanpy.pl.pca_loadings."""
+        return plot_pca_loadings(data, **kwargs)
+
+    def umap(self, data, **kwargs):
+        """Plot UMAP embedding. Wrapper around scanpy.pl.umap."""
+        return plot_umap(data, **kwargs)
 
 pp = _PreprocessingNamespace()
 pb = _PseudobulkNamespace()
@@ -615,6 +878,7 @@ __all__ = [
     "calculate_optimal_chunk_size",
     "calculate_optimal_gene_chunk_size",
     "normalize_total_log1p",
+    "convert_to_csc",
     # Profiling utilities
     "Profiler",
     "MemoryProfiler",
@@ -623,6 +887,10 @@ __all__ = [
     # Plotting utilities
     "materialize_rank_genes_groups",
     "rank_genes_groups_df",
+    "plot_pca",
+    "plot_pca_variance_ratio",
+    "plot_pca_loadings",
+    "plot_umap",
     "plot_volcano",
     "plot_ma",
     "plot_top_genes_bar",

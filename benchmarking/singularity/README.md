@@ -98,7 +98,8 @@ benchmarking/singularity/
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `CRISPYX_SIF` | `./crispyx-benchmark.sif` | Path to Singularity image |
-| `DATA_DIR` | `../data` | Path to data directory |
+| `DATA_DIR` | `../data` | Path to local data directory (small datasets) |
+| `ORIGIN_DATA_DIR` | `$PROJECT_ROOT/data/origin` | Path to large-dataset `.h5ad` files; override when data lives elsewhere (e.g. `export ORIGIN_DATA_DIR=/lustre1/g/ids_du/data/origin`) |
 | `RESULTS_DIR` | `./results` | Path to results directory |
 | `N_CORES` | `8` | Number of CPU cores |
 
@@ -109,6 +110,7 @@ The scripts mount the following directories:
 | Host Path | Container Path | Mode |
 |-----------|----------------|------|
 | `$DATA_DIR` | `/workspace/data` | Read-only |
+| `$ORIGIN_DATA_DIR` | `/data/origin` | Read-only |
 | `$RESULTS_DIR` | `/workspace/benchmarking/results` | Read-write |
 | `$LOGS_DIR` | `/workspace/benchmarking/logs` | Read-write |
 | `$CONFIG_DIR` | `/workspace/benchmarking/config` | Read-only |

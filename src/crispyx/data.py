@@ -334,6 +334,153 @@ def read_backed(path: str | Path) -> ad.AnnData:
     return ad.read_h5ad(str(path), backed="r")
 
 
+# -----------------------------------------------------------------------------
+# H5AD Write Helpers (for close-write-reopen pattern)
+# -----------------------------------------------------------------------------
+
+
+def write_obsm_to_h5ad(path: str | Path, key: str, data: np.ndarray) -> None:
+    """Write a dense array to obsm/{key} in an h5ad file.
+    
+    Parameters
+    ----------
+    path
+        Path to the h5ad file.
+    key
+        Key under obsm (e.g., 'X_pca').
+    data
+        Dense numpy array of shape (n_obs, n_dims).
+    """
+    with h5py.File(path, "r+") as f:
+        if "obsm" not in f:
+            f.create_group("obsm")
+        obsm = f["obsm"]
+        if key in obsm:
+            del obsm[key]
+        ds = obsm.create_dataset(key, data=data, compression="gzip", compression_opts=4)
+        ds.attrs["encoding-type"] = "array"
+        ds.attrs["encoding-version"] = "0.2.0"
+
+
+def write_varm_to_h5ad(path: str | Path, key: str, data: np.ndarray) -> None:
+    """Write a dense array to varm/{key} in an h5ad file.
+    
+    Parameters
+    ----------
+    path
+        Path to the h5ad file.
+    key
+        Key under varm (e.g., 'PCs').
+    data
+        Dense numpy array of shape (n_vars, n_dims).
+    """
+    with h5py.File(path, "r+") as f:
+        if "varm" not in f:
+            f.create_group("varm")
+        varm = f["varm"]
+        if key in varm:
+            del varm[key]
+        ds = varm.create_dataset(key, data=data, compression="gzip", compression_opts=4)
+        ds.attrs["encoding-type"] = "array"
+        ds.attrs["encoding-version"] = "0.2.0"
+
+
+def write_uns_dict_to_h5ad(path: str | Path, key: str, data: dict) -> None:
+    """Write a dict to uns/{key} in an h5ad file.
+    
+    Handles scalar values, numpy arrays, and nested dicts.
+    Uses AnnData-compatible encoding for proper round-trip compatibility.
+    
+    Parameters
+    ----------
+    path
+        Path to the h5ad file.
+    key
+        Key under uns (e.g., 'pca').
+    data
+        Dictionary with string keys and scalar/array values.
+    """
+    # Variable-length string type for h5py
+    str_dtype = h5py.string_dtype(encoding='utf-8')
+    
+    def _write_value(grp: h5py.Group, k: str, v):
+        if k in grp:
+            del grp[k]
+        if isinstance(v, dict):
+            sub = grp.create_group(k)
+            for sub_k, sub_v in v.items():
+                _write_value(sub, sub_k, sub_v)
+        elif isinstance(v, np.ndarray):
+            ds = grp.create_dataset(k, data=v)
+            ds.attrs["encoding-type"] = "array"
+            ds.attrs["encoding-version"] = "0.2.0"
+        elif isinstance(v, (list, tuple)):
+            arr = np.array(v)
+            ds = grp.create_dataset(k, data=arr)
+            ds.attrs["encoding-type"] = "array"
+            ds.attrs["encoding-version"] = "0.2.0"
+        elif isinstance(v, str):
+            ds = grp.create_dataset(k, data=v, dtype=str_dtype)
+            ds.attrs["encoding-type"] = "string"
+            ds.attrs["encoding-version"] = "0.2.0"
+        elif isinstance(v, bool):
+            # Store bool as numpy bool_ to avoid confusion with int
+            ds = grp.create_dataset(k, data=np.bool_(v))
+            ds.attrs["encoding-type"] = "numeric-scalar"
+            ds.attrs["encoding-version"] = "0.2.0"
+        elif isinstance(v, (int, float, np.integer, np.floating)):
+            ds = grp.create_dataset(k, data=v)
+            ds.attrs["encoding-type"] = "numeric-scalar"
+            ds.attrs["encoding-version"] = "0.2.0"
+        else:
+            # Fallback: try as string
+            ds = grp.create_dataset(k, data=str(v), dtype=str_dtype)
+            ds.attrs["encoding-type"] = "string"
+            ds.attrs["encoding-version"] = "0.2.0"
+    
+    with h5py.File(path, "r+") as f:
+        if "uns" not in f:
+            f.create_group("uns")
+        uns = f["uns"]
+        if key in uns:
+            del uns[key]
+        grp = uns.create_group(key)
+        for k, v in data.items():
+            _write_value(grp, k, v)
+
+
+def write_obsp_to_h5ad(path: str | Path, key: str, data: sp.spmatrix) -> None:
+    """Write a sparse matrix to obsp/{key} in an h5ad file.
+    
+    Stores in CSR format following AnnData conventions.
+    
+    Parameters
+    ----------
+    path
+        Path to the h5ad file.
+    key
+        Key under obsp (e.g., 'distances', 'connectivities').
+    data
+        Sparse matrix of shape (n_obs, n_obs).
+    """
+    csr = sp.csr_matrix(data)
+    
+    with h5py.File(path, "r+") as f:
+        if "obsp" not in f:
+            f.create_group("obsp")
+        obsp = f["obsp"]
+        if key in obsp:
+            del obsp[key]
+        
+        grp = obsp.create_group(key)
+        grp.attrs["encoding-type"] = np.bytes_("csr_matrix")
+        grp.attrs["encoding-version"] = np.bytes_("0.1.0")
+        grp.attrs["shape"] = np.array(csr.shape, dtype=np.int64)
+        grp.create_dataset("data", data=csr.data, compression="gzip", compression_opts=4)
+        grp.create_dataset("indices", data=csr.indices)
+        grp.create_dataset("indptr", data=csr.indptr)
+
+
 def resolve_data_path(
     data: str | Path | "AnnData" | ad.AnnData,
     *,
@@ -734,6 +881,11 @@ def write_filtered_subset(
         var = backed.var.iloc[gene_mask].copy()
         obs.index = obs.index.astype(str)
         var.index = var.index.astype(str)
+        # Drop stale categories so downstream tools (e.g. scanpy) only see
+        # groups that have at least one cell in the filtered subset.
+        for _col in obs.columns:
+            if isinstance(obs[_col].dtype, pd.CategoricalDtype):
+                obs[_col] = obs[_col].cat.remove_unused_categories()
         if var_assignments:
             for key, values in var_assignments.items():
                 if len(values) != var.shape[0]:
@@ -1056,8 +1208,13 @@ def normalize_total_log1p(
         adata.write(output_path)
         return output_path
     
+    # Choose consistent index dtype for both indptr and indices.
+    # scipy requires indptr and indices to share the same integer dtype;
+    # mixed int32/int64 triggers "Output dtype not compatible" in scipy >= 1.15.
+    idx_dtype = np.int32 if total_nnz <= np.iinfo(np.int32).max else np.int64
+
     # Compute indptr
-    indptr = np.zeros(n_obs + 1, dtype=np.int64)
+    indptr = np.zeros(n_obs + 1, dtype=idx_dtype)
     np.cumsum(row_nnz, out=indptr[1:])
     
     # HDF5 chunk sizing
@@ -1085,7 +1242,7 @@ def normalize_total_log1p(
         indices_ds = grp.create_dataset(
             "indices",
             shape=(total_nnz,),
-            dtype=np.int32,
+            dtype=idx_dtype,
             chunks=(hdf5_chunk_size,) if total_nnz >= hdf5_chunk_size else None,
         )
         grp.create_dataset("indptr", data=indptr)
@@ -1130,7 +1287,7 @@ def normalize_total_log1p(
                 nnz = len(processed_data)
                 if nnz:
                     data_ds[offset : offset + nnz] = processed_data
-                    indices_ds[offset : offset + nnz] = csr.indices.astype(np.int32)
+                    indices_ds[offset : offset + nnz] = csr.indices.astype(idx_dtype)
                     offset += nnz
         finally:
             backed.file.close()
@@ -1143,6 +1300,197 @@ def normalize_total_log1p(
 
 # Alias for backward compatibility
 write_normalized_log1p = normalize_total_log1p
+
+
+def convert_to_csc(
+    data: str | Path | "AnnData" | ad.AnnData,
+    *,
+    output_path: str | Path | None = None,
+    chunk_size: int = 4096,
+    output_dir: str | Path | None = None,
+    data_name: str | None = None,
+    verbose: bool = True,
+) -> "AnnData":
+    """Convert a backed h5ad file's matrix from CSR (or dense) to CSC format.
+
+    CSC format allows O(nnz_in_chunk) column-slicing instead of O(total_nnz)
+    that CSR requires.  This is required for efficient Wilcoxon rank-sum testing,
+    which iterates over gene chunks with ``axis=1`` access patterns.
+
+    The conversion is done in two streaming passes over the source file so the
+    peak memory is bounded by ``total_nnz × sizeof(float32 + row_dtype)`` bytes
+    (the output buffers) plus one row-chunk working buffer.  The result is written
+    to disk in a single sequential write which is as fast as possible on HDD/SSD.
+
+    If the input file is already CSC, no file is written; the function returns a
+    backed AnnData pointing to the original file.
+
+    Parameters
+    ----------
+    data
+        Path to source h5ad file (CSR or dense), or a backed AnnData.
+    output_path
+        Explicit path for the output file.  If ``None``, a path is derived from
+        ``output_dir``/``data_name`` with ``"_csc"`` appended to the stem.
+    chunk_size
+        Number of rows (cells) to read at a time during both passes.  Default 4096.
+    output_dir
+        Directory for the output file.  Defaults to the source file's directory.
+    data_name
+        Custom name used when building the output filename.
+    verbose
+        Print progress messages.
+
+    Returns
+    -------
+    AnnData
+        Backed (read-only) AnnData pointing to the written CSC h5ad file,
+        or to the source file if it was already CSC.
+
+    Examples
+    --------
+    >>> adata_csc = cx.pp.convert_to_csc(preprocessed_path, output_dir=OUTPUT_DIR)
+    """
+    source_path = resolve_data_path(data, require_exists=True)
+
+    # Fast path: input is already CSC — return it directly.
+    if get_matrix_storage_format(source_path) == "csc":
+        if verbose:
+            print(f"File is already CSC, skipping conversion: {source_path}")
+        return AnnData(source_path)
+
+    # Resolve output path.
+    if output_path is None:
+        output_path = resolve_output_path(
+            source_path,
+            suffix="csc",
+            output_dir=output_dir,
+            data_name=data_name,
+        )
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if verbose:
+        print(f"Converting to CSC (two-pass streaming): {source_path} → {output_path}")
+
+    # ------------------------------------------------------------------ Pass 1
+    # Read all rows in chunks; count non-zeros per *column*; collect metadata.
+    backed = read_backed(source_path)
+    try:
+        n_obs = backed.n_obs
+        n_vars = backed.n_vars
+        obs = backed.obs.copy()
+        var = backed.var.copy()
+        obs.index = obs.index.astype(str)
+        var.index = var.index.astype(str)
+
+        col_nnz = np.zeros(n_vars, dtype=np.int64)
+        total_nnz = 0
+        for _slc, block in iter_matrix_chunks(
+            backed, axis=0, chunk_size=chunk_size, convert_to_dense=False
+        ):
+            csr = _ensure_csr(block)
+            np.add.at(col_nnz, csr.indices, 1)
+            total_nnz += csr.nnz
+    finally:
+        backed.file.close()
+
+    # Empty matrix edge case.
+    if total_nnz == 0:
+        placeholder = sp.csc_matrix((n_obs, n_vars), dtype=np.float32)
+        adata = ad.AnnData(placeholder, obs=obs, var=var)
+        adata.write(output_path)
+        return AnnData(output_path)
+
+    # CSC indptr: length n_vars + 1.  Use int64 when NNZ exceeds INT32_MAX.
+    idx_dtype = np.int32 if total_nnz <= np.iinfo(np.int32).max else np.int64
+    indptr = np.zeros(n_vars + 1, dtype=idx_dtype)
+    np.cumsum(col_nnz, out=indptr[1:])
+
+    # Row-index dtype: int32 suffices for up to ~2 billion cells.
+    row_dtype = np.int32 if n_obs <= np.iinfo(np.int32).max else np.int64
+
+    # ------------------------------------------------------------------ Pass 2
+    # Scatter CSR non-zeros into in-memory CSC buffers, then write sequentially.
+    # Memory cost: total_nnz * (4 + sizeof_row_dtype) bytes.
+    out_data = np.empty(total_nnz, dtype=np.float32)
+    out_row_indices = np.empty(total_nnz, dtype=row_dtype)
+    # offset[c] = next write position in the CSC arrays for column c.
+    # Must be int64 so positions can exceed INT32_MAX when total_nnz > 2^31.
+    offset = indptr[:-1].astype(np.int64)
+
+    row_global = 0
+    backed = read_backed(source_path)
+    try:
+        for _slc, block in iter_matrix_chunks(
+            backed, axis=0, chunk_size=chunk_size, convert_to_dense=False
+        ):
+            csr = _ensure_csr(block)
+            n_chunk = csr.shape[0]
+            if csr.nnz == 0:
+                row_global += n_chunk
+                continue
+
+            # Global row index for every non-zero in this chunk.
+            local_row_ids = np.repeat(
+                np.arange(n_chunk, dtype=row_dtype), np.diff(csr.indptr)
+            ) + row_dtype(row_global)
+
+            cols = csr.indices          # column index of each non-zero
+            vals = csr.data.astype(np.float32)
+
+            # Sort non-zeros by column so we can process contiguous groups.
+            col_order = np.argsort(cols, kind="stable")
+            sorted_cols = cols[col_order]
+            sorted_vals = vals[col_order]
+            sorted_rows = local_row_ids[col_order]
+
+            # Compute within-column sequential ranks: 0, 1, 2, … per column.
+            unique_cols, col_counts = np.unique(sorted_cols, return_counts=True)
+            col_ends = np.cumsum(col_counts)
+            col_starts = col_ends - col_counts
+            within_col = np.arange(len(sorted_cols)) - np.repeat(col_starts, col_counts)
+
+            # Absolute write positions: base position for each column + rank.
+            positions = np.repeat(offset[unique_cols], col_counts) + within_col
+
+            out_data[positions] = sorted_vals
+            out_row_indices[positions] = sorted_rows
+
+            # Advance column write offsets.
+            offset[unique_cols] += col_counts.astype(np.int64)
+            row_global += n_chunk
+    finally:
+        backed.file.close()
+
+    # ------------------------------------------------------------------ Write
+    hdf5_chunk_size = min(262144, max(8192, total_nnz // 16))
+
+    # Bootstrap a minimal skeleton so anndata writes valid obs/var groups.
+    placeholder = sp.csr_matrix((n_obs, n_vars), dtype=np.float32)
+    adata = ad.AnnData(placeholder, obs=obs, var=var)
+    adata.write(output_path)
+
+    # Replace the X group with a proper CSC encoding.
+    with h5py.File(output_path, "r+", libver="latest") as dest:
+        if "X" in dest:
+            del dest["X"]
+        grp = dest.create_group("X")
+        grp.attrs["encoding-type"] = np.bytes_("csc_matrix")
+        grp.attrs["encoding-version"] = np.bytes_("0.1.0")
+        grp.attrs["shape"] = np.array([n_obs, n_vars], dtype=np.int64)
+        chunk_arg = (hdf5_chunk_size,) if total_nnz >= hdf5_chunk_size else None
+        grp.create_dataset("data", data=out_data, chunks=chunk_arg)
+        grp.create_dataset("indices", data=out_row_indices, chunks=chunk_arg)
+        grp.create_dataset("indptr", data=indptr)
+
+    if verbose:
+        print(
+            f"  ✓ CSC file written: {n_obs} cells × {n_vars} genes,"
+            f" {total_nnz:,} non-zeros"
+        )
+
+    return AnnData(output_path)
 
 
 def calculate_optimal_chunk_size(
@@ -1298,6 +1646,32 @@ def calculate_optimal_gene_chunk_size(
         elif n_groups > 2000:
             effective_max_chunk = min(effective_max_chunk, 384)
     
+    # Cell-count-based caps for very large datasets (Wilcoxon ranking is memory-intensive)
+    # On memory-constrained machines (< 32 GB available) these caps act as hard safety guards
+    # to avoid OOM. On large-memory machines the memory-formula above (max_chunk_from_memory)
+    # already accounts for available RAM, so over-riding it with small fixed values would be
+    # unnecessarily conservative — e.g. Feng-gwsf on 128 GB can safely use 384-gene chunks.
+    _CELL_COUNT_CAP_MEMORY_THRESHOLD_GB = 32.0
+    if available_memory_gb < _CELL_COUNT_CAP_MEMORY_THRESHOLD_GB:
+        if n_obs > 1_000_000:
+            effective_max_chunk = min(effective_max_chunk, 32)   # Very conservative for >1M cells
+        elif n_obs > 500_000:
+            effective_max_chunk = min(effective_max_chunk, 64)   # Conservative for >500K cells
+        elif n_obs > 300_000:
+            effective_max_chunk = min(effective_max_chunk, 128)  # Moderate for >300K cells
+    # else: trust max_chunk_from_memory (computed from available_memory_gb above)
+
+    # Additional cell-count cap for ALL memory tiers: the per-chunk transient memory
+    # for Wilcoxon (dense block + control presort + pert stacking) scales as
+    # ~n_obs × chunk × 12 bytes. On high-cell datasets this can exceed 5% of available
+    # memory per chunk, causing glibc arena fragmentation across many chunks.
+    _PER_CHUNK_BUDGET_FRACTION = 0.05
+    per_chunk_bytes_per_gene = n_obs * 12  # dense(f32) + ctrl(f64) + pert(f32)
+    per_chunk_budget = available_memory_gb * _PER_CHUNK_BUDGET_FRACTION * 1e9
+    if per_chunk_bytes_per_gene > 0 and per_chunk_bytes_per_gene * effective_max_chunk > per_chunk_budget:
+        cell_cap = max(min_chunk, int(per_chunk_budget / per_chunk_bytes_per_gene))
+        effective_max_chunk = min(effective_max_chunk, cell_cap)
+    
     # Clamp to reasonable range
     chunk_size = max(min_chunk, min(effective_max_chunk, max_chunk_from_memory))
     
@@ -1309,6 +1683,211 @@ def calculate_optimal_gene_chunk_size(
     )
     
     return chunk_size
+
+
+def calculate_nb_glm_chunk_size(
+    n_obs: int,
+    n_vars: int,
+    n_groups: int | None = None,
+    available_memory_gb: float | None = None,
+    memory_limit_gb: float | None = None,
+    safety_factor: float = 8.0,
+    memory_fraction: float = 0.5,
+    min_chunk: int = 32,
+    max_chunk: int = 256,
+) -> int:
+    """Calculate optimal gene chunk size for NB-GLM operations.
+    
+    NB-GLM iterates over genes (columns) and for each chunk:
+    - Loads dense count data: n_obs × chunk_size
+    - Computes dispersion: requires cell-level statistics
+    - Fits GLM: design matrix operations
+    
+    This function is specifically tuned for NB-GLM memory patterns,
+    which differ from Wilcoxon (ranking) and t-test (simple statistics).
+    
+    Parameters
+    ----------
+    n_obs
+        Number of observations (cells) in the dataset.
+    n_vars
+        Number of variables (genes) in the dataset.
+    n_groups
+        Number of perturbation groups. If provided, used to estimate memory
+        for output arrays and design matrix overhead.
+    available_memory_gb
+        Available memory in gigabytes. If None, auto-detects using psutil.
+    memory_limit_gb
+        Optional hard memory limit in GB. If provided, uses the minimum of
+        available memory and this limit.
+    safety_factor
+        Safety multiplier to account for overhead (default 8.0).
+    memory_fraction
+        Fraction of available memory to use (default 0.5).
+    min_chunk
+        Minimum chunk size to return (default 32).
+    max_chunk
+        Maximum chunk size to return (default 256).
+    
+    Returns
+    -------
+    int
+        Recommended gene chunk size, clamped to [min_chunk, max_chunk].
+        For datasets where memory is sufficient, returns max_chunk (256).
+        Only reduces chunk size when memory would be exceeded.
+    
+    Examples
+    --------
+    >>> calculate_nb_glm_chunk_size(100000, 20000, n_groups=100, available_memory_gb=128)
+    256
+    >>> calculate_nb_glm_chunk_size(1200000, 36000, n_groups=500, available_memory_gb=128)
+    143
+    """
+    if available_memory_gb is None:
+        try:
+            import psutil
+            available_memory_gb = psutil.virtual_memory().available / 1e9
+        except ImportError:
+            logger.warning(
+                "psutil not installed, using default 16GB for NB-GLM chunk size calculation."
+            )
+            available_memory_gb = 16.0
+    
+    # Apply memory limit if provided
+    if memory_limit_gb is not None:
+        available_memory_gb = min(available_memory_gb, memory_limit_gb)
+    
+    # Usable memory = fraction of available
+    usable_memory_bytes = available_memory_gb * memory_fraction * 1e9
+    
+    # NB-GLM memory per gene (conservative estimate):
+    # - Dense counts: n_obs × 8 bytes (float64)
+    # - Design matrix contribution: n_obs × 2 × 8 bytes
+    # - Working matrices (mu, var, residuals): n_obs × 8 × 3
+    # - Output arrays: n_groups × 8 × 8 (lfc, stat, pvalue, se, etc.)
+    base_memory_per_gene = n_obs * 8 * 6  # ~48 bytes per cell per gene
+    group_memory_per_gene = (n_groups * 8 * 8) if n_groups else 0
+    
+    total_memory_per_gene = (base_memory_per_gene + group_memory_per_gene) * safety_factor
+    
+    # Calculate max chunk from memory
+    if total_memory_per_gene > 0:
+        max_chunk_from_memory = int(usable_memory_bytes / total_memory_per_gene)
+    else:
+        max_chunk_from_memory = max_chunk
+    
+    # Clamp to reasonable range
+    chunk_size = max(min_chunk, min(max_chunk, max_chunk_from_memory))
+    
+    logger.info(
+        f"Calculated NB-GLM chunk size: {chunk_size} "
+        f"(dataset: {n_obs} cells × {n_vars} genes, "
+        f"groups: {n_groups or 'unknown'}, "
+        f"available memory: {available_memory_gb:.1f}GB)"
+    )
+    
+    return chunk_size
+
+
+def calculate_pca_chunk_size(
+    n_obs: int,
+    n_vars: int,
+    n_comps: int = 50,
+    available_memory_gb: float | None = None,
+    method: str = "auto",
+    memory_fraction: float = 0.5,
+    min_chunk: int = 256,
+    max_chunk: int = 4096,
+) -> tuple[int, str]:
+    """Calculate optimal chunk size for streaming PCA.
+    
+    PCA memory usage depends on the method:
+    - sparse_cov: O(genes²) for covariance matrix, fast for small gene counts
+    - incremental: O(chunk × genes) for data chunks, better for large gene counts
+    
+    Parameters
+    ----------
+    n_obs
+        Number of observations (cells) in the dataset.
+    n_vars
+        Number of variables (genes) in the dataset.
+    n_comps
+        Number of principal components to compute. Default 50.
+    available_memory_gb
+        Available memory in gigabytes. If None, auto-detects using psutil.
+    method
+        PCA method: 'auto', 'sparse_cov', or 'incremental'.
+        'auto' selects based on gene count and available memory.
+    memory_fraction
+        Fraction of available memory to use (default 0.5).
+    min_chunk
+        Minimum chunk size to return (default 256).
+    max_chunk
+        Maximum chunk size to return (default 4096).
+    
+    Returns
+    -------
+    tuple[int, str]
+        (chunk_size, selected_method) where selected_method is 'sparse_cov'
+        or 'incremental'.
+    
+    Examples
+    --------
+    >>> calculate_pca_chunk_size(100000, 8000, available_memory_gb=32)
+    (2048, 'sparse_cov')
+    >>> calculate_pca_chunk_size(100000, 50000, available_memory_gb=32)
+    (1024, 'incremental')
+    """
+    if available_memory_gb is None:
+        try:
+            import psutil
+            available_memory_gb = psutil.virtual_memory().available / 1e9
+        except ImportError:
+            logger.warning(
+                "psutil not installed, using default 16GB for PCA chunk size calculation."
+            )
+            available_memory_gb = 16.0
+    
+    usable_memory_gb = available_memory_gb * memory_fraction
+    
+    # Estimate covariance matrix memory (genes × genes × 8 bytes)
+    cov_memory_gb = n_vars * n_vars * 8 / 1e9
+    
+    # Select method if auto
+    if method == "auto":
+        # Use sparse_cov if covariance fits in 30% of usable memory
+        if cov_memory_gb < usable_memory_gb * 0.3:
+            selected_method = "sparse_cov"
+        else:
+            selected_method = "incremental"
+    else:
+        selected_method = method
+    
+    # Calculate chunk size based on method
+    if selected_method == "sparse_cov":
+        # Need: XTX (genes² × 8), sums (genes × 8), chunk (chunk × genes × 8)
+        reserved_gb = cov_memory_gb + n_vars * 8 / 1e9
+        remaining_gb = max(0.1, usable_memory_gb - reserved_gb)
+    else:
+        # Need: mean (genes × 8), IPCA internals (~2 × comps × genes × 8), chunk
+        ipca_internal_gb = 2 * n_comps * n_vars * 8 / 1e9
+        reserved_gb = n_vars * 8 / 1e9 + ipca_internal_gb
+        remaining_gb = max(0.1, usable_memory_gb - reserved_gb)
+    
+    # Chunk memory: chunk_size × n_vars × 8 bytes (float64 during computation)
+    bytes_per_row = n_vars * 8
+    max_chunk_from_memory = int(remaining_gb * 0.5 * 1e9 / bytes_per_row)
+    
+    chunk_size = max(min_chunk, min(max_chunk, max_chunk_from_memory))
+    
+    logger.info(
+        f"PCA chunk size: {chunk_size}, method: {selected_method} "
+        f"(dataset: {n_obs} cells × {n_vars} genes, "
+        f"cov matrix: {cov_memory_gb:.2f} GB, "
+        f"available: {available_memory_gb:.1f} GB)"
+    )
+    
+    return chunk_size, selected_method
 
 
 def calculate_adaptive_qc_thresholds(

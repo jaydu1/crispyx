@@ -2,23 +2,344 @@
 
 All notable changes to crispyx are documented here.
 
-## [0.7.4] - 2026-02-11
+## [0.7.4] - 2026-02-21
 
+### Fixed (2026-02-24 — Wilcoxon OOM patch)
+- **h5py direct write for Wilcoxon results**: Replaced the end-of-function triple
+  allocation (memmap → `np.array()` copy → `AnnData.write()`) with `_write_wilcoxon_result_h5ad()`,
+  which writes each memmap directly to HDF5 via h5py one dataset at a time. This avoids
+  having the full memmap, its in-memory copy, and the AnnData write buffers all resident
+  simultaneously — the primary OOM cause for datasets like Feng-gwsf (2,031 groups × 31,772 genes).
+
+- **glibc malloc_trim after each gene chunk**: Added `_release_chunk_memory()` (gc.collect +
+  `malloc_trim(0)`) after each gene chunk's memmap writes. On Linux, glibc holds freed pages
+  in thread-local arenas; `malloc_trim(0)` forces return to the OS, preventing RLIMIT_AS
+  violations that accumulated across hundreds of gene chunks.
+
+- **Adaptive per-chunk budget cap**: Added a 5%-of-available-memory cap per gene chunk in
+  `calculate_optimal_gene_chunk_size()`. For high-cell datasets (e.g., Feng-ts at 1.16M cells)
+  this limits chunk size to ~460 genes instead of 512, preventing transient dense-block
+  allocations from exceeding the per-chunk memory budget.
+
+- **Lazy result readback for huge output**: `_build_result_from_h5ad()` returns a lazy result
+  (empty arrays + AnnData file reference) when the result arrays would exceed 25% of physical
+  memory. This prevents OOM during the readback phase for extreme datasets like Huang-HEK293T
+  (18,311 groups × 38,606 genes ≈ 40 GB of result arrays).
+
+- **Peak multiplier increased to 5.0×**: `_should_use_streaming()` now uses
+  `peak_multiplier=5.0` (was 4.0) to account for glibc arena overhead and freed-but-unreturned
+  pages, improving streaming dispatch accuracy for borderline datasets.
+
+- **Removed unused `order_matrix` memmap**: The non-streaming Wilcoxon path no longer
+  allocates an `(n_groups × n_genes)` int64 memmap for sort order. Order is now computed
+  on-demand during result readback via `np.argsort`, saving ~500 MB for large datasets.
+
+- **Benchmark runner: skip RLIMIT_AS for mmap-backed methods**: Inside Singularity
+  containers (where cgroups are unavailable), the benchmark runner previously enforced
+  memory limits via `RLIMIT_AS`, which caps total virtual address space (VSZ) — not RSS.
+  crispyx methods mmap large h5ad files and numpy memmaps that inflate VSZ to ~42 GB
+  while RSS stays at 6–17 GB, causing spurious SIGKILL. Added
+  `_uses_mmap_backed_files()` helper to skip `RLIMIT_AS` for crispyx methods; memory
+  enforcement relies on parent-process RSS sampling instead.
+
+### Performance
+- **Wilcoxon dense-block once per chunk**: Both the standard and streaming paths now
+  convert the relevant gene columns to dense **once** per chunk (for all cells combined)
+  instead of once per perturbation group. This eliminates ≥ N_groups × scipy sparse→dense
+  conversions inside the inner loop — for Feng-gwsnf (4,955 groups) that removes ~1.4 M
+  sparse→dense calls per gene chunk, yielding a **~6× I/O speedup** (17 GB read in
+  ~2 min vs ~12 min before).
+
+- **Integer row indexing in Wilcoxon**: Replaced boolean-masked dense extraction
+  (`csr[mask, :]`) with precomputed integer arrays (`np.where(mask)[0]`) so each group
+  row-selection is a single O(k) fancy-index copy instead of a boolean scan + copy.
+
+- **Pre-sorted control Numba kernels**: Added two new `@nb.njit(parallel=True, cache=True)`
+  kernels to `_kernels.py`:
+  - `_presort_control_nonzeros`: sorts control non-zeros once per gene chunk using
+    `nb.prange` over genes (two parallel passes: count → prefix-sum → extract+sort).
+  - `_wilcoxon_presorted_ctrl_numba`: merge-based rank-sum test that reuses the
+    pre-sorted control; eliminates the O(n_ctrl × log n_ctrl) sort that previously
+    ran once per perturbation group × gene.
+  
+  Kernel microbenchmark (5,824 calls, Adamson scale): **7.38× faster** (27.6 s → 3.7 s).
+  Applied to both standard and streaming paths in `de.py`.
+
+- **Batched Wilcoxon Numba kernel (`_wilcoxon_batch_perts_presorted_numba`)**: New
+  `@nb.njit(parallel=True, cache=True)` kernel that processes all perturbation groups
+  in a single JIT call using `nb.prange` over `n_perts`. Replaced the sequential
+  perturbation loop in both standard and streaming paths. Combined with
+  `_wilcoxon_single_pert_presorted` for per-perturbation rank-sum logic.
+
+- **Dense array dtype aligned with Scanpy (float32)**: Removed `.astype(np.float64)`
+  casts from both standard and streaming Wilcoxon paths in `de.py`. Dense gene blocks
+  are kept at the native h5ad dtype (float32), halving per-chunk working-set memory
+  (~200 MB → ~100 MB at Huang scale). Output statistic arrays (`u_stats`, `pvals`)
+  remain float64 for numerical precision, matching Scanpy's `_ranks()` behaviour.
 
 ### Fixed
-- **Wilcoxon OOM on large datasets with many perturbation groups**: Enhanced 
-  `calculate_optimal_gene_chunk_size()` to account for the number of perturbation 
-  groups (`n_groups`), which significantly impacts memory due to output array allocation.
-  - Added `n_groups` parameter to scale chunk sizes based on group count
-  - Added `memory_fraction` parameter (default 0.5) to leave headroom for memmaps
-  - Reduced default `max_chunk` from 1024 → 512 for more conservative memory usage
-  - Added dynamic scaling: >10K groups → max 128, >5K → 256, >2K → 384
-  - Datasets like Huang-HEK293T (4.5M cells, 18K groups) now use 128 genes/chunk 
-    instead of ~440, reducing peak memory by ~50%
-  - Fixes OOM errors on Feng-gwsf, Feng-gwsnf, Huang-HCT116, Huang-HEK293T datasets
+- **Wilcoxon OOM on very large datasets (>300K cells)**: Cell-count caps in
+  `calculate_optimal_gene_chunk_size()` are now gated on `available_memory_gb < 32.0`.
+  On 128 GB benchmark servers the caps are lifted, allowing chunk sizes to reach
+  384–512 genes/chunk (e.g., Feng-gwsf 322K cells → 384, Feng-ts 1.16M cells → 512).
+  On memory-constrained systems (< 32 GB) the protective caps still apply:
+  - >1M cells: max_chunk = 32 genes
+  - >500K cells: max_chunk = 64 genes
+  - >300K cells: max_chunk = 128 genes
+  This retains OOM safety on small machines while removing the performance penalty on
+  128 GB benchmark servers. Fixes Wilcoxon OOM on Feng-gwsf, Feng-gwsnf, and Feng-ts.
+
+- **NB-GLM OOM on datasets with large control populations**: Enhanced `freeze_control`
+  auto-detection to enable when control matrix exceeds 10 GB, regardless of worker count.
+  For the Feng datasets (~110K control cells × 36K genes = 32 GB), each worker previously
+  copied the full control matrix, causing OOM. Now `freeze_control` auto-enables,
+  reducing per-worker memory from ~32 GB to <1 GB.
+  
+  Auto-enable conditions (either triggers freeze_control):
+  1. **Large control matrix** (NEW): control_n × n_genes × 8 bytes > 10 GB
+  2. **Worker limitation**: standard mode would limit to <4 workers
+  
+  This fixes NB-GLM OOM on Feng-gwsf, Feng-gwsnf, and Feng-ts datasets under 128 GB.
+
+- **Scanpy DE "only one sample" errors (Feng-gwsf, Feng-gwsnf, Nadig-JURKAT)**:
+  `scanpy_de_wilcoxon` was moved to use `preprocessed_path`, but `preprocessed_path`
+  itself was built from the raw (unfiltered) standardized h5ad. Small singleton
+  perturbation groups were still present, causing `sc.tl.rank_genes_groups()` to crash.
+  Filtering inside individual DE functions was not viable as it distorts timing. Fixed by
+  introducing a new `crispyx_preprocess` benchmark step that normalizes the QC-filtered
+  output (`crispyx_qc_filtered.h5ad`) → `preprocessed_<dataset>.h5ad`. All four t-test /
+  Wilcoxon DE methods now declare `depends_on="crispyx_preprocess"` so the run order is
+  enforced: **QC → preprocess → DE**.
+
+- **Wilcoxon OOM in Singularity (HPC) — incomplete float32 dtype alignment**: The O2
+  fix ("Removed `.astype(np.float64)` casts") was only partial. `sp.csr_matrix(block,
+  dtype=np.float64)` remained in both the standard path and streaming path, forcing
+  float64 upstream of the `toarray()` call. On HPC via Singularity the workspace
+  `__pycache__` (bind-mounted) only contained the float32 Numba kernel variant
+  (`.py311.1.nbc`). The float64 code path caused Numba to trigger LLVM recompilation
+  with 32 threads → 40–80 GB peak → SIGKILL. Fixed by removing `dtype=np.float64` from
+  both `sp.csr_matrix(block, ...)` calls; blocks now stay at native h5ad dtype (float32).
+
+- **Wilcoxon OOM with many perturbation groups (many-group mask pre-allocation)**:
+  `wilcoxon_test` pre-validated all candidates by building a `{label: labels == label}`
+  dict — one boolean array of `n_cells` per group. For Huang-HCT116 (18,293 groups ×
+  3.4 M cells) this silently allocated **62 GB** before any computation began, causing
+  container OOM within the 128 GB Docker limit. Fixed by replacing the dict with a
+  single `np.unique(labels)` set-membership check (`O(n_cells log n_cells)` time,
+  `O(n_unique)` memory ≈ 18 KB instead of 62 GB).
+
+- **Wilcoxon OOM due to under-estimated peak memory**: `_should_use_streaming()` used
+  `peak_multiplier=2.0` which only accounted for memmaps + numpy copy (~23 GB for
+  Feng-gwsnf). The actual peak was ~47 GB due to backed h5ad file pages in RSS plus
+  AnnData/h5py write overhead. Increased to `peak_multiplier=4.0` so the dispatch now
+  correctly triggers streaming for Feng-gwsnf (4955 groups × 36518 genes) at 128 GB.
+
+- **Benchmark runner: removed RLIMIT_CPU from all spawned workers (Feng-gwsf fix)**:
+  `_worker()` previously set `RLIMIT_CPU = time_limit` for all methods. `RLIMIT_CPU`
+  counts CPU time summed across **all pthreads** in the process; with 32 Numba threads
+  the effective wall limit became `21600 / 32 ≈ 675 s` instead of the intended 6 hours.
+  After ~4 gene chunks (≈ 23 min wall time) the accumulated CPU time exceeded the limit,
+  the kernel delivered `SIGXCPU → SIGKILL` (exit code -9), and the job was misdiagnosed
+  as OOM because peak RSS was only 19 GB. `RLIMIT_CPU` is now removed for **all** methods;
+  wall-clock enforcement already works correctly via `process.join(timeout=time_limit+5)`
+  in the parent process. `time_limit` in `Feng-gwsf.yaml` raised from 21600 → 32400 s
+  (6 h → 9 h) to match the dataset's legitimate ~7.9 h runtime
+  (83 chunks × ~344 s/chunk). Regression tests added in `tests/test_benchmarking.py`.
+
+### Added
+- **`run_preprocess()` benchmark function** (`run_benchmarks.py`): wraps
+  `normalize_total_log1p()` as a timed, resumable benchmark step so its wall-clock and
+  memory cost are captured separately from DE.
+
+- **`crispyx_preprocess` BenchmarkMethod**: new step between `crispyx_qc_filtered` and the
+  DE benchmarks. Normalizes the QC-filtered h5ad with streaming `normalize_total_log1p()`.
+
+- **Singularity HPC Numba warmup guard** (`slurm_benchmark.sh`): A cache-guarded
+  single-threaded Numba warmup step runs before the benchmark if the kernel index file
+  (`_wilcoxon_batch_perts_presorted_numba-1784.py311.nbi`) is not yet present in the
+  workspace `__pycache__`. Uses `NUMBA_NUM_THREADS=1` to keep LLVM peak memory low.
+  Subsequent runs skip the warmup automatically.
+
+- **`memory_limit_gb` parameter for `wilcoxon_test()`, `t_test()`, and `shrink_lfc()`**: Unified memory
+  budget parameter matching `nb_glm_test()`. For `wilcoxon_test()`, controls whether the
+  streaming path is used for large datasets. For `t_test()`, controls automatic cell
+  chunk size calculation. For `shrink_lfc()`, limits parallel workers in the "full" method.
+  When `None` (default), detects available system memory via
+  `psutil`. For HPC environments, set explicitly (e.g., `memory_limit_gb=128`).
+  ```python
+  # Wilcoxon with memory limit
+  result = cx.wilcoxon_test(
+      "large_dataset.h5ad",
+      perturbation_column="perturbation",
+      memory_limit_gb=128,
+  )
+
+  # t-test with memory limit
+  result = cx.t_test(
+      "large_dataset.h5ad",
+      perturbation_column="perturbation",
+      memory_limit_gb=128,
+  )
+  ```
+
+- **Adaptive memory dispatch (`_should_use_streaming`)**: Extracted reusable memory dispatch
+  function to `crispyx._memory`. Estimates peak memory for output arrays and automatically
+  switches to group-batch streaming when the memmap approach would exceed 30% of the memory
+  budget. Small datasets that previously worked remain on the fast standard path.
+
+- **Streaming Wilcoxon for large group counts**: New `_wilcoxon_test_streaming()` processes
+  perturbation groups in batches, writing results incrementally to h5ad via h5py. This
+  keeps peak memory bounded by `batch_size × n_genes` rather than `n_groups × n_genes`,
+  enabling datasets with thousands of perturbation groups under 128 GB.
+
+- **Dense array optimisation in Wilcoxon standard path**: Control and perturbation data
+  are now extracted directly from sparse matrices per group instead of materialising a
+  single dense array for all cells. Reduces per-chunk memory from O(n_cells × chunk_size)
+  to O(max_group_size × chunk_size).
+
+- **`calculate_nb_glm_chunk_size()`**: New function that automatically calculates
+  memory-aware chunk sizes for NB-GLM operations based on dataset dimensions,
+  perturbation group count, and available memory.
+  - Small/medium datasets keep default chunk_size=256 (no speed impact)
+  - Large memory-constrained datasets automatically reduce chunk size to avoid OOM
+  - Considers `memory_limit_gb` parameter when calculating chunk sizes
+  - Formula: `chunk_size = min(256, usable_memory / (n_obs × 48 × safety_factor))`
+  ```python
+  from crispyx.data import calculate_nb_glm_chunk_size
+  
+  # Returns 256 for small datasets (sufficient memory)
+  chunk = calculate_nb_glm_chunk_size(100000, 20000, n_groups=100, available_memory_gb=128)
+  
+  # Returns ~143 for large datasets (memory-constrained)
+  chunk = calculate_nb_glm_chunk_size(1200000, 36000, n_groups=500, available_memory_gb=128)
+  ```
+
+- **Auto-adaptive `chunk_size` in `nb_glm_test()`**: The `chunk_size` parameter now defaults 
+  to `None`, enabling automatic calculation based on dataset dimensions and `memory_limit_gb`.
+  - Previously defaulted to `chunk_size=256`, which caused OOM on large datasets
+  - Now calls `calculate_nb_glm_chunk_size()` internally when `chunk_size=None`
+  - Datasets that ran successfully before continue to use chunk_size=256 (no speed regression)
+  - Large datasets like Frangieh (218K cells) and Feng-ts (1.2M cells) now automatically
+    use smaller chunks to fit within memory limits
+  ```python
+  # Automatic chunk size (recommended)
+  result = cx.nb_glm_test(
+      "large_dataset.h5ad",
+      perturbation_column="perturbation",
+      memory_limit_gb=128,  # Chunk size calculated from this
+  )
+  
+  # Manual override still supported
+  result = cx.nb_glm_test(
+      "large_dataset.h5ad",
+      perturbation_column="perturbation",
+      chunk_size=64,  # Explicit small chunk
+  )
+  ```
+
+- **Streaming PCA (`cx.pp.pca()`)**: Memory-efficient PCA for on-disk datasets using hybrid
+  method selection:
+  - **Sparse covariance method** (`sparse_cov`): ~5× faster than IncrementalPCA for datasets
+    with ≤15K genes. Exploits sparsity in X^T @ X computation.
+  - **IncrementalPCA method** (`incremental`): Lower memory for datasets with >15K genes.
+    Uses sklearn's IncrementalPCA with streaming partial_fit().
+  - **Automatic selection** (`method='auto'`): Chooses optimal method based on gene count
+    and available memory. Threshold at ~15K genes.
+  - Memory-aware chunk size calculation via `calculate_pca_chunk_size()`.
+  - Supports highly variable gene filtering (`use_highly_variable=True`).
+  - Results stored in `obsm['X_pca']`, `varm['PCs']`, `uns['pca']`.
+  ```python
+  cx.pp.pca(adata, n_comps=50)  # Auto-selects optimal method
+  cx.pp.pca(adata, n_comps=50, method='sparse_cov')  # Force fast method
+  ```
+
+- **KNN graph construction (`cx.pp.neighbors()`)**: Compute k-nearest neighbors graph
+  from PCA embeddings for downstream clustering and visualization.
+  - Supports `pynndescent` (fast approximate, default) and `sklearn` (exact) methods.
+  - UMAP-style fuzzy connectivities with exponential decay.
+  - Configurable `n_neighbors`, `n_pcs`, `metric` parameters.
+  - Results stored in `obsp['distances']`, `obsp['connectivities']`, `uns['neighbors']`.
+  ```python
+  cx.pp.pca(adata, n_comps=50)
+  cx.pp.neighbors(adata, n_neighbors=15)
+  ```
+
+- **UMAP embedding (`cx.tl.umap()`)**: Compute UMAP embeddings from pre-computed neighbor
+  graph. Memory-efficient: only loads neighbor graph (~1.5GB for 2M cells), not expression
+  matrix.
+  - Wrapper around `scanpy.tl.umap()` with close-write-reopen pattern for backed data.
+  - Configurable `min_dist`, `spread`, `n_components` parameters.
+  - Results stored in `obsm['X_umap']`, `uns['umap']`.
+  ```python
+  cx.pp.pca(adata, n_comps=50)
+  cx.pp.neighbors(adata, n_neighbors=15)
+  cx.tl.umap(adata, min_dist=0.5)  # Writes X_umap to h5ad
+  cx.pl.umap(adata, color='perturbation')  # Scanpy-style plot
+  ```
+
+- **New dimension reduction module** (`src/crispyx/dimred.py`): Contains all streaming
+  PCA, neighbor computation, and UMAP logic with comprehensive test suite (45 tests).
+
+- **PCA plotting helpers** (`cx.pl.pca`, `cx.pl.pca_variance_ratio`, `cx.pl.pca_loadings`):
+  Scanpy-style plotting wrappers for backed AnnData that load only embeddings into memory.
+  ```python
+  cx.pp.pca(adata, n_comps=50)
+  cx.pl.pca(adata, color='perturbation')  # Scatter plot
+  cx.pl.pca_variance_ratio(adata)         # Variance explained
+  cx.pl.pca_loadings(adata, components=[1, 2, 3])  # Gene loadings
+  ```
+
+- **UMAP plotting (`cx.pl.umap()`)**: Scanpy-style UMAP visualization for backed AnnData.
+  Loads only X_umap embedding and obs metadata, not expression matrix.
+  ```python
+  cx.pl.umap(adata, color='perturbation', size=10)
+  ```
+
+- **Close-write-reopen pattern for backed data**: `cx.pp.pca()`, `cx.pp.neighbors()`,
+  and `cx.tl.umap()` now write results directly to h5ad files when using crispyx.AnnData
+  wrapper. This keeps `.X` on disk while persisting embeddings, loadings, and neighbor graphs.
+  - No need for `copy=True` in typical workflows
+  - New h5ad write helpers: `write_obsm_to_h5ad`, `write_varm_to_h5ad`,
+    `write_uns_dict_to_h5ad`, `write_obsp_to_h5ad`
+  - PCA plotting functions also accept in-memory AnnData for flexibility
+  ```python
+  # Clean API - results written to h5ad
+  adata = cx.read_h5ad_ondisk("data.h5ad")
+  cx.pp.pca(adata, n_comps=50)      # Writes to file
+  cx.pp.neighbors(adata)            # Writes to file
+  cx.pl.pca(adata, color='group')   # Reads from file
+  ```
+
+- **`cx.pl.pca_variance_ratio()` TypeError with default `n_pcs`**: Fixed bug where
+  passing `n_pcs=None` explicitly to scanpy's `pca_variance_ratio` overrode the default
+  value of 30, causing `TypeError: unsupported operand type(s) for +: 'NoneType' and 'int'`.
+  Now only passes `n_pcs` when explicitly specified by the user.
+
+- **Benchmark effect size extraction bug**: Fixed `generate_results.py` to correctly 
+  extract effect sizes from crispyx DE outputs. The code checked for `logfoldchange`
+  (singular) layer but crispyx stores results in `logfoldchanges` (plural) layer.
+  This caused accuracy heatmaps to show artificially low overlap between crispyx 
+  methods (t-test, Wilcoxon) and NB-GLM. Effect sizes are now correctly read from
+  the `logfoldchanges` layer when available.
+
+- **Benchmark "Ran out of input" subprocess crash handling**: Fixed `run_benchmarks.py`
+  error handling when benchmark subprocess crashes during result transmission. Previously,
+  if a worker process crashed (e.g., OOM killed) while writing results to the queue,
+  the parent would fail with cryptic `EOFError: Ran out of input` from pickle. Now:
+  - Checks process exit code before reading from queue
+  - Catches `EOFError` and `queue.Empty` with descriptive error messages
+  - Reports "Worker process crashed (exitcode=X)" or "Result transmission failed"
+  - Increased queue flush delay from 0.5s → 1.0s to prevent race conditions
+  - Affected methods: crispyx_de_wilcoxon, crispyx_de_nb_glm on large datasets
 
 
 ### Added
+- **72 new unit tests for Wilcoxon dispatch** (`tests/test_wilcoxon_dispatch.py`):
+  Covers kernel correctness (`_presort_control_nonzeros`, `_wilcoxon_presorted_ctrl_numba`),
+  standard vs streaming numerical parity (tol ≤ 1e-10 on real Adamson_subset data),
+  dispatch-mode decisions for all 10 benchmark datasets at 128 GB, chunk-size bounds,
+  and memory-estimate accuracy. Full suite: 109 tests (72 new + 37 existing).
+
 - **Rerun Scanpy script (`rerun_scanpy.py`)**: New tool to run Scanpy QC, t-test, 
   and Wilcoxon methods without time/memory limits for datasets where they fail 
   in the main benchmark.
@@ -39,6 +360,47 @@ All notable changes to crispyx are documented here.
 - **`wilcoxon_test()` now passes `n_groups` to chunk calculator**: The function now 
   determines the number of perturbation groups before calculating chunk size, enabling 
   group-aware memory optimization.
+- **`rerun_scanpy` now tracks peak memory**: `extract_scanpy_qc()` and 
+  `extract_scanpy_de()` record `peak_memory_mb` alongside `elapsed_seconds` in the
+  `.reference_extracted` marker file, using `get_peak_memory_mb()` from profiling.
+- **Benchmark summary table shows rerun data for failed Scanpy methods**: When a Scanpy
+  method originally failed (timeout/error/memory_limit) but was rerun without limits,
+  the performance table now shows the original error status annotated with
+  "(rerun: no limits)" and includes **Rerun (s)** / **Rerun Mem (MB)** columns with
+  the unlimited-run time and memory usage.
+- **Cell-count caps in `calculate_optimal_gene_chunk_size()` are now memory-aware**:
+  Previously unconditional cell-count caps are now gated on `available_memory_gb < 32.0`.
+  On 128 GB benchmark servers the caps are lifted: Feng-gwsf (322K cells) goes from
+  128 → 384 genes/chunk; Feng-ts (1.16M cells) goes from 32 → 512 genes/chunk,
+  cutting estimated Wilcoxon runtime from ~46 hr to ~2.9 hr. Machines with ≤ 32 GB
+  retain the original protective caps (`_CELL_COUNT_CAP_MEMORY_THRESHOLD_GB = 32.0`).
+- **Docker image pre-compiles Numba JIT kernels at build time**: New
+  `benchmarking/tools/numba_warmup.py` script runs during `docker build`, exercising
+  both float32 and float64 type specialisations for all Wilcoxon kernels and baking
+  the Numba cache into the image layer. Eliminates the ~25-minute cold-start JIT
+  overhead on the first `crispyx_de_wilcoxon` benchmark run.
+
+### Fixed (2026-02-25 — Feng-gwsnf benchmark runner fixes)
+- **Singularity PYTHONPATH priority for bind-mounted source** (`slurm_benchmark.sh`):
+  Added `--env "PYTHONPATH=/workspace/src:/workspace"` to both `singularity exec`
+  commands (Numba warmup and main benchmark). Without this, the SIF-baked
+  `site-packages` egg-link took precedence over the bind-mounted host source in
+  `mp.spawn` child processes, meaning OOM fixes from 2026-02-24 were never active
+  inside the container. This was the root cause of the Feng-gwsnf Wilcoxon SIGKILL
+  at 35 GB peak RSS.
+
+- **PyDESeq2 benchmarks use QC-filtered data** (`run_benchmarks.py`):
+  `pertpy_de_pydeseq2` and `pertpy_de_lfcshrink` now use `qc_filtered_path` instead
+  of the raw standardised `dataset_path`. The raw data contained singleton perturbation
+  groups and 36,518 genes (vs 32,373 after QC), inflating the dense count matrix to
+  38.3 GiB and causing `MemoryError`. Using the QC-filtered file eliminates singletons
+  and reduces the matrix by ~11%.
+
+- **PyDESeq2 int32 count arrays** (`run_benchmarks.py`): Changed `.astype(int)` →
+  `.astype(np.int32)` in all three PyDESeq2 functions (`run_pydeseq2_integrated`,
+  `run_pydeseq2_base`, `run_pydeseq2_lfcshrink`). `.astype(int)` produced int64
+  arrays (8 bytes/element), doubling memory for the dense count matrix. int32 is
+  sufficient for scRNA-seq UMI counts (max ~65K) and halves the allocation.
 
 ## [0.7.3] - 2026-01-31
 

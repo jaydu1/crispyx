@@ -16,6 +16,7 @@ if str(SRC_PATH) not in sys.path:
 
 from crispyx.data import (
     AnnData,
+    calculate_nb_glm_chunk_size,
     ensure_gene_symbol_column,
     read_h5ad_ondisk,
     resolve_control_label,
@@ -95,3 +96,88 @@ def test_compute_average_log_expression_infers_control(tmp_path, caplog):
     assert list(loaded_var.index) == ["gene0", "gene1", "gene2"]
     assert "Inferred control label" in caplog.text
     result.close()
+
+
+# ============================================================================
+# Tests for calculate_nb_glm_chunk_size
+# ============================================================================
+
+
+def test_calculate_nb_glm_chunk_size_returns_max_for_small_dataset():
+    """Small datasets should use max chunk size (256)."""
+    chunk_size = calculate_nb_glm_chunk_size(
+        n_obs=10000,
+        n_vars=5000,
+        n_groups=50,
+        available_memory_gb=128,
+    )
+    assert chunk_size == 256  # max_chunk default
+
+
+def test_calculate_nb_glm_chunk_size_reduces_for_large_dataset():
+    """Large datasets should get reduced chunk size to fit memory."""
+    chunk_size = calculate_nb_glm_chunk_size(
+        n_obs=1200000,  # 1.2M cells (like Feng-ts)
+        n_vars=36000,
+        n_groups=500,
+        available_memory_gb=128,
+    )
+    # Should be less than max_chunk due to memory constraints
+    assert chunk_size < 256
+    assert chunk_size >= 32  # min_chunk default
+
+
+def test_calculate_nb_glm_chunk_size_respects_memory_limit():
+    """memory_limit_gb should cap the available memory."""
+    # With high available memory, should use max
+    chunk_high = calculate_nb_glm_chunk_size(
+        n_obs=500000,
+        n_vars=20000,
+        n_groups=200,
+        available_memory_gb=256,
+    )
+    
+    # With memory_limit_gb, should be constrained
+    chunk_limited = calculate_nb_glm_chunk_size(
+        n_obs=500000,
+        n_vars=20000,
+        n_groups=200,
+        available_memory_gb=256,
+        memory_limit_gb=32,  # Lower limit
+    )
+    
+    assert chunk_limited <= chunk_high
+
+
+def test_calculate_nb_glm_chunk_size_respects_min_max_bounds():
+    """Chunk size should be clamped to [min_chunk, max_chunk]."""
+    # Even with huge memory, don't exceed max_chunk
+    chunk_max = calculate_nb_glm_chunk_size(
+        n_obs=1000,
+        n_vars=100,
+        n_groups=10,
+        available_memory_gb=1000,  # Huge memory
+        max_chunk=128,
+    )
+    assert chunk_max == 128
+    
+    # Even with tiny memory, don't go below min_chunk
+    chunk_min = calculate_nb_glm_chunk_size(
+        n_obs=10000000,  # Very large
+        n_vars=50000,
+        n_groups=1000,
+        available_memory_gb=1,  # Tiny memory
+        min_chunk=64,
+    )
+    assert chunk_min == 64
+
+
+def test_calculate_nb_glm_chunk_size_handles_none_n_groups():
+    """Function should work without n_groups specified."""
+    chunk_size = calculate_nb_glm_chunk_size(
+        n_obs=100000,
+        n_vars=20000,
+        n_groups=None,  # Unknown groups
+        available_memory_gb=64,
+    )
+    assert 32 <= chunk_size <= 256

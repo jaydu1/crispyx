@@ -85,6 +85,46 @@ operate with minimal boilerplate on well-annotated datasets. Passing a
 manually, and the returned wrappers expose ``.obs``/``.var`` tables with
 ``.load()`` helpers for materialising the full metadata only when requested.
 
+Dimension Reduction
+-------------------
+
+For visualization and clustering, CRISPYx provides streaming PCA and KNN
+graph construction that works with on-disk data:
+
+.. code-block:: python
+
+   # Streaming PCA (auto-selects optimal method based on gene count)
+   cx.pp.pca(adata_norm, n_comps=50)
+   
+   # Build KNN graph from PCA embeddings
+   cx.pp.neighbors(adata_norm, n_neighbors=15)
+
+The PCA implementation uses a hybrid approach:
+
+* **Sparse covariance** (``method='sparse_cov'``): ~5× faster for datasets with
+  ≤15K genes. Exploits sparsity in the Xᵀ @ X computation.
+* **IncrementalPCA** (``method='incremental'``): Lower memory for datasets with
+  >15K genes. Uses sklearn's streaming PCA with partial_fit().
+* **Automatic selection** (``method='auto'``, default): Chooses the optimal method
+  based on gene count and available memory.
+
+PCA results are stored in:
+
+* ``adata.obsm['X_pca']``: Cell embeddings (n_cells × n_comps)
+* ``adata.varm['PCs']``: Gene loadings (n_genes × n_comps)
+* ``adata.uns['pca']``: Variance info and method metadata
+
+KNN results are stored in:
+
+* ``adata.obsp['distances']``: Sparse distance matrix
+* ``adata.obsp['connectivities']``: Sparse connectivity matrix (UMAP-style)
+* ``adata.uns['neighbors']``: Parameters dict
+
+**Close-Write-Reopen Pattern**: When using ``cx.read_h5ad_ondisk()`` to load
+backed data, PCA and neighbors results are written directly to the h5ad file.
+This keeps ``.X`` on disk while persisting embeddings, loadings, and neighbor
+graphs for later use. No ``copy=True`` is needed in typical workflows.
+
 Differential expression
 -----------------------
 
@@ -105,6 +145,26 @@ Plotting
 crispyx provides Scanpy-style plotting helpers under ``cx.pl`` that work with
 on-disk results. The plotting functions materialise only the metadata needed
 for plotting, keeping the expression matrix on disk.
+
+PCA Visualization
+~~~~~~~~~~~~~~~~~
+
+.. code-block:: python
+
+   # Run PCA first (if not already done)
+   cx.pp.pca(adata_norm, n_comps=50)
+   
+   # Plot variance explained per component
+   cx.pl.pca_variance_ratio(adata_norm, n_pcs=20)
+   
+   # PCA scatter colored by perturbation
+   cx.pl.pca(adata_norm, color='perturbation', components='1,2')
+   
+   # Gene loadings for top components
+   cx.pl.pca_loadings(adata_norm, components=[1, 2, 3])
+
+Differential Expression Visualization
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 .. code-block:: python
 
@@ -148,6 +208,29 @@ NB-GLM options
 
 The negative binomial GLM (``method="nb_glm"``) supports several options:
 
+* **Adaptive chunk size** (default): When ``chunk_size=None`` (the default),
+  crispyx automatically calculates an optimal chunk size based on dataset
+  dimensions and ``memory_limit_gb``. Small/medium datasets use the maximum
+  chunk size (256) for speed, while large memory-constrained datasets use
+  smaller chunks to avoid OOM errors. You can still set ``chunk_size``
+  explicitly to override automatic selection.
+
+* **Frozen control mode** (``freeze_control``): For datasets with large control
+  populations (>100K cells), the control matrix can consume 30+ GB of memory.
+  When ``freeze_control=True``, control statistics are pre-computed once and
+  shared across workers via memory-mapped files, reducing per-worker memory
+  from ~32 GB to <1 GB. This enables full parallelization on large datasets.
+  
+  **Auto-detection** (default): When ``freeze_control=None``, crispyx automatically
+  enables frozen control mode when:
+  
+  1. Control matrix exceeds 10 GB (control_n × n_genes × 8 bytes > 10 GB)
+  2. Standard mode would limit parallelization to <4 workers
+  
+  This means large datasets like Feng (110K control cells) automatically use
+  frozen control mode without user intervention, while smaller datasets maintain
+  full flexibility.
+
 * **LFC shrinkage**: For improved accuracy, apply adaptive Cauchy prior 
   shrinkage to log-fold changes using ``shrink_lfc()`` after running 
   ``nb_glm_test()``. This preserves large effects while shrinking 
@@ -157,6 +240,15 @@ The negative binomial GLM (``method="nb_glm"``) supports several options:
   using all cells (similar to PyDESeq2's approach). This provides more stable 
   estimates when sample sizes are small or when you expect homogeneous 
   dispersion across perturbations.
+
+* **Memory limit** (``memory_limit_gb``): Specify the maximum memory available
+  for the analysis. For ``nb_glm_test()``, this affects chunk size calculation and
+  worker count estimation. For ``wilcoxon_test()``, it controls whether the
+  streaming path is used for large datasets (>30% of budget triggers streaming).
+  For ``t_test()``, it controls automatic cell chunk size calculation.
+  For ``shrink_lfc()``, it limits parallel workers in ``method="full"``.
+  For HPC environments with fixed allocations, set this to your SLURM ``--mem``
+  value (e.g., ``memory_limit_gb=128``).
 
 * **Scanpy format** (``scanpy_format=True``): Write Scanpy-compatible 
   ``uns["rank_genes_groups"]`` structure for interoperability with 

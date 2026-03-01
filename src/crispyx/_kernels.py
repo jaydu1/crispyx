@@ -1235,6 +1235,206 @@ def _wilcoxon_sparse_batch_numba(
 
 
 @nb.njit(parallel=True, cache=True)
+def _presort_control_nonzeros(control_dense: np.ndarray):
+    """Pre-sort non-zero control values per gene for reuse across groups.
+
+    Returns a flat array of sorted non-zeros with per-gene offsets and counts.
+    Sorting control non-zeros once per gene chunk instead of once per group
+    gives ~n_groups× speedup for the dominant zero-separation path.
+    """
+    n_control, n_genes = control_dense.shape
+
+    # Pass 1: count non-zeros per gene (parallel)
+    n_nonzero = np.empty(n_genes, dtype=np.int64)
+    n_zeros = np.empty(n_genes, dtype=np.int64)
+    for g in nb.prange(n_genes):
+        nz = 0
+        for i in range(n_control):
+            if control_dense[i, g] != 0.0:
+                nz += 1
+        n_nonzero[g] = nz
+        n_zeros[g] = n_control - nz
+
+    # Prefix sum for offsets (sequential, only n_genes iterations)
+    offsets = np.empty(n_genes + 1, dtype=np.int64)
+    offsets[0] = 0
+    for g in range(n_genes):
+        offsets[g + 1] = offsets[g] + n_nonzero[g]
+
+    total = offsets[n_genes]
+    flat = np.empty(total, dtype=np.float64)
+
+    # Pass 2: extract and sort non-zeros (parallel)
+    for g in nb.prange(n_genes):
+        start = offsets[g]
+        nz = n_nonzero[g]
+        idx = 0
+        for i in range(n_control):
+            if control_dense[i, g] != 0.0:
+                flat[start + idx] = control_dense[i, g]
+                idx += 1
+        # Sort this gene's non-zeros
+        if nz > 1:
+            tmp = flat[start:start + nz].copy()
+            tmp.sort()
+            flat[start:start + nz] = tmp
+
+    return flat, offsets, n_nonzero, n_zeros
+
+
+@nb.njit(parallel=True, cache=True)
+def _wilcoxon_presorted_ctrl_numba(
+    control_dense: np.ndarray,
+    ctrl_sorted_flat: np.ndarray,
+    ctrl_offsets: np.ndarray,
+    ctrl_n_nonzero: np.ndarray,
+    ctrl_n_zeros: np.ndarray,
+    pert_dense: np.ndarray,
+    valid_genes: np.ndarray,
+    tie_correct: bool,
+    zero_threshold: float,
+    u_stat_out: np.ndarray,
+    z_score_out: np.ndarray,
+    pvalue_out: np.ndarray,
+    effect_out: np.ndarray,
+) -> None:
+    """Wilcoxon test reusing pre-sorted control non-zeros.
+
+    For the zero-separation path (majority of genes in sparse data),
+    skips the O(n_ctrl * log(n_ctrl)) sort per group, using the
+    pre-sorted array from ``_presort_control_nonzeros`` instead.
+    Falls back to full sorting for the rare low-zero-fraction genes.
+    """
+    n_control = control_dense.shape[0]
+    n_pert = pert_dense.shape[0]
+    n_genes = pert_dense.shape[1]
+    n_total = n_control + n_pert
+
+    n_control_f = float(n_control)
+    n_pert_f = float(n_pert)
+    n_total_f = float(n_total)
+
+    for g in nb.prange(n_genes):
+        if not valid_genes[g]:
+            u_stat_out[g] = 0.0
+            z_score_out[g] = 0.0
+            pvalue_out[g] = 1.0
+            effect_out[g] = 0.0
+            continue
+
+        pert_col = pert_dense[:, g]
+
+        # Count pert zeros
+        n_pert_zeros = 0
+        for i in range(n_pert):
+            if pert_col[i] == 0.0:
+                n_pert_zeros += 1
+
+        n_zeros = ctrl_n_zeros[g] + n_pert_zeros
+        zero_frac = float(n_zeros) / n_total_f
+
+        use_zero_sep = zero_frac >= zero_threshold
+
+        if use_zero_sep and n_zeros < n_total:
+            # --- Zero-separation with pre-sorted control ---
+            n_ctrl_nz = ctrl_n_nonzero[g]
+            n_pert_nonzero = n_pert - n_pert_zeros
+
+            # Extract and sort pert non-zeros (typically very few values)
+            pert_nonzero = np.empty(n_pert_nonzero, dtype=np.float64)
+            idx = 0
+            for i in range(n_pert):
+                if pert_col[i] != 0.0:
+                    pert_nonzero[idx] = pert_col[i]
+                    idx += 1
+            pert_sorted = np.sort(pert_nonzero)
+
+            # Use pre-sorted control non-zeros (no sort needed!)
+            start = ctrl_offsets[g]
+            ctrl_sorted = ctrl_sorted_flat[start:start + n_ctrl_nz]
+
+            ctrl_ranks = np.empty(n_ctrl_nz, dtype=np.float64)
+            pert_ranks = np.empty(n_pert_nonzero, dtype=np.float64)
+
+            tie_corr = _merge_sorted_with_ranks_numba(
+                ctrl_sorted, pert_sorted, ctrl_ranks, pert_ranks, n_zeros
+            )
+
+            if not tie_correct:
+                tie_corr = 1.0
+
+            zero_avg_rank = (float(n_zeros) + 1.0) / 2.0
+            rank_sum = float(n_pert_zeros) * zero_avg_rank
+            for i in range(n_pert_nonzero):
+                rank_sum += pert_ranks[i]
+
+        else:
+            # --- Standard full ranking (rare for sparse data) ---
+            ctrl_col = control_dense[:, g]
+
+            combined = np.empty(n_total, dtype=np.float64)
+            for i in range(n_pert):
+                combined[i] = pert_col[i]
+            for i in range(n_control):
+                combined[n_pert + i] = ctrl_col[i]
+
+            order = np.argsort(combined)
+            ranks = np.empty(n_total, dtype=np.float64)
+            tie_sum = 0.0
+            pos = 0
+            while pos < n_total:
+                tie_start = pos
+                while pos < n_total - 1 and combined[order[pos + 1]] == combined[order[tie_start]]:
+                    pos += 1
+                tie_end = pos
+
+                tie_count = tie_end - tie_start + 1
+                if tie_count > 1:
+                    t = float(tie_count)
+                    tie_sum += t ** 3 - t
+
+                avg_rank = (tie_start + tie_end + 2) / 2.0
+                for k in range(tie_start, tie_end + 1):
+                    ranks[order[k]] = avg_rank
+
+                pos += 1
+
+            denom = n_total_f ** 3 - n_total_f
+            if denom > 0 and tie_correct:
+                tie_corr = 1.0 - tie_sum / denom
+            else:
+                tie_corr = 1.0
+
+            rank_sum = 0.0
+            for i in range(n_pert):
+                rank_sum += ranks[i]
+
+        # Statistics
+        expected = n_pert_f * (n_total_f + 1.0) / 2.0
+        u_stat = rank_sum - n_pert_f * (n_pert_f + 1.0) / 2.0
+
+        std = math.sqrt(tie_corr * n_pert_f * n_control_f * (n_total_f + 1.0) / 12.0)
+
+        if std > 0.0:
+            z = (rank_sum - expected) / std
+            abs_z = abs(z)
+            pval = math.erfc(abs_z / math.sqrt(2.0))
+        else:
+            z = 0.0
+            pval = 1.0
+
+        if n_pert_f > 0 and n_control_f > 0:
+            effect = u_stat / (n_pert_f * n_control_f) - 0.5
+        else:
+            effect = 0.0
+
+        u_stat_out[g] = u_stat
+        z_score_out[g] = z
+        pvalue_out[g] = pval
+        effect_out[g] = effect
+
+
+@nb.njit(parallel=True, cache=True)
 def _wilcoxon_all_perts_numba(
     control_dense: np.ndarray,
     all_pert_dense: np.ndarray,
@@ -1430,6 +1630,228 @@ def _wilcoxon_all_perts_numba(
             z_score_out[p_idx, g] = z
             pvalue_out[p_idx, g] = pval
             effect_out[p_idx, g] = effect
+
+
+@nb.njit(parallel=False, cache=True)
+def _wilcoxon_single_pert_presorted(
+    control_dense: np.ndarray,
+    ctrl_sorted_flat: np.ndarray,
+    ctrl_offsets: np.ndarray,
+    ctrl_n_nonzero: np.ndarray,
+    ctrl_n_zeros: np.ndarray,
+    pert_dense: np.ndarray,
+    valid_genes: np.ndarray,
+    tie_correct: bool,
+    zero_threshold: float,
+    u_stat_out: np.ndarray,
+    z_score_out: np.ndarray,
+    pvalue_out: np.ndarray,
+    effect_out: np.ndarray,
+) -> None:
+    """Non-parallel single-perturbation Wilcoxon kernel for use inside prange.
+
+    Identical logic to ``_wilcoxon_presorted_ctrl_numba`` but without
+    ``parallel=True`` so it can be safely called from within a prange loop
+    (Numba does not support nested parallel launches).
+    """
+    n_control = control_dense.shape[0]
+    n_pert = pert_dense.shape[0]
+    n_genes = pert_dense.shape[1]
+    n_total = n_control + n_pert
+
+    n_control_f = float(n_control)
+    n_pert_f = float(n_pert)
+    n_total_f = float(n_total)
+
+    for g in range(n_genes):
+        if not valid_genes[g]:
+            u_stat_out[g] = 0.0
+            z_score_out[g] = 0.0
+            pvalue_out[g] = 1.0
+            effect_out[g] = 0.0
+            continue
+
+        pert_col = pert_dense[:, g]
+
+        # Count pert zeros
+        n_pert_zeros = 0
+        for i in range(n_pert):
+            if pert_col[i] == 0.0:
+                n_pert_zeros += 1
+
+        n_zeros = ctrl_n_zeros[g] + n_pert_zeros
+        zero_frac = float(n_zeros) / n_total_f
+
+        use_zero_sep = zero_frac >= zero_threshold
+
+        if use_zero_sep and n_zeros < n_total:
+            # --- Zero-separation with pre-sorted control ---
+            n_ctrl_nz = ctrl_n_nonzero[g]
+            n_pert_nonzero = n_pert - n_pert_zeros
+
+            pert_nonzero = np.empty(n_pert_nonzero, dtype=np.float64)
+            idx = 0
+            for i in range(n_pert):
+                if pert_col[i] != 0.0:
+                    pert_nonzero[idx] = pert_col[i]
+                    idx += 1
+            pert_sorted = np.sort(pert_nonzero)
+
+            start = ctrl_offsets[g]
+            ctrl_sorted = ctrl_sorted_flat[start : start + n_ctrl_nz]
+
+            ctrl_ranks = np.empty(n_ctrl_nz, dtype=np.float64)
+            pert_ranks = np.empty(n_pert_nonzero, dtype=np.float64)
+
+            tie_corr = _merge_sorted_with_ranks_numba(
+                ctrl_sorted, pert_sorted, ctrl_ranks, pert_ranks, n_zeros
+            )
+
+            if not tie_correct:
+                tie_corr = 1.0
+
+            zero_avg_rank = (float(n_zeros) + 1.0) / 2.0
+            rank_sum = float(n_pert_zeros) * zero_avg_rank
+            for i in range(n_pert_nonzero):
+                rank_sum += pert_ranks[i]
+
+        else:
+            # --- Standard full ranking ---
+            ctrl_col = control_dense[:, g]
+
+            combined = np.empty(n_total, dtype=np.float64)
+            for i in range(n_pert):
+                combined[i] = pert_col[i]
+            for i in range(n_control):
+                combined[n_pert + i] = ctrl_col[i]
+
+            order = np.argsort(combined)
+            ranks = np.empty(n_total, dtype=np.float64)
+            tie_sum = 0.0
+            pos = 0
+            while pos < n_total:
+                tie_start = pos
+                while pos < n_total - 1 and combined[order[pos + 1]] == combined[order[tie_start]]:
+                    pos += 1
+                tie_end = pos
+
+                tie_count = tie_end - tie_start + 1
+                if tie_count > 1:
+                    t = float(tie_count)
+                    tie_sum += t ** 3 - t
+
+                avg_rank = (tie_start + tie_end + 2) / 2.0
+                for k in range(tie_start, tie_end + 1):
+                    ranks[order[k]] = avg_rank
+
+                pos += 1
+
+            denom = n_total_f ** 3 - n_total_f
+            if denom > 0 and tie_correct:
+                tie_corr = 1.0 - tie_sum / denom
+            else:
+                tie_corr = 1.0
+
+            rank_sum = 0.0
+            for i in range(n_pert):
+                rank_sum += ranks[i]
+
+        # Statistics
+        expected = n_pert_f * (n_total_f + 1.0) / 2.0
+        u_stat = rank_sum - n_pert_f * (n_pert_f + 1.0) / 2.0
+
+        std = math.sqrt(tie_corr * n_pert_f * n_control_f * (n_total_f + 1.0) / 12.0)
+
+        if std > 0.0:
+            z = (rank_sum - expected) / std
+            abs_z = abs(z)
+            pval = math.erfc(abs_z / math.sqrt(2.0))
+        else:
+            z = 0.0
+            pval = 1.0
+
+        if n_pert_f > 0 and n_control_f > 0:
+            effect = u_stat / (n_pert_f * n_control_f) - 0.5
+        else:
+            effect = 0.0
+
+        u_stat_out[g] = u_stat
+        z_score_out[g] = z
+        pvalue_out[g] = pval
+        effect_out[g] = effect
+
+
+@nb.njit(parallel=True, cache=True)
+def _wilcoxon_batch_perts_presorted_numba(
+    control_dense: np.ndarray,
+    ctrl_sorted_flat: np.ndarray,
+    ctrl_offsets: np.ndarray,
+    ctrl_n_nonzero: np.ndarray,
+    ctrl_n_zeros: np.ndarray,
+    all_pert_stacked: np.ndarray,
+    pert_row_offsets: np.ndarray,
+    valid_masks: np.ndarray,
+    tie_correct: bool,
+    zero_threshold: float,
+    u_stat_out: np.ndarray,
+    z_score_out: np.ndarray,
+    pvalue_out: np.ndarray,
+    effect_out: np.ndarray,
+) -> None:
+    """Batch Wilcoxon test: single prange over perturbations.
+
+    Replaces 2254 sequential ``_wilcoxon_presorted_ctrl_numba`` calls per
+    gene chunk with a single ``prange`` over all perturbation groups.  Each
+    parallel thread handles one perturbation and iterates over genes
+    sequentially, eliminating ~2253 redundant Numba thread-pool launches.
+
+    Parameters
+    ----------
+    control_dense : (n_control, n_valid_genes)
+        Dense control expression for this gene chunk.
+    ctrl_sorted_flat : (sum_ctrl_nnz,)
+        Pre-sorted control non-zeros (from ``_presort_control_nonzeros``).
+    ctrl_offsets : (n_valid_genes + 1,)
+        Offsets into ``ctrl_sorted_flat`` per gene.
+    ctrl_n_nonzero : (n_valid_genes,)
+        Number of non-zero control values per gene.
+    ctrl_n_zeros : (n_valid_genes,)
+        Number of zero control values per gene.
+    all_pert_stacked : (total_pert_cells, n_valid_genes)
+        Pre-stacked dense pert matrix (all groups concatenated row-wise).
+    pert_row_offsets : (n_perts + 1,)
+        Row offsets into ``all_pert_stacked`` for each perturbation.
+    valid_masks : (n_perts, n_valid_genes)
+        Boolean validity mask per (pert, gene).
+    tie_correct : bool
+    zero_threshold : float
+    u_stat_out : (n_perts, n_valid_genes)
+    z_score_out : (n_perts, n_valid_genes)
+    pvalue_out : (n_perts, n_valid_genes)
+    effect_out : (n_perts, n_valid_genes)
+    """
+    n_perts = pert_row_offsets.shape[0] - 1
+
+    for p_idx in nb.prange(n_perts):
+        p_start = pert_row_offsets[p_idx]
+        p_end = pert_row_offsets[p_idx + 1]
+        pert_dense = all_pert_stacked[p_start:p_end, :]
+
+        _wilcoxon_single_pert_presorted(
+            control_dense,
+            ctrl_sorted_flat,
+            ctrl_offsets,
+            ctrl_n_nonzero,
+            ctrl_n_zeros,
+            pert_dense,
+            valid_masks[p_idx],
+            tie_correct,
+            zero_threshold,
+            u_stat_out[p_idx],
+            z_score_out[p_idx],
+            pvalue_out[p_idx],
+            effect_out[p_idx],
+        )
 
 
 @nb.njit(parallel=True, cache=True)

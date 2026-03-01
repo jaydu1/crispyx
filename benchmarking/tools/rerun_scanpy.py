@@ -55,6 +55,7 @@ from .run_benchmarks import (
     run_scanpy_de,
     REPO_ROOT,
 )
+from .profiling import get_peak_memory_mb
 
 from .generate_results import evaluate_benchmarks
 
@@ -125,6 +126,7 @@ def extract_scanpy_qc(
     if verbose:
         print(f"  Running scanpy_qc_filtered...")
     
+    mem_before = get_peak_memory_mb()
     start_time = time.perf_counter()
     try:
         result = run_scanpy_qc(
@@ -137,14 +139,16 @@ def extract_scanpy_qc(
             output_dir=preprocessing_dir,
         )
         elapsed = time.perf_counter() - start_time
+        peak_memory_mb = get_peak_memory_mb() - mem_before
         
         if verbose:
-            print(f"    ✓ Completed in {elapsed:.1f}s")
+            print(f"    ✓ Completed in {elapsed:.1f}s (peak mem delta: {peak_memory_mb:.1f} MB)")
             print(f"      Cells: {result.get('cells_kept', 'N/A')}, Genes: {result.get('genes_kept', 'N/A')}")
         
         return {
             "status": "success",
             "elapsed_seconds": elapsed,
+            "peak_memory_mb": peak_memory_mb,
             "result": result,
         }
     except Exception as e:
@@ -176,6 +180,7 @@ def extract_scanpy_de(
     if verbose:
         print(f"  Running {method_name}...")
     
+    mem_before = get_peak_memory_mb()
     start_time = time.perf_counter()
     try:
         result = run_scanpy_de(
@@ -187,14 +192,16 @@ def extract_scanpy_de(
             preprocess=preprocess,
         )
         elapsed = time.perf_counter() - start_time
+        peak_memory_mb = get_peak_memory_mb() - mem_before
         
         if verbose:
-            print(f"    ✓ Completed in {elapsed:.1f}s")
+            print(f"    ✓ Completed in {elapsed:.1f}s (peak mem delta: {peak_memory_mb:.1f} MB)")
             print(f"      Groups: {result.get('groups', 'N/A')}")
         
         return {
             "status": "success",
             "elapsed_seconds": elapsed,
+            "peak_memory_mb": peak_memory_mb,
             "result": result,
         }
     except Exception as e:
@@ -380,6 +387,7 @@ def run_reference_extraction(
             extracted_methods[method_name] = {
                 "timestamp": time.time(),
                 "elapsed_seconds": result.get("elapsed_seconds"),
+                "peak_memory_mb": result.get("peak_memory_mb"),
             }
     
     # Save marker data

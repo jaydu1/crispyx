@@ -1,0 +1,56 @@
+# Exclude large data files and build artifacts
+data/
+notebooks/tutorial_outputs/
+
+# Benchmarking outputs (can be 100s of GB)
+benchmarking/results/
+benchmarking/results-old/
+benchmarking/logs/
+benchmarking/.benchmark_cache/
+benchmarking/singularity/*.sif
+benchmarking/singularity/*.tar
+
+# Work-in-progress directories
+yida wang/
+20260107/
+20260109/
+20260110/
+20260111/
+20260112/
+20260113/
+20260114/
+20260119/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Docs build outputs
+docs/_build/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+
+# Git
+.git/
+.gitignore
+
+# Tests cache
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Misc
+*.log
+*.tmp

@@ -34,6 +34,21 @@ The script accepts additional options to benchmark a subset of methods or to
 redirect outputs to a different directory. Refer to ``benchmarking/README.md``
 for further details.
 
+Available benchmark methods
+---------------------------
+
+**crispyx**: ``crispyx_qc_filtered``, ``crispyx_preprocess``,
+``crispyx_pb_avg_log``, ``crispyx_pb_pseudobulk``, ``crispyx_de_t_test``,
+``crispyx_de_wilcoxon``, ``crispyx_de_nb_glm``
+
+**Reference**: ``scanpy_qc_filtered``, ``scanpy_de_t_test``,
+``scanpy_de_wilcoxon``, ``edger_de_glm``, ``pertpy_de_pydeseq2``
+
+The ``crispyx_preprocess`` step normalizes the QC-filtered output with streaming
+``normalize_total_log1p()`` and is a prerequisite for all t-test and Wilcoxon DE
+methods (both crispyx and Scanpy). The execution order is enforced via
+``depends_on``: **QC → preprocess → DE**.
+
 Available NB-GLM benchmark methods
 ----------------------------------
 

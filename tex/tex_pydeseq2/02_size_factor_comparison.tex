@@ -1,0 +1,158 @@
+\documentclass[11pt]{article}
+\usepackage{amsmath, amssymb}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{geometry}
+\geometry{margin=1in}
+
+\title{Size Factor Strategies in Differential Expression Analysis:\\
+Global vs. Per-Comparison Approaches}
+\author{CRISPYx Technical Documentation}
+\date{December 2024}
+
+\begin{document}
+
+\maketitle
+
+\section{Overview}
+
+Size factors normalize for differences in sequencing depth across cells. The choice of \textit{which} cells to use when computing size factors significantly affects differential expression results. This document compares two approaches:
+
+\begin{enumerate}
+    \item \textbf{Global size factors}: Compute once from all cells, reuse for each comparison
+    \item \textbf{Per-comparison size factors}: Compute separately for each perturbation vs. control subset
+\end{enumerate}
+
+\section{Mathematical Formulation}
+
+\subsection{DESeq2 Median-of-Ratios Method}
+
+For a count matrix $K$ with cells $i$ and genes $j$, the size factor $s_i$ for cell $i$ is:
+
+\begin{equation}
+s_i = \text{median}_j \left( \frac{K_{ij}}{\exp\left( \frac{1}{n} \sum_{i'} \log K_{i'j} \right)} \right)
+\end{equation}
+
+where the denominator is the geometric mean of gene $j$ across all cells in the normalization set.
+
+\subsection{Global Size Factors (CRISPYx Default)}
+
+Compute size factors once using \textbf{all $N$ cells} in the dataset:
+
+\begin{equation}
+s_i^{\text{global}} = \text{median}_j \left( \frac{K_{ij}}{\exp\left( \frac{1}{N} \sum_{i'=1}^{N} \log K_{i'j} \right)} \right)
+\end{equation}
+
+For each perturbation $p$ comparison, use the pre-computed $s_i^{\text{global}}$ for cells in that comparison.
+
+\subsection{Per-Comparison Size Factors (PyDESeq2 Default)}
+
+For each perturbation $p$, compute size factors using only cells in the comparison subset $C_p = \{i : \text{cell } i \in \text{perturbation } p \text{ or control}\}$:
+
+\begin{equation}
+s_i^{(p)} = \text{median}_j \left( \frac{K_{ij}}{\exp\left( \frac{1}{|C_p|} \sum_{i' \in C_p} \log K_{i'j} \right)} \right), \quad i \in C_p
+\end{equation}
+
+\section{Empirical Comparison}
+
+Testing on the Adamson subset dataset (1716 cells, 100 perturbations):
+
+\begin{table}[h]
+\centering
+\caption{Size factor statistics by approach}
+\begin{tabular}{lcc}
+\toprule
+\textbf{Metric} & \textbf{Global} & \textbf{Per-Comparison} \\
+\midrule
+Cells per normalization & 1716 (all) & $\sim$966 (varies) \\
+Consistency across comparisons & Identical & Varies \\
+Computation cost & $O(1)$ & $O(P)$ where $P$ = perturbations \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[h]
+\centering
+\caption{CRISPYx vs PyDESeq2 agreement by size factor approach}
+\begin{tabular}{lcc}
+\toprule
+\textbf{Metric} & \textbf{Global SF} & \textbf{Per-Comparison SF} \\
+\midrule
+LFC Pearson correlation & 0.95 & 0.99 \\
+P-value Pearson correlation & 0.60 & 0.99 \\
+Top-100 overlap (LFC) & 94\% & 99\% \\
+Top-100 overlap (p-value) & 89\% & 99\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Biological Considerations}
+
+\subsection{CRISPR Screen Context}
+
+In CRISPR screens, perturbations affect specific biological pathways but should not systematically alter global RNA content. This has implications:
+
+\begin{enumerate}
+    \item \textbf{Library size is independent of perturbation}: Cells with gene knockouts maintain similar total RNA content
+    \item \textbf{Global normalization is appropriate}: Since perturbation doesn't affect sequencing depth, normalizing across all cells captures true library size differences
+    \item \textbf{Per-comparison normalization may introduce bias}: Using only perturbed + control cells means size factors are influenced by which genes happen to be affected by the perturbation
+\end{enumerate}
+
+\subsection{When Each Approach is Preferred}
+
+\textbf{Global size factors} (CRISPYx default):
+\begin{itemize}
+    \item CRISPR knockout/knockdown screens
+    \item When comparing many perturbations to the same control
+    \item When computational efficiency matters
+    \item When consistency across comparisons is desired
+\end{itemize}
+
+\textbf{Per-comparison size factors}:
+\begin{itemize}
+    \item When exact PyDESeq2 parity is required for validation
+    \item Bulk RNA-seq where each sample is a separate experiment
+    \item When perturbations might affect global RNA content (e.g., CRISPRa activation screens)
+\end{itemize}
+
+\section{Implementation in CRISPYx}
+
+\subsection{API Usage}
+
+\begin{verbatim}
+# Default: Global size factors (efficient, consistent)
+nb_glm_test(adata, ..., size_factor_scope="global")
+
+# PyDESeq2 parity: Per-comparison size factors
+nb_glm_test(adata, ..., size_factor_scope="per_comparison")
+\end{verbatim}
+
+\subsection{Benchmark Configuration}
+
+In \texttt{benchmarking/config/*.yaml}:
+
+\begin{verbatim}
+# Enable optional per-comparison size factor method
+optional_methods:
+  - crispyx_de_nb_glm_sf_per
+\end{verbatim}
+
+This runs both:
+\begin{itemize}
+    \item \texttt{crispyx\_de\_nb\_glm}: Default with global size factors
+    \item \texttt{crispyx\_de\_nb\_glm\_sf\_per}: Variant with per-comparison size factors
+\end{itemize}
+
+\section{Conclusion}
+
+The choice between global and per-comparison size factors involves a trade-off:
+
+\begin{itemize}
+    \item \textbf{Global}: More efficient, more consistent, biologically appropriate for most CRISPR screens
+    \item \textbf{Per-comparison}: Matches PyDESeq2 exactly, may be preferred when validating against published results
+\end{itemize}
+
+CRISPYx defaults to global size factors for efficiency and biological appropriateness, while providing the \texttt{size\_factor\_scope="per\_comparison"} option for exact PyDESeq2 parity when needed.
+
+\end{document}

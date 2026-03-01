@@ -33,6 +33,7 @@ from .data import (
     AnnData,
     calculate_optimal_chunk_size,
     calculate_optimal_gene_chunk_size,
+    calculate_nb_glm_chunk_size,
     ensure_gene_symbol_column,
     get_perturbation_slice,
     iter_matrix_chunks,
@@ -66,6 +67,9 @@ from ._kernels import (
     _compute_rank_sums_batch_numba,
     _wilcoxon_sparse_batch_numba,
     _wilcoxon_all_perts_numba,
+    _presort_control_nonzeros,
+    _wilcoxon_presorted_ctrl_numba,
+    _wilcoxon_batch_perts_presorted_numba,
     _ZERO_PARTITION_THRESHOLD,
 )
 from ._checkpoint import (
@@ -77,6 +81,7 @@ from ._checkpoint import (
     _create_progress_context,
     _DummyProgress,
 )
+from ._memory import _should_use_streaming
 from ._size_factors import (
     _validate_size_factors,
     _median_of_ratios_size_factors,
@@ -291,6 +296,198 @@ def _resolve_candidates(
     return candidates
 
 
+def _release_chunk_memory() -> None:
+    """Force Python and glibc to return freed memory to the OS.
+
+    After large per-chunk arrays are deleted, glibc may hold freed pages in
+    thread-local arenas.  ``gc.collect()`` tears down Python reference cycles,
+    then ``malloc_trim(0)`` (Linux-only) asks glibc to return free heap pages
+    to the OS, shrinking virtual address space.  This prevents RLIMIT_AS
+    violations over many gene chunks.
+    """
+    gc.collect()
+    try:
+        import ctypes
+        libc = ctypes.CDLL(None)
+        libc.malloc_trim(0)
+    except (OSError, AttributeError):
+        pass  # Non-Linux or libc without malloc_trim
+
+
+def _write_wilcoxon_result_h5ad(
+    output_path: Path,
+    *,
+    effect_matrix: np.ndarray,
+    z_matrix: np.ndarray,
+    pvalue_matrix: np.ndarray,
+    pvalue_adj_matrix: np.ndarray,
+    lfc_matrix: np.ndarray,
+    u_matrix: np.ndarray,
+    pts_matrix: np.ndarray,
+    pts_rest_matrix: np.ndarray,
+    candidates: list[str],
+    gene_symbols: pd.Index,
+    perturbation_column: str,
+    control_label: str,
+    tie_correct: bool,
+    corr_method: str,
+) -> None:
+    """Write wilcoxon result arrays directly to h5ad via h5py.
+
+    Writes each array (which may be a memmap) as an HDF5 dataset one at a
+    time, avoiding the triple-allocation of memmap → np.array copy → AnnData
+    → ``.write()``.  h5py reads memmap pages on demand and writes HDF5 chunks
+    without requiring the full array in RAM simultaneously.
+    """
+    obs_names = pd.Index(candidates, name="perturbation").astype(str)
+    var_names = gene_symbols.astype(str)
+
+    # Create a minimal AnnData structure via h5py
+    with h5py.File(output_path, "w") as hf:
+        # X = effect_size matrix
+        hf.create_dataset("X", data=effect_matrix)
+
+        # obs
+        obs_grp = hf.create_group("obs")
+        obs_grp.attrs["_index"] = "_index"
+        obs_grp.attrs["encoding-type"] = "dataframe"
+        obs_grp.attrs["encoding-version"] = "0.2.0"
+        obs_grp.create_dataset("_index", data=np.array(obs_names, dtype="S"))
+        obs_grp.attrs["column-order"] = [perturbation_column]
+        obs_grp.create_dataset(
+            perturbation_column, data=np.array(obs_names, dtype="S")
+        )
+
+        # var
+        var_grp = hf.create_group("var")
+        var_grp.attrs["_index"] = "_index"
+        var_grp.attrs["encoding-type"] = "dataframe"
+        var_grp.attrs["encoding-version"] = "0.2.0"
+        var_grp.create_dataset("_index", data=np.array(var_names, dtype="S"))
+        var_grp.attrs["column-order"] = []
+
+        # layers
+        layers_grp = hf.create_group("layers")
+        layers_grp.create_dataset("z_score", data=z_matrix)
+        layers_grp.create_dataset("pvalue", data=pvalue_matrix)
+        layers_grp.create_dataset("pvalue_adj", data=pvalue_adj_matrix)
+        layers_grp.create_dataset("logfoldchanges", data=lfc_matrix)
+        layers_grp.create_dataset("u_statistic", data=u_matrix)
+        layers_grp.create_dataset("pts", data=pts_matrix)
+        layers_grp.create_dataset("pts_rest", data=pts_rest_matrix)
+
+        # uns metadata
+        uns_grp = hf.create_group("uns")
+        uns_grp.attrs["method"] = "wilcoxon"
+        uns_grp.attrs["control_label"] = control_label
+        uns_grp.attrs["perturbation_column"] = perturbation_column
+        uns_grp.attrs["tie_correct"] = tie_correct
+        uns_grp.attrs["pvalue_correction"] = corr_method
+
+
+def _build_result_from_h5ad(
+    output_path: Path,
+    candidates: list[str],
+    gene_symbols: pd.Index,
+    perturbation_column: str,
+    control_label: str,
+    tie_correct: bool,
+    corr_method: str,
+    *,
+    memory_limit_gb: float | None = None,
+) -> "RankGenesGroupsResult":
+    """Build a RankGenesGroupsResult by reading back arrays from the h5ad file.
+
+    For very large result files (> 25% of *physical* memory), returns a result
+    with empty arrays and only the ``result`` AnnData reference, so callers
+    can access data from disk on demand.
+
+    The lazy threshold is based on *actual physical memory* (``None`` →
+    auto-detect via psutil), not ``memory_limit_gb``, because the latter
+    may be set artificially low to force the streaming dispatch path.
+    """
+    from ._memory import _resolve_memory_limit_bytes
+
+    n_groups = len(candidates)
+    n_genes = len(gene_symbols)
+    result_bytes = n_groups * n_genes * (7 * 8 + 2 * 4)  # same as memmap estimate
+    # Use actual physical memory for the lazy-load decision, not the
+    # (possibly tiny) memory_limit_gb used for streaming dispatch.
+    physical_budget = _resolve_memory_limit_bytes(None)
+    # If an explicit limit was given and is *larger* than physical, honour it
+    # (e.g., user trusts their system won't OOM at 256 GB).
+    if memory_limit_gb is not None:
+        explicit_budget = memory_limit_gb * 1e9
+        budget = max(physical_budget, explicit_budget)
+    else:
+        budget = physical_budget
+    skip_loading = result_bytes > budget * 0.25
+
+    if skip_loading:
+        logger.info(
+            "Result arrays too large to fit in memory (%.1f GB > %.1f GB budget × 0.25). "
+            "Returning lazy result — access data via result.result (AnnData h5ad).",
+            result_bytes / 1e9, budget / 1e9,
+        )
+        # Construct a minimal result with zero-size arrays
+        empty_f64 = np.empty((0, 0), dtype=np.float64)
+        empty_f32 = np.empty((0, 0), dtype=np.float32)
+        empty_i64 = np.empty((0, 0), dtype=np.int64)
+        result = RankGenesGroupsResult(
+            genes=gene_symbols,
+            groups=candidates,
+            statistics=empty_f64,
+            pvalues=empty_f64,
+            pvalues_adj=empty_f64,
+            logfoldchanges=empty_f64,
+            effect_size=empty_f64,
+            u_statistics=empty_f64,
+            pts=empty_f32,
+            pts_rest=empty_f32,
+            order=empty_i64,
+            groupby=perturbation_column,
+            method="wilcoxon",
+            control_label=control_label,
+            tie_correct=tie_correct,
+            pvalue_correction=corr_method,
+        )
+        result.result = AnnData(output_path)
+        return result
+
+    with h5py.File(output_path, "r") as hf:
+        z_arr = hf["layers/z_score"][:]
+        pval_arr = hf["layers/pvalue"][:]
+        pval_adj_arr = hf["layers/pvalue_adj"][:]
+        lfc_arr = hf["layers/logfoldchanges"][:]
+        effect_arr = hf["X"][:]
+        u_arr = hf["layers/u_statistic"][:]
+        pts_arr = np.array(hf["layers/pts"][:], dtype=np.float32)
+        pts_rest_arr = np.array(hf["layers/pts_rest"][:], dtype=np.float32)
+
+    order_arr = np.argsort(-np.abs(z_arr), axis=1, kind="mergesort").astype(np.int64)
+
+    result = RankGenesGroupsResult(
+        genes=gene_symbols,
+        groups=candidates,
+        statistics=z_arr,
+        pvalues=pval_arr,
+        pvalues_adj=pval_adj_arr,
+        logfoldchanges=lfc_arr,
+        effect_size=effect_arr,
+        u_statistics=u_arr,
+        pts=pts_arr,
+        pts_rest=pts_rest_arr,
+        order=order_arr,
+        groupby=perturbation_column,
+        method="wilcoxon",
+        control_label=control_label,
+        tie_correct=tie_correct,
+        pvalue_correction=corr_method,
+    )
+    result.result = AnnData(output_path)
+    return result
+
+
 def _write_rank_genes_groups_hdf5(
     output_path: Path,
     result: "RankGenesGroupsResult",
@@ -360,6 +557,7 @@ def t_test(
     resume: bool = False,
     checkpoint_interval: int | None = None,
     scanpy_format: bool = False,
+    memory_limit_gb: float | None = None,
 ) -> RankGenesGroupsResult:
     """Perform a t-test comparing log-expression means for each perturbation.
     
@@ -414,6 +612,11 @@ def t_test(
         If True, write Scanpy-compatible ``uns['rank_genes_groups']`` structure
         in addition to the layer-based storage. Adds ~2-6 seconds of I/O overhead
         for large datasets. Default False for performance.
+    memory_limit_gb
+        Maximum memory budget in GB. Used for automatic chunk size calculation.
+        When ``None`` (default), detects available system memory via ``psutil``.
+        For HPC environments, set this to your SLURM ``--mem`` value
+        (e.g., ``memory_limit_gb=128``).
     
     Returns
     -------
@@ -428,7 +631,10 @@ def t_test(
     try:
         # Calculate adaptive chunk_size if not provided
         if cell_chunk_size is None:
-            cell_chunk_size = calculate_optimal_chunk_size(backed.n_obs, backed.n_vars)
+            cell_chunk_size = calculate_optimal_chunk_size(
+                backed.n_obs, backed.n_vars,
+                available_memory_gb=memory_limit_gb,
+            )
         gene_symbols = ensure_gene_symbol_column(backed, gene_name_column)
         if perturbation_column not in backed.obs.columns:
             raise KeyError(
@@ -824,7 +1030,7 @@ def nb_glm_test(
     tol: float = 1e-6,
     min_mu: float = 0.5,
     poisson_init_iter: int = 5,
-    chunk_size: int = 256,
+    chunk_size: int | None = None,
     irls_batch_size: int | None = 128,
     # ---- Filtering parameters ----
     min_cells_expressed: int = 0,
@@ -1156,6 +1362,16 @@ def nb_glm_test(
         backed.file.close()
 
     n_cells_total = obs_df.shape[0]
+    
+    # Calculate adaptive chunk_size if not provided
+    # Only reduces chunk_size when memory would be exceeded; successful datasets keep default (256)
+    if chunk_size is None:
+        chunk_size = calculate_nb_glm_chunk_size(
+            n_obs=n_cells_total,
+            n_vars=n_genes,
+            n_groups=len(candidates),
+            memory_limit_gb=memory_limit_gb,
+        )
     
     # For per_comparison size factors, we skip the expensive global computation
     # since size factors will be recomputed per-comparison anyway.
@@ -2096,6 +2312,7 @@ def nb_glm_test(
             if settings_compatible:
                 # Estimate per-worker memory in standard mode (matching actual formula below)
                 control_matrix_mb_est = control_n * n_genes * 8 / 1e6
+                control_matrix_gb_est = control_matrix_mb_est / 1000
                 labels_mb_est = n_cells_total * 50 / 1e6  # ~50 bytes per string
                 size_factors_mb_est = n_cells_total * 8 / 1e6
                 work_arrays_mb_est = (control_n + use_group_size) * n_genes * 8 * 4 / 1e6
@@ -2112,24 +2329,37 @@ def nb_glm_test(
                     except ImportError:
                         available_mb = 8000.0
                 
-                # How many workers could we run without frozen control?
-                base_memory_mb_est = control_matrix_mb_est + 1000
-                usable_mb = available_mb * 0.8
-                remaining_mb = max(usable_mb - base_memory_mb_est, per_worker_standard_mb)
-                max_workers_standard = max(1, int(remaining_mb / per_worker_standard_mb))
-                
-                # Auto-enable if standard mode would limit to <4 workers AND user wants >4
-                # Use requested_n_jobs (original request) not effective_n_jobs (may be reduced)
-                if max_workers_standard < 4 and requested_n_jobs >= 4:
+                # ================================================================
+                # AUTO-ENABLE CONDITION 1: Large control matrix (>10 GB)
+                # For datasets like Feng (110K control × 36K genes = 32 GB),
+                # freeze_control significantly reduces per-worker memory.
+                # ================================================================
+                if control_matrix_gb_est > 10.0:
                     freeze_control = True
                     logger.info(
-                        f"Auto-enabling freeze_control: standard mode would limit to {max_workers_standard} workers "
-                        f"(control: {control_n:,} cells × {n_genes:,} genes = {control_matrix_mb_est:.0f} MB, "
-                        f"per_worker: {per_worker_standard_mb:.0f} MB). "
-                        f"Frozen control enables ~{requested_n_jobs} workers."
+                        f"Auto-enabling freeze_control: large control matrix "
+                        f"({control_n:,} cells × {n_genes:,} genes = {control_matrix_gb_est:.1f} GB > 10 GB threshold)"
                     )
                 else:
-                    freeze_control = False
+                    # ================================================================
+                    # AUTO-ENABLE CONDITION 2: Worker count limitation (<4 workers)
+                    # Original logic: enable if parallelization would be severely limited
+                    # ================================================================
+                    base_memory_mb_est = control_matrix_mb_est + 1000
+                    usable_mb = available_mb * 0.8
+                    remaining_mb = max(usable_mb - base_memory_mb_est, per_worker_standard_mb)
+                    max_workers_standard = max(1, int(remaining_mb / per_worker_standard_mb))
+                    
+                    if max_workers_standard < 4 and requested_n_jobs >= 4:
+                        freeze_control = True
+                        logger.info(
+                            f"Auto-enabling freeze_control: standard mode would limit to {max_workers_standard} workers "
+                            f"(control: {control_n:,} cells × {n_genes:,} genes = {control_matrix_mb_est:.0f} MB, "
+                            f"per_worker: {per_worker_standard_mb:.0f} MB). "
+                            f"Frozen control enables ~{requested_n_jobs} workers."
+                        )
+                    else:
+                        freeze_control = False
             else:
                 freeze_control = False
         
@@ -2752,6 +2982,350 @@ def nb_glm_test(
     return result
 
 
+def _wilcoxon_test_streaming(
+    path: Path,
+    *,
+    gene_symbols: pd.Index,
+    perturbation_column: str,
+    control_label: str,
+    candidates: list[str],
+    n_genes: int,
+    chunk_size: int,
+    min_cells_expressed: int,
+    tie_correct: bool,
+    corr_method: str,
+    output_path: Path,
+    checkpoint_path: Path,
+    checkpoint_interval: int | None,
+    scanpy_format: bool,
+    verbose: bool,
+    resume: bool,
+    group_batch_size: int,
+    memory_limit_gb: float | None = None,
+) -> "RankGenesGroupsResult":
+    """Memory-efficient Wilcoxon test that streams over perturbation group batches.
+
+    Instead of allocating output arrays for ALL groups at once, processes groups
+    in batches and writes results incrementally to the output h5ad via h5py.
+    This keeps peak memory bounded by ``group_batch_size * n_genes`` rather than
+    ``n_groups * n_genes``.
+    """
+    n_groups = len(candidates)
+    n_gene_chunks = (n_genes + chunk_size - 1) // chunk_size
+    n_batches = (n_groups + group_batch_size - 1) // group_batch_size
+
+    gene_symbols = pd.Index(gene_symbols).astype(str)
+
+    # Pre-create h5ad scaffold with obs/var/uns and empty layer datasets
+    obs_index = pd.Index(candidates, name="perturbation").astype(str)
+    obs = pd.DataFrame({perturbation_column: obs_index.to_list()}, index=obs_index)
+    var = pd.DataFrame(index=gene_symbols)
+    # Write a minimal AnnData to establish the h5ad structure
+    scaffold = ad.AnnData(
+        np.zeros((n_groups, n_genes), dtype=np.float32),  # placeholder X, will be overwritten
+        obs=obs, var=var,
+    )
+    scaffold.write(output_path)
+    del scaffold
+    gc.collect()
+
+    # Now re-open with h5py and create layer datasets for streaming writes
+    with h5py.File(output_path, "r+") as hf:
+        # Overwrite X with chunked dataset for streaming writes
+        if "X" in hf:
+            del hf["X"]
+        hf.create_dataset("X", shape=(n_groups, n_genes), dtype="float64",
+                          chunks=(min(group_batch_size, n_groups), n_genes))
+
+        layer_names = ["z_score", "pvalue", "pvalue_adj", "logfoldchanges",
+                       "u_statistic", "pts", "pts_rest"]
+        layer_dtypes = {
+            "z_score": "float64", "pvalue": "float64", "pvalue_adj": "float64",
+            "logfoldchanges": "float64", "u_statistic": "float64",
+            "pts": "float32", "pts_rest": "float32",
+        }
+        layers_group = hf.require_group("layers")
+        for name in layer_names:
+            if name in layers_group:
+                del layers_group[name]
+            layers_group.create_dataset(
+                name, shape=(n_groups, n_genes), dtype=layer_dtypes[name],
+                chunks=(min(group_batch_size, n_groups), n_genes),
+            )
+
+        # Write uns metadata
+        uns = hf.require_group("uns")
+        for key in ["method", "control_label", "perturbation_column", "tie_correct", "pvalue_correction"]:
+            if key in uns:
+                del uns[key]
+        uns.create_dataset("method", data="wilcoxon")
+        uns.create_dataset("control_label", data=control_label)
+        uns.create_dataset("perturbation_column", data=perturbation_column)
+        uns.create_dataset("tie_correct", data=tie_correct)
+        uns.create_dataset("pvalue_correction", data=corr_method)
+
+    # Resume logic: track which group batches are already done
+    last_completed_batch = -1
+    if resume and checkpoint_path.exists():
+        checkpoint = _read_checkpoint(checkpoint_path)
+        if checkpoint is not None:
+            last_completed_batch = checkpoint.get("last_group_batch", -1)
+            logger.info(f"Resuming from group batch {last_completed_batch + 1}")
+
+    eff_checkpoint_interval = _get_checkpoint_interval(n_batches, checkpoint_interval)
+
+    logger.info(
+        f"Wilcoxon streaming mode: {n_groups} groups in {n_batches} batches "
+        f"(batch_size={group_batch_size}), {n_gene_chunks} gene chunks "
+        f"(chunk_size={chunk_size})"
+    )
+
+    def _save_streaming_checkpoint(batch_idx: int) -> None:
+        checkpoint_data = {
+            "total_group_batches": n_batches,
+            "last_group_batch": batch_idx,
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "method": "wilcoxon",
+            "mode": "streaming",
+            "control_label": control_label,
+        }
+        _write_checkpoint_atomic(checkpoint_path, checkpoint_data)
+
+    with _create_progress_context(n_batches, "Wilcoxon DE (group batches)", verbose) as pbar:
+        for batch_idx in range(n_batches):
+            if batch_idx <= last_completed_batch:
+                pbar.update(1)
+                continue
+
+            batch_start = batch_idx * group_batch_size
+            batch_end = min(batch_start + group_batch_size, n_groups)
+            batch_candidates = candidates[batch_start:batch_end]
+            bs = len(batch_candidates)
+
+            # Allocate result arrays for this batch only
+            batch_effect = np.zeros((bs, n_genes), dtype=np.float64)
+            batch_u = np.zeros((bs, n_genes), dtype=np.float64)
+            batch_z = np.zeros((bs, n_genes), dtype=np.float64)
+            batch_p = np.ones((bs, n_genes), dtype=np.float64)
+            batch_lfc = np.zeros((bs, n_genes), dtype=np.float64)
+            batch_pts = np.zeros((bs, n_genes), dtype=np.float32)
+            batch_pts_rest = np.zeros((bs, n_genes), dtype=np.float32)
+
+            # Stream gene chunks from backed file
+            backed = read_backed(path)
+            try:
+                labels = backed.obs[perturbation_column].astype(str).to_numpy()
+                control_mask = labels == control_label
+                control_n = int(control_mask.sum())
+                # Precompute integer row indices (faster than boolean indexing
+                # on the dense block: O(n_pert) vs O(n_cells) per group)
+                control_idx = np.where(control_mask)[0]
+                batch_pert_idx = {label: np.where(labels == label)[0]
+                                  for label in batch_candidates}
+
+                for slc, block in iter_matrix_chunks(
+                    backed, axis=1, chunk_size=chunk_size, convert_to_dense=False
+                ):
+                    if not sp.issparse(block):
+                        raise ValueError(
+                            "wilcoxon_test only supports sparse input matrices."
+                        )
+                    csr_block = sp.csr_matrix(block)  # Keep native dtype (float32)
+                    n_chunk_genes = csr_block.shape[1]
+
+                    # Control stats for this gene chunk (same for all groups)
+                    control_values = csr_block[control_mask, :]
+                    control_expr = np.asarray(control_values.getnnz(axis=0)).ravel()
+                    control_mean = (
+                        np.asarray(control_values.mean(axis=0)).ravel()
+                        if control_values.nnz
+                        else np.zeros(n_chunk_genes, dtype=np.float64)
+                    )
+                    control_mean_expm1 = np.expm1(control_mean) + 1e-9
+                    control_pts_chunk = np.divide(
+                        control_expr, control_n,
+                        out=np.zeros_like(control_expr, dtype=float),
+                        where=control_n > 0,
+                    )
+
+                    # Pre-compute perturbation summary stats from sparse
+                    pert_expr_counts = []
+                    pert_means = []
+                    pert_n_cells = []
+                    for label in batch_candidates:
+                        gv = csr_block[batch_pert_idx[label], :]
+                        n_pc = gv.shape[0]
+                        pert_n_cells.append(n_pc)
+                        ge = np.asarray(gv.getnnz(axis=0)).ravel()
+                        pert_expr_counts.append(ge)
+                        gm = (
+                            np.asarray(gv.mean(axis=0)).ravel()
+                            if gv.nnz
+                            else np.zeros(n_chunk_genes, dtype=np.float64)
+                        )
+                        pert_means.append(gm)
+
+                    # Determine valid genes per perturbation
+                    valid_masks = []
+                    for idx in range(bs):
+                        ge = pert_expr_counts[idx]
+                        total_expr = control_expr + ge
+                        low_expr = (control_expr < min_cells_expressed) & (
+                            ge < min_cells_expressed
+                        )
+                        valid = (total_expr >= min_cells_expressed) & ~low_expr
+                        valid_masks.append(valid)
+
+                    any_valid = np.zeros(n_chunk_genes, dtype=bool)
+                    for v in valid_masks:
+                        any_valid |= v
+                    valid_gene_indices = np.where(any_valid)[0]
+                    n_valid_genes = len(valid_gene_indices)
+
+                    if n_valid_genes > 0:
+                        # Convert valid-gene block to dense ONCE for all cells,
+                        # then use integer indexing per group (O(n_pert) vs
+                        # O(n_cells) for boolean masks on 400K-row arrays).
+                        # Keep native dtype (float32 for typical h5ad) to halve
+                        # working-set memory, consistent with Scanpy's wilcoxon.
+                        # ctrl_sorted_flat is always float64 inside _presort_control_nonzeros.
+                        all_valid_dense = csr_block[:, valid_gene_indices].toarray()
+                        control_dense = all_valid_dense[control_idx, :]
+
+                        # Pre-sort control non-zeros once per chunk (~14x
+                        # speedup: avoids redundant sort across 4955 groups)
+                        ctrl_sorted_flat, ctrl_offsets, ctrl_n_nz, ctrl_n_z = \
+                            _presort_control_nonzeros(control_dense)
+
+                        # Per-perturbation: pre-stack then call batched kernel
+                        # (single prange over n_perts, avoids serial launch overhead)
+                        bs_local = len(batch_candidates)
+                        total_pert_cells_s = sum(
+                            len(batch_pert_idx[label]) for label in batch_candidates
+                        )
+                        all_pert_stacked_s = np.empty(
+                            (total_pert_cells_s, n_valid_genes), dtype=all_valid_dense.dtype
+                        )
+                        pert_row_offsets_s = np.zeros(bs_local + 1, dtype=np.int64)
+                        valid_masks_2d_s = np.empty(
+                            (bs_local, n_valid_genes), dtype=np.bool_
+                        )
+                        valid_u_s = np.zeros((bs_local, n_valid_genes), dtype=np.float64)
+                        valid_z_s = np.zeros((bs_local, n_valid_genes), dtype=np.float64)
+                        valid_p_s = np.ones((bs_local, n_valid_genes), dtype=np.float64)
+                        valid_eff_s = np.zeros((bs_local, n_valid_genes), dtype=np.float64)
+
+                        for idx, label in enumerate(batch_candidates):
+                            rows = batch_pert_idx[label]
+                            start_s = pert_row_offsets_s[idx]
+                            end_s = start_s + len(rows)
+                            pert_row_offsets_s[idx + 1] = end_s
+                            all_pert_stacked_s[start_s:end_s] = all_valid_dense[rows, :]
+                            valid_masks_2d_s[idx] = valid_masks[idx][valid_gene_indices]
+
+                        _wilcoxon_batch_perts_presorted_numba(
+                            control_dense,
+                            ctrl_sorted_flat,
+                            ctrl_offsets,
+                            ctrl_n_nz,
+                            ctrl_n_z,
+                            all_pert_stacked_s,
+                            pert_row_offsets_s,
+                            valid_masks_2d_s,
+                            tie_correct,
+                            _ZERO_PARTITION_THRESHOLD,
+                            valid_u_s,
+                            valid_z_s,
+                            valid_p_s,
+                            valid_eff_s,
+                        )
+
+                        gene_pos = slc.start + valid_gene_indices
+                        for idx in range(bs_local):
+                            batch_u[idx, gene_pos] = valid_u_s[idx]
+                            batch_z[idx, gene_pos] = valid_z_s[idx]
+                            batch_p[idx, gene_pos] = valid_p_s[idx]
+                            batch_effect[idx, gene_pos] = valid_eff_s[idx]
+
+                    # LFC and pts for this chunk
+                    for idx in range(bs):
+                        ge = pert_expr_counts[idx]
+                        gm = pert_means[idx]
+                        np_ = pert_n_cells[idx]
+                        valid = valid_masks[idx]
+
+                        pts = np.divide(
+                            ge, float(np_),
+                            out=np.zeros_like(ge, dtype=float),
+                            where=np_ > 0,
+                        )
+                        pts = np.where(valid, pts, 0.0)
+                        pts_rest = np.where(valid, control_pts_chunk, 0.0)
+                        lfc = np.log2((np.expm1(gm) + 1e-9) / control_mean_expm1)
+                        lfc = np.where(valid, lfc, 0.0)
+
+                        gene_pos = np.arange(slc.start, slc.stop)
+                        batch_lfc[idx, gene_pos] = lfc
+                        batch_pts[idx, gene_pos] = pts
+                        batch_pts_rest[idx, gene_pos] = pts_rest
+            finally:
+                backed.file.close()
+
+            # P-value adjustment and ordering for this batch
+            batch_pvalue_adj = np.ones_like(batch_p)
+            _adjust_pvalue_matrix(batch_p, corr_method, out=batch_pvalue_adj)
+
+            # Write batch results to h5ad
+            sl = slice(batch_start, batch_end)
+            with h5py.File(output_path, "r+") as hf:
+                hf["X"][sl, :] = batch_effect
+                hf["layers/z_score"][sl, :] = batch_z
+                hf["layers/pvalue"][sl, :] = batch_p
+                hf["layers/pvalue_adj"][sl, :] = batch_pvalue_adj
+                hf["layers/logfoldchanges"][sl, :] = batch_lfc
+                hf["layers/u_statistic"][sl, :] = batch_u
+                hf["layers/pts"][sl, :] = batch_pts
+                hf["layers/pts_rest"][sl, :] = batch_pts_rest
+
+            del batch_effect, batch_u, batch_z, batch_p, batch_lfc
+            del batch_pts, batch_pts_rest, batch_pvalue_adj
+            gc.collect()
+            _release_chunk_memory()  # return freed batch-array pages to OS before next batch
+
+            # Checkpoint
+            if (batch_idx + 1) % eff_checkpoint_interval == 0 or batch_idx == n_batches - 1:
+                _save_streaming_checkpoint(batch_idx)
+            pbar.update(1)
+
+    logger.info(f"Completed all {n_batches} group batches")
+
+    # Build RankGenesGroupsResult by reading back from h5ad.
+    # Uses _build_result_from_h5ad which skips loading for very large results
+    # (>25% of memory budget) to avoid OOM on datasets like Huang-HEK293T.
+    result = _build_result_from_h5ad(
+        output_path,
+        candidates=candidates,
+        gene_symbols=gene_symbols,
+        perturbation_column=perturbation_column,
+        control_label=control_label,
+        tie_correct=tie_correct,
+        corr_method=corr_method,
+        memory_limit_gb=memory_limit_gb,
+    )
+
+    if scanpy_format and result.statistics.size > 0:
+        _write_rank_genes_groups_hdf5(output_path, result)
+
+    # Clean up checkpoint on success
+    if checkpoint_path.exists():
+        try:
+            checkpoint_path.unlink()
+        except Exception:
+            pass
+
+    return result
+
+
 def wilcoxon_test(
     data: str | Path | AnnData | ad.AnnData,
     *,
@@ -2770,6 +3344,7 @@ def wilcoxon_test(
     resume: bool = False,
     checkpoint_interval: int | None = None,
     scanpy_format: bool = False,
+    memory_limit_gb: float | None = None,
 ) -> RankGenesGroupsResult:
     """Perform a Wilcoxon rank-sum (Mann-Whitney U) test for each gene.
 
@@ -2824,6 +3399,12 @@ def wilcoxon_test(
         If True, write Scanpy-compatible ``uns['rank_genes_groups']`` structure
         in addition to the layer-based storage. Adds ~2-6 seconds of I/O overhead
         for large datasets. Default False for performance.
+    memory_limit_gb
+        Maximum memory budget in GB. Controls whether the streaming path is
+        used for very large datasets. When ``None`` (default), detects
+        available system memory via ``psutil``. For HPC environments with
+        fixed allocations, set this to your SLURM ``--mem`` value
+        (e.g., ``memory_limit_gb=128``).
 
     Returns
     -------
@@ -2849,17 +3430,24 @@ def wilcoxon_test(
         control_n = int(control_mask.sum())
         if control_n == 0:
             raise ValueError("Control group contains no cells")
-        pert_masks = {label: labels == label for label in candidates}
-        for label, mask in pert_masks.items():
-            if not np.any(mask):
-                raise ValueError(f"Perturbation '{label}' contains no cells")
+        # Memory-efficient validation: avoid creating per-group bool masks (n_groups × n_cells
+        # memory, e.g. 18K groups × 3.4M cells = 62 GB for Huang-HCT116). Instead use
+        # np.unique to get the set of observed labels in a single O(n_cells) pass.
+        _observed_labels = set(np.unique(labels).tolist())
+        _missing_perts = [lbl for lbl in candidates if lbl not in _observed_labels]
+        if _missing_perts:
+            raise ValueError(
+                f"Perturbation(s) {_missing_perts[:3]}"
+                f"{'...' if len(_missing_perts) > 3 else ''} contain no cells"
+            )
         
         # Calculate adaptive gene chunk_size if not provided
         # Wilcoxon iterates over genes (columns), so use gene chunk calculator
         # Pass n_groups to account for output array memory scaling
         if chunk_size is None:
             chunk_size = calculate_optimal_gene_chunk_size(
-                backed.n_obs, backed.n_vars, n_groups=len(candidates)
+                backed.n_obs, backed.n_vars, n_groups=len(candidates),
+                available_memory_gb=memory_limit_gb,
             )
     finally:
         backed.file.close()
@@ -2870,6 +3458,45 @@ def wilcoxon_test(
     output_path = resolve_output_path(path, suffix="wilcoxon", output_dir=output_dir, data_name=data_name)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     checkpoint_path = output_path.with_suffix(".progress.json")
+
+    # =========================================================================
+    # Adaptive dispatch: use group-batch streaming for large datasets
+    # =========================================================================
+    use_streaming, _, _, group_batch_size = _should_use_streaming(
+        n_groups, n_genes, memory_limit_gb=memory_limit_gb,
+    )
+
+    # Only stream when multiple batches are actually needed.
+    # If group_batch_size >= n_groups (one batch = all groups), the standard memmap
+    # path is strictly better: memmaps are OS-pageable and glibc returns their pages
+    # before readback, keeping peak ~10 GB.  The streaming path keeps all result arrays
+    # in Python heap and skips malloc_trim, leading to 20-35 GB peaks for mid-size
+    # datasets like Feng-gwsnf (4,955 groups × 32,373 genes).
+    if use_streaming and group_batch_size < n_groups:
+        return _wilcoxon_test_streaming(
+            path,
+            gene_symbols=gene_symbols,
+            perturbation_column=perturbation_column,
+            control_label=control_label,
+            candidates=candidates,
+            n_genes=n_genes,
+            chunk_size=chunk_size,
+            min_cells_expressed=min_cells_expressed,
+            tie_correct=tie_correct,
+            corr_method=corr_method,
+            output_path=output_path,
+            checkpoint_path=checkpoint_path,
+            checkpoint_interval=checkpoint_interval,
+            scanpy_format=scanpy_format,
+            verbose=verbose,
+            resume=resume,
+            group_batch_size=group_batch_size,
+            memory_limit_gb=memory_limit_gb,
+        )
+
+    # =========================================================================
+    # Standard single-pass path (unchanged for small/medium datasets)
+    # =========================================================================
     
     # For wilcoxon, we track gene chunk progress (not perturbation progress)
     # Resume logic: read checkpoint to get last completed gene chunk
@@ -2903,15 +3530,15 @@ def wilcoxon_test(
         lfc_matrix = _create_memmap("logfoldchange", np.float64)
         pts_matrix = _create_memmap("pts", np.float32)
         pts_rest_matrix = _create_memmap("pts_rest", np.float32)
-        order_matrix = np.memmap(
-            tmpdir_path / "order.dat", dtype=np.int64, mode="w+", shape=(n_groups, n_genes)
-        )
 
         backed = read_backed(path)
         try:
             labels = backed.obs[perturbation_column].astype(str).to_numpy()
             control_mask = labels == control_label
-            pert_masks = {label: labels == label for label in candidates}
+            # Precompute integer row indices (faster than boolean indexing
+            # on the dense block: O(n_pert) vs O(n_cells) per group)
+            control_idx = np.where(control_mask)[0]
+            pert_idx = {label: np.where(labels == label)[0] for label in candidates}
 
             dtype_checked = False
 
@@ -2966,7 +3593,7 @@ def wilcoxon_test(
                         _warn_if_count_like(block)
                         dtype_checked = True
 
-                    csr_block = sp.csr_matrix(block, dtype=np.float64)
+                    csr_block = sp.csr_matrix(block)  # Keep native dtype (float32)
                     n_chunk_genes = csr_block.shape[1]
 
                     # ===== OPTIMIZED BATCH PROCESSING =====
@@ -2987,13 +3614,12 @@ def wilcoxon_test(
                     )
                     chunk_gene_indices = np.arange(slc.start, slc.stop)
 
-                    # 2. Pre-compute perturbation masks and expression counts
+                    # 2. Pre-compute perturbation expression counts
                     pert_expr_counts = []
                     pert_means = []
                     pert_n_cells = []
                     for label in candidates:
-                        mask = pert_masks[label]
-                        group_values = csr_block[mask, :]
+                        group_values = csr_block[pert_idx[label], :]
                         n_pert_cells = group_values.shape[0]
                         pert_n_cells.append(n_pert_cells)
                         group_expr = np.asarray(group_values.getnnz(axis=0)).ravel()
@@ -3033,37 +3659,64 @@ def wilcoxon_test(
                     chunk_pts_rest = np.zeros((n_groups, n_chunk_genes), dtype=np.float32)
 
                     if n_valid_genes > 0:
-                        # 6. Convert to dense ONCE for ALL cells and valid genes
-                        # This is the key optimization - avoid per-perturbation sparse ops
-                        all_cells_dense = csr_block[:, valid_gene_indices].toarray().astype(np.float64)
-                        
-                        # Pre-extract control rows (constant across all perturbations)
-                        control_dense = all_cells_dense[control_mask, :]
+                        # 6. Convert valid-gene block to dense ONCE for all cells,
+                        # then use integer indexing per group (O(n_pert) vs
+                        # O(n_cells) for boolean masks on large arrays).
+                        # Keep native dtype (float32 for typical h5ad) to halve
+                        # working-set memory, consistent with Scanpy's wilcoxon.
+                        # ctrl_sorted_flat is always float64 inside _presort_control_nonzeros.
+                        all_valid_dense = csr_block[:, valid_gene_indices].toarray()
+                        control_dense = all_valid_dense[control_idx, :]
+
+                        # Pre-sort control non-zeros once per chunk (~14x
+                        # speedup: avoids redundant sort across all groups)
+                        ctrl_sorted_flat, ctrl_offsets, ctrl_n_nz, ctrl_n_z = \
+                            _presort_control_nonzeros(control_dense)
                         
                         # 7. Pre-allocate output arrays for valid genes
                         valid_u = np.zeros((n_groups, n_valid_genes), dtype=np.float64)
                         valid_z = np.zeros((n_groups, n_valid_genes), dtype=np.float64)
                         valid_p = np.ones((n_groups, n_valid_genes), dtype=np.float64)
                         valid_effect = np.zeros((n_groups, n_valid_genes), dtype=np.float64)
-                        
-                        # 8. Process each perturbation using fast Numba kernel
+
+                        # 8. Stack all pert dense matrices and call batched kernel.
+                        # Single prange(n_perts) replaces n_perts serial kernel
+                        # launches, eliminating the ~25ms prange thread-pool startup
+                        # overhead per call (~50x speedup on kernel time).
+                        total_pert_cells = sum(
+                            len(pert_idx[label]) for label in candidates
+                        )
+                        all_pert_stacked = np.empty(
+                            (total_pert_cells, n_valid_genes), dtype=all_valid_dense.dtype
+                        )
+                        pert_row_offsets = np.zeros(n_groups + 1, dtype=np.int64)
+                        valid_masks_2d = np.empty(
+                            (n_groups, n_valid_genes), dtype=np.bool_
+                        )
                         for idx, label in enumerate(candidates):
-                            mask = pert_masks[label]
-                            pert_dense = all_cells_dense[mask, :]
-                            valid_genes_arr = valid_masks[idx][valid_gene_indices]
-                            
-                            # Call optimized single-perturbation kernel
-                            _wilcoxon_sparse_batch_numba(
-                                control_dense,
-                                pert_dense,
-                                valid_genes_arr,
-                                tie_correct,
-                                _ZERO_PARTITION_THRESHOLD,
-                                valid_u[idx],
-                                valid_z[idx],
-                                valid_p[idx],
-                                valid_effect[idx],
-                            )
+                            rows = pert_idx[label]
+                            start = pert_row_offsets[idx]
+                            end = start + len(rows)
+                            pert_row_offsets[idx + 1] = end
+                            all_pert_stacked[start:end] = all_valid_dense[rows, :]
+                            valid_masks_2d[idx] = valid_masks[idx][valid_gene_indices]
+
+                        _wilcoxon_batch_perts_presorted_numba(
+                            control_dense,
+                            ctrl_sorted_flat,
+                            ctrl_offsets,
+                            ctrl_n_nz,
+                            ctrl_n_z,
+                            all_pert_stacked,
+                            pert_row_offsets,
+                            valid_masks_2d,
+                            tie_correct,
+                            _ZERO_PARTITION_THRESHOLD,
+                            valid_u,
+                            valid_z,
+                            valid_p,
+                            valid_effect,
+                        )
                         
                         # 9. Map results back to full chunk gene indices
                         for idx in range(n_groups):
@@ -3108,6 +3761,18 @@ def wilcoxon_test(
                         pts_matrix[idx, gene_indices] = chunk_pts[idx]
                         pts_rest_matrix[idx, gene_indices] = chunk_pts_rest[idx]
                     
+                    # Release transient chunk arrays and return freed pages to OS
+                    # (prevents glibc arena fragmentation across many gene chunks)
+                    del csr_block, chunk_u, chunk_z, chunk_p, chunk_effect, chunk_lfc
+                    del chunk_pts, chunk_pts_rest, pert_expr_counts, pert_means
+                    del pert_n_cells, valid_masks
+                    if n_valid_genes > 0:
+                        del all_valid_dense, control_dense
+                        del ctrl_sorted_flat, ctrl_offsets, ctrl_n_nz, ctrl_n_z
+                        del all_pert_stacked, valid_u, valid_z, valid_p, valid_effect
+                        del pert_row_offsets, valid_masks_2d
+                    _release_chunk_memory()
+
                     # Update progress and checkpoint
                     n_chunks_processed += 1
                     pbar.update(1)
@@ -3122,69 +3787,48 @@ def wilcoxon_test(
             backed.file.close()
 
         gene_symbols = pd.Index(gene_symbols).astype(str)
-        gene_array = gene_symbols.to_numpy()
         pvalue_adj_matrix = _create_memmap("pvalue_adj", np.float64)
         _adjust_pvalue_matrix(pvalue_matrix, corr_method, out=pvalue_adj_matrix)
 
-        for idx in range(n_groups):
-            order_matrix[idx] = np.argsort(-z_matrix[idx], kind="mergesort")
-
-        # Convert memmap arrays to regular arrays before tempdir cleanup
-        z_arr = np.array(z_matrix)
-        pval_arr = np.array(pvalue_matrix)
-        pval_adj_arr = np.array(pvalue_adj_matrix)
-        lfc_arr = np.array(lfc_matrix)
-        effect_arr = np.array(effect_matrix)
-        u_arr = np.array(u_matrix)
-        pts_arr = np.array(pts_matrix, dtype=np.float32)
-        pts_rest_arr = np.array(pts_rest_matrix, dtype=np.float32)
-        order_arr = np.array(order_matrix)
-        
-        result = RankGenesGroupsResult(
-            genes=gene_symbols,
-            groups=candidates,
-            statistics=z_arr,
-            pvalues=pval_arr,
-            pvalues_adj=pval_adj_arr,
-            logfoldchanges=lfc_arr,
-            effect_size=effect_arr,
-            u_statistics=u_arr,
-            pts=pts_arr,
-            pts_rest=pts_rest_arr,
-            order=order_arr,
-            groupby=perturbation_column,
-            method="wilcoxon",
+        # Write h5ad directly from memmaps via h5py (avoids triple allocation:
+        # memmap + np.array copy + AnnData that previously caused OOM)
+        _write_wilcoxon_result_h5ad(
+            output_path,
+            effect_matrix=effect_matrix,
+            z_matrix=z_matrix,
+            pvalue_matrix=pvalue_matrix,
+            pvalue_adj_matrix=pvalue_adj_matrix,
+            lfc_matrix=lfc_matrix,
+            u_matrix=u_matrix,
+            pts_matrix=pts_matrix,
+            pts_rest_matrix=pts_rest_matrix,
+            candidates=candidates,
+            gene_symbols=gene_symbols,
+            perturbation_column=perturbation_column,
             control_label=control_label,
             tie_correct=tie_correct,
-            pvalue_correction=corr_method,
+            corr_method=corr_method,
         )
+        # Memmaps will be released when TemporaryDirectory exits below
 
-    # Create AnnData with layer-based storage (avoid recarray-based rank_genes_groups
-    # which fails with HDF5 header size limits for large group counts)
-    obs_index = pd.Index(candidates, name="perturbation").astype(str)
-    obs = pd.DataFrame({perturbation_column: obs_index.to_list()}, index=obs_index)
-    var = pd.DataFrame(index=gene_symbols)
-    adata = ad.AnnData(effect_arr, obs=obs, var=var)
-    adata.layers["z_score"] = z_arr
-    adata.layers["pvalue"] = pval_arr
-    adata.layers["pvalue_adj"] = pval_adj_arr
-    adata.layers["logfoldchanges"] = lfc_arr
-    adata.layers["u_statistic"] = u_arr
-    adata.layers["pts"] = pts_arr
-    adata.layers["pts_rest"] = pts_rest_arr
-    adata.uns["method"] = "wilcoxon"
-    adata.uns["control_label"] = control_label
-    adata.uns["perturbation_column"] = perturbation_column
-    adata.uns["tie_correct"] = tie_correct
-    adata.uns["pvalue_correction"] = corr_method
-    adata.write(output_path)
-    
+    # tmpdir is now cleaned up — all memmaps released.
+    # Read back from h5ad for the result object.
+    _release_chunk_memory()
+    result = _build_result_from_h5ad(
+        output_path,
+        candidates=candidates,
+        gene_symbols=gene_symbols,
+        perturbation_column=perturbation_column,
+        control_label=control_label,
+        tie_correct=tie_correct,
+        corr_method=corr_method,
+        memory_limit_gb=memory_limit_gb,
+    )
+
     # Optionally write Scanpy-compatible rank_genes_groups structure
-    if scanpy_format:
+    if scanpy_format and result.statistics.size > 0:
         _write_rank_genes_groups_hdf5(output_path, result)
-    
-    result.result = AnnData(output_path)
-    
+
     # Clean up checkpoint on successful completion
     if checkpoint_path.exists():
         try:
@@ -3206,6 +3850,7 @@ def shrink_lfc(
     n_jobs: int = -1,
     batch_size: int = 128,
     profiling: bool = False,
+    memory_limit_gb: float | None = None,
 ) -> RankGenesGroupsResult:
     """Apply apeGLM log-fold change shrinkage to existing NB-GLM results.
     
@@ -3280,6 +3925,11 @@ def shrink_lfc(
         - `shrinkage_peak_memory_mb`: Peak memory during shrinkage
         - `profiling_enabled`: True
         When False (default), `adata.uns["profiling"]` is set to "NA".
+    memory_limit_gb
+        Optional memory budget in gigabytes. When ``method="full"``, this
+        limits the number of parallel ``n_jobs`` so that joblib workers stay
+        within the budget. When ``None`` (default), detects available system
+        memory via ``psutil``.
     
     Returns
     -------

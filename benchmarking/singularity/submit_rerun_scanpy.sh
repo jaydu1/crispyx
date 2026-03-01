@@ -7,7 +7,7 @@
 #   ./submit_rerun_scanpy.sh Adamson_subset.yaml          # Submit single config
 #   ./submit_rerun_scanpy.sh Replogle-GW-k562.yaml --force  # Submit with force flag
 #
-# Resources (memory, cores) are automatically read from the config file.
+# Resources: 32 cores (same as benchmark), no memory limit, 3-day time limit.
 # Run this AFTER benchmarks to get Scanpy outputs for datasets where Scanpy
 # timed out or ran out of memory.
 
@@ -22,11 +22,11 @@ SLURM_SCRIPT="$PROJECT_ROOT/benchmarking/singularity/slurm_rerun_scanpy.sh"
 # Small datasets usually complete in benchmark, so skip by default
 DEFAULT_CONFIGS=(
     "Feng-ts.yaml"
-    "Replogle-GW-k562.yaml"
-    "Replogle-E-k562.yaml"
-    "Replogle-E-rpe1.yaml"
-    "Huang-HCT116.yaml"
-    "Huang-HEK293T.yaml"
+    # "Replogle-GW-k562.yaml"
+    # "Replogle-E-k562.yaml"
+    # "Replogle-E-rpe1.yaml"
+    # "Huang-HCT116.yaml"
+    # "Huang-HEK293T.yaml"
 )
 
 # Script-specific flags that should be forwarded to Python script
@@ -89,24 +89,9 @@ else
     fi
 fi
 
-# Function to extract resource limits from YAML config using Python
-read_config() {
-    local config_path="$1"
-    python3 -c "
-import yaml
-
-with open('$config_path', 'r') as f:
-    config = yaml.safe_load(f)
-
-limits = config.get('resource_limits', {})
-parallel = config.get('parallel_config', {})
-
-memory_limit = limits.get('memory_limit', 64)  # default 64 GB
-n_cores = parallel.get('n_cores', 8)  # default 8 cores
-
-print(f'{int(memory_limit)} {n_cores}')
-"
-}
+# Fixed resource allocation for rerun (same parallelism as benchmark)
+N_CORES=32       # Same as benchmark
+SLURM_MEMORY="500G"  # Large memory limit to avoid OOM on big datasets
 
 # Process each config file
 for CONFIG_FILE in "${CONFIGS[@]}"; do
@@ -120,20 +105,11 @@ for CONFIG_FILE in "${CONFIGS[@]}"; do
         continue
     fi
 
-    # Parse config
-    CONFIG_VALUES=$(read_config "$CONFIG_PATH")
-    MEMORY_GB=$(echo $CONFIG_VALUES | cut -d' ' -f1)
-    N_CORES=$(echo $CONFIG_VALUES | cut -d' ' -f2)
-    
     # Extract dataset name for job name
     DATASET_NAME=$(basename "$CONFIG_FILE" .yaml)
-    
-    # Add 10% memory buffer for SLURM
-    SLURM_MEMORY_GB=$((MEMORY_GB + MEMORY_GB / 10))
-    SLURM_MEMORY="${SLURM_MEMORY_GB}G"
 
-    # Set job time limit - Scanpy can be slow, allow up to 3 days
-    JOB_TIME_LIMIT="3-00:00:00"
+    # Set job time limit - Scanpy can be slow, allow up to 5 days
+    JOB_TIME_LIMIT="5-00:00:00"
 
     # Generate timestamp for log files
     TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
@@ -155,7 +131,7 @@ for CONFIG_FILE in "${CONFIGS[@]}"; do
     [ ${#SCRIPT_ARGS[@]} -gt 0 ] && echo "Script args: ${SCRIPT_ARGS[*]}"
     echo "========================================"
 
-    # Submit job
+    # Submit job (no time/memory limits, 32 cores same as benchmark)
     SCRIPT_ARGS_STR="${SCRIPT_ARGS[*]}"
     sbatch \
         --job-name="rs-$DATASET_NAME" \
@@ -164,8 +140,9 @@ for CONFIG_FILE in "${CONFIGS[@]}"; do
         --cpus-per-task="$N_CORES" \
         --output="$LOG_OUT" \
         --error="$LOG_ERR" \
+        --export=ALL,PRESET_TIME="$JOB_TIME_LIMIT",PRESET_MEM="$SLURM_MEMORY" \
         "${SBATCH_ARGS[@]}" \
-        "$SLURM_SCRIPT" "$CONFIG_FILE" "$MEMORY_GB" "$SCRIPT_ARGS_STR"
+        "$SLURM_SCRIPT" "$CONFIG_FILE" "$SCRIPT_ARGS_STR"
     
     echo ""
 done

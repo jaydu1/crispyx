@@ -963,7 +963,13 @@ def _qc_in_memory(
     
     # Add gene_symbols to var
     adata_filtered.var["gene_symbols"] = gene_names[gene_mask].to_numpy()
-    
+
+    # Drop stale categories so downstream tools (e.g. scanpy) only see
+    # groups that have at least one cell in the filtered subset.
+    for _col in adata_filtered.obs.columns:
+        if isinstance(adata_filtered.obs[_col].dtype, pd.CategoricalDtype):
+            adata_filtered.obs[_col] = adata_filtered.obs[_col].cat.remove_unused_categories()
+
     # Save
     output_path.parent.mkdir(parents=True, exist_ok=True)
     adata_filtered.write(output_path)
@@ -1540,8 +1546,19 @@ def quality_control_summary(
         except ImportError:
             memory_limit_gb = 8.0
     
-    # Estimate memory needed (rough: 2x file size for safety with in-memory processing)
-    estimated_memory_gb = file_size_gb * 2
+    # Estimate memory needed for in-memory processing.
+    # For dense arrays, the compressed file size can be much smaller than the
+    # actual uncompressed footprint, so we use n_obs * n_vars * dtype_size.
+    if storage_format == 'dense':
+        import h5py as _h5py
+        with _h5py.File(path, 'r') as _f:
+            _dtype = _f['X'].dtype if isinstance(_f.get('X'), _h5py.Dataset) else None
+        _itemsize = _dtype.itemsize if _dtype is not None else 4  # default float32
+        # 2x: one copy to load + one working copy
+        estimated_memory_gb = n_obs * n_vars * _itemsize * 2 / 1e9
+    else:
+        # For sparse formats the compressed size is a reasonable proxy
+        estimated_memory_gb = file_size_gb * 2
     
     # Determine chunk size for streaming paths
     if chunk_size is None:

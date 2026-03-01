@@ -18,21 +18,21 @@ SLURM_SCRIPT="$PROJECT_ROOT/benchmarking/singularity/slurm_benchmark.sh"
 
 # Default config files to run when none specified
 DEFAULT_CONFIGS=(
-    "Adamson_subset.yaml"
-    "Adamson.yaml"
+    # "Adamson_subset.yaml"
+    # "Adamson.yaml"
     "Feng-gwsf.yaml"
     "Feng-gwsnf.yaml"
-    "Feng-ts.yaml"
-    "Frangieh.yaml"
-    "Nadig-HEPG2.yaml"
-    "Nadig-JURKAT.yaml"
-    "Replogle-E-k562.yaml"
-    "Replogle-E-rpe1.yaml"
+    # "Feng-ts.yaml"
+    # "Frangieh.yaml"
+    # "Nadig-HEPG2.yaml"
+    # "Nadig-JURKAT.yaml"
+    # "Replogle-E-k562.yaml"
+    # "Replogle-E-rpe1.yaml"
     "Replogle-GW-k562.yaml"
-    "Tian-crispra.yaml"
-    "Tian-crispri.yaml"
-    "Huang-HCT116.yaml"
-    "Huang-HEK293T.yaml"
+    # "Tian-crispra.yaml"
+    # "Tian-crispri.yaml"
+    # "Huang-HCT116.yaml"
+    # "Huang-HEK293T.yaml"
 )
 
 # Benchmark-specific flags that should be forwarded to Python script
