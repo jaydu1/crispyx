@@ -32,7 +32,7 @@ from crispyx._kernels import (
     _wilcoxon_sparse_batch_numba,
 )
 from crispyx._memory import _should_use_streaming
-from crispyx.data import calculate_optimal_gene_chunk_size
+from crispyx.data import calculate_optimal_gene_chunk_size, calculate_wilcoxon_chunk_size
 from crispyx.de import wilcoxon_test
 
 
@@ -370,16 +370,27 @@ ADAMSON_PATH = PROJECT_ROOT / "data" / "Adamson_subset.h5ad"
 class TestAdamsonSubsetParity:
     """Standard and streaming paths must produce identical results on real data."""
 
+    @pytest.fixture(autouse=True, scope="class")
+    def _normalised_adamson(self, tmp_path_factory):
+        """Create a normalised copy of the Adamson subset for all tests."""
+        tmp = tmp_path_factory.mktemp("adamson_norm")
+        adata = ad.read_h5ad(ADAMSON_PATH)
+        sc.pp.normalize_total(adata, target_sum=1e4)
+        sc.pp.log1p(adata)
+        norm_path = tmp / "Adamson_subset_norm.h5ad"
+        adata.write(norm_path)
+        type(self).norm_path = norm_path
+
     def test_pvalue_parity(self, tmp_path):
         standard = wilcoxon_test(
-            ADAMSON_PATH,
+            self.norm_path,
             perturbation_column="perturbation",
             control_label="control",
             output_dir=tmp_path / "std",
             memory_limit_gb=128,
         )
         streaming = wilcoxon_test(
-            ADAMSON_PATH,
+            self.norm_path,
             perturbation_column="perturbation",
             control_label="control",
             output_dir=tmp_path / "stream",
@@ -394,14 +405,14 @@ class TestAdamsonSubsetParity:
 
     def test_effect_size_parity(self, tmp_path):
         standard = wilcoxon_test(
-            ADAMSON_PATH,
+            self.norm_path,
             perturbation_column="perturbation",
             control_label="control",
             output_dir=tmp_path / "std2",
             memory_limit_gb=128,
         )
         streaming = wilcoxon_test(
-            ADAMSON_PATH,
+            self.norm_path,
             perturbation_column="perturbation",
             control_label="control",
             output_dir=tmp_path / "stream2",
@@ -415,14 +426,14 @@ class TestAdamsonSubsetParity:
 
     def test_statistic_parity(self, tmp_path):
         standard = wilcoxon_test(
-            ADAMSON_PATH,
+            self.norm_path,
             perturbation_column="perturbation",
             control_label="control",
             output_dir=tmp_path / "std3",
             memory_limit_gb=128,
         )
         streaming = wilcoxon_test(
-            ADAMSON_PATH,
+            self.norm_path,
             perturbation_column="perturbation",
             control_label="control",
             output_dir=tmp_path / "stream3",
@@ -436,14 +447,14 @@ class TestAdamsonSubsetParity:
 
     def test_pvalue_adj_parity(self, tmp_path):
         standard = wilcoxon_test(
-            ADAMSON_PATH,
+            self.norm_path,
             perturbation_column="perturbation",
             control_label="control",
             output_dir=tmp_path / "std4",
             memory_limit_gb=128,
         )
         streaming = wilcoxon_test(
-            ADAMSON_PATH,
+            self.norm_path,
             perturbation_column="perturbation",
             control_label="control",
             output_dir=tmp_path / "stream4",
@@ -726,3 +737,160 @@ class TestAdaptiveChunkSizeHighCells:
         )
         # 10K cells × 12 bytes = 120 KB per gene; 512 genes = 61 MB << 6.4 GB budget
         assert chunk == 512, f"chunk {chunk} should be 512 for small dataset"
+
+
+# ---------------------------------------------------------------------------
+# 9. Wilcoxon chunk size with 15% budget (Fix 1 verification)
+# ---------------------------------------------------------------------------
+
+class TestWilcoxonChunkSize15pct:
+    """Verify calculate_wilcoxon_chunk_size with the 15% budget and max_chunk=4096."""
+
+    def test_feng_gwsnf_larger_chunk(self):
+        """Feng-gwsnf (393K cells, 128 GB): chunk should increase from ~1355 to ~4067."""
+        chunk = calculate_wilcoxon_chunk_size(393465, 32373, available_memory_gb=128)
+        assert chunk > 3000, f"chunk {chunk} should be > 3000 for Feng-gwsnf at 128 GB"
+        assert chunk <= 4096, f"chunk {chunk} should be <= max_chunk=4096"
+
+    def test_feng_ts_larger_chunk(self):
+        """Feng-ts (1.16M cells, 128 GB): chunk should increase from ~459 to ~1378."""
+        chunk = calculate_wilcoxon_chunk_size(1161864, 33165, available_memory_gb=128)
+        assert chunk > 1000, f"chunk {chunk} should be > 1000 for Feng-ts at 128 GB"
+
+    def test_small_dataset_hits_max_chunk(self):
+        """Small dataset (21K cells, 128 GB): budget cap is huge, hits max_chunk=4096."""
+        chunk = calculate_wilcoxon_chunk_size(21071, 22040, available_memory_gb=128)
+        assert chunk == 4096, f"chunk {chunk} should be 4096 (max_chunk) for small dataset"
+
+    def test_low_memory_still_small(self):
+        """Feng-gwsnf at 16 GB: chunk should still be small."""
+        chunk = calculate_wilcoxon_chunk_size(393465, 32373, available_memory_gb=16)
+        assert chunk < 1000, f"chunk {chunk} should be < 1000 for 16 GB"
+        assert chunk >= 32, f"chunk {chunk} should be >= min_chunk=32"
+
+    def test_replogle_gw_larger_chunk(self):
+        """Replogle-GW (1.97M cells, 128 GB): chunk should increase from ~271 to ~813."""
+        chunk = calculate_wilcoxon_chunk_size(1970000, 8248, available_memory_gb=128)
+        assert chunk > 700, f"chunk {chunk} should be > 700 for Replogle-GW at 128 GB"
+
+    def test_fewer_chunks_feng_gwsnf(self):
+        """Feng-gwsnf: 8 chunks instead of 24."""
+        import math
+        chunk = calculate_wilcoxon_chunk_size(393465, 32373, available_memory_gb=128)
+        n_chunks = math.ceil(32373 / chunk)
+        assert n_chunks <= 10, f"n_chunks {n_chunks} should be <= 10 (was 24)"
+
+
+# ---------------------------------------------------------------------------
+# 8. Dense-gene binary search correctness
+# ---------------------------------------------------------------------------
+
+class TestDenseGeneBinarySearch:
+    """Verify Wilcoxon results are correct for genes with zero_frac < 0.5.
+
+    These genes previously used the O(n_total*log(n_total)) argsort path.
+    After Fix 3 they always use binary search, which must give identical
+    statistical results.
+    """
+
+    def _make_dense_h5ad(self, tmp_path, n_ctrl=200, n_perts=5,
+                         cells_per_pert=10, n_genes=20, seed=99):
+        """Create h5ad where ALL genes are dense (zero_frac ≈ 0)."""
+        rng = np.random.default_rng(seed)
+        n_cells = n_ctrl + n_perts * cells_per_pert
+        # Positive expression values only — no zeros
+        data = rng.exponential(2.0, (n_cells, n_genes)) + 0.1
+        labels = (["control"] * n_ctrl
+                  + [f"p{i}" for i in range(n_perts) for _ in range(cells_per_pert)])
+        obs = pd.DataFrame({"perturbation": labels},
+                           index=[f"c{i}" for i in range(n_cells)])
+        var = pd.DataFrame(index=[f"g{i}" for i in range(n_genes)])
+        adata = ad.AnnData(sp.csr_matrix(data), obs=obs, var=var)
+        sc.pp.normalize_total(adata, target_sum=1e4)
+        sc.pp.log1p(adata)
+        adata.X = sp.csr_matrix(adata.X)
+        path = tmp_path / "dense_genes.h5ad"
+        adata.write(path)
+        return path
+
+    def _make_mixed_h5ad(self, tmp_path, n_ctrl=200, n_perts=5,
+                         cells_per_pert=10, n_genes=20, seed=99):
+        """Create h5ad with a mix of dense and sparse genes.
+
+        First half: dense (zero_frac ≈ 0).
+        Second half: sparse (zero_frac ≈ 0.8).
+        """
+        rng = np.random.default_rng(seed)
+        n_cells = n_ctrl + n_perts * cells_per_pert
+        n_dense = n_genes // 2
+        n_sparse = n_genes - n_dense
+        dense = rng.exponential(2.0, (n_cells, n_dense)) + 0.1
+        sparse = (rng.random((n_cells, n_sparse)) < 0.2) * rng.exponential(2.0, (n_cells, n_sparse))
+        data = np.hstack([dense, sparse])
+        labels = (["control"] * n_ctrl
+                  + [f"p{i}" for i in range(n_perts) for _ in range(cells_per_pert)])
+        obs = pd.DataFrame({"perturbation": labels},
+                           index=[f"c{i}" for i in range(n_cells)])
+        var = pd.DataFrame(index=[f"g{i}" for i in range(n_genes)])
+        adata = ad.AnnData(sp.csr_matrix(data), obs=obs, var=var)
+        sc.pp.normalize_total(adata, target_sum=1e4)
+        sc.pp.log1p(adata)
+        adata.X = sp.csr_matrix(adata.X)
+        path = tmp_path / "mixed_genes.h5ad"
+        adata.write(path)
+        return path
+
+    def test_dense_genes_vs_scanpy(self, tmp_path):
+        """All-dense genes: crispyx matches Scanpy p-values."""
+        path = self._make_dense_h5ad(tmp_path)
+        result = wilcoxon_test(path, perturbation_column="perturbation",
+                               control_label="control", output_dir=tmp_path)
+        # Compare with Scanpy
+        adata = sc.read_h5ad(path)
+        sc.tl.rank_genes_groups(adata, groupby="perturbation",
+                                reference="control", method="wilcoxon",
+                                tie_correct=True)
+        for label in [f"p{i}" for i in range(5)]:
+            cx_p = result[label].pvalue
+            sc_df = sc.get.rank_genes_groups_df(adata, group=label)
+            sc_pvals = sc_df.set_index("names").reindex(result.genes)["pvals"].values
+            # Relaxed tolerance — kernel numerics may differ slightly
+            np.testing.assert_allclose(cx_p, sc_pvals, rtol=1e-4, atol=1e-10)
+
+    def test_mixed_genes_vs_scanpy(self, tmp_path):
+        """Mixed dense+sparse genes: crispyx matches Scanpy p-values."""
+        path = self._make_mixed_h5ad(tmp_path)
+        result = wilcoxon_test(path, perturbation_column="perturbation",
+                               control_label="control", output_dir=tmp_path)
+        adata = sc.read_h5ad(path)
+        sc.tl.rank_genes_groups(adata, groupby="perturbation",
+                                reference="control", method="wilcoxon",
+                                tie_correct=True)
+        for label in [f"p{i}" for i in range(5)]:
+            cx_p = result[label].pvalue
+            sc_df = sc.get.rank_genes_groups_df(adata, group=label)
+            sc_pvals = sc_df.set_index("names").reindex(result.genes)["pvals"].values
+            np.testing.assert_allclose(cx_p, sc_pvals, rtol=1e-4, atol=1e-10)
+
+    def test_all_zero_gene(self, tmp_path):
+        """Gene with all zeros across ctrl + pert → p=1, U=0."""
+        rng = np.random.default_rng(123)
+        n_ctrl, n_perts, cpp, n_genes = 100, 3, 5, 10
+        n_cells = n_ctrl + n_perts * cpp
+        data = (rng.random((n_cells, n_genes)) < 0.3) * rng.exponential(2, (n_cells, n_genes))
+        data[:, 0] = 0.0  # gene 0 is all zeros
+        labels = (["control"] * n_ctrl
+                  + [f"p{i}" for i in range(n_perts) for _ in range(cpp)])
+        obs = pd.DataFrame({"perturbation": labels},
+                           index=[f"c{i}" for i in range(n_cells)])
+        var = pd.DataFrame(index=[f"g{i}" for i in range(n_genes)])
+        adata = ad.AnnData(sp.csr_matrix(data), obs=obs, var=var)
+        sc.pp.normalize_total(adata, target_sum=1e4)
+        sc.pp.log1p(adata)
+        adata.X = sp.csr_matrix(adata.X)
+        path = tmp_path / "allzero.h5ad"
+        adata.write(path)
+        result = wilcoxon_test(path, perturbation_column="perturbation",
+                               control_label="control", output_dir=tmp_path)
+        for label in [f"p{i}" for i in range(n_perts)]:
+            assert result[label].pvalue[0] == 1.0, "All-zero gene should have p=1"

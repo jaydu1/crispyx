@@ -105,6 +105,7 @@ else
         --env "PYTHONPATH=/workspace/src:/workspace" \
         --env "NUMBA_NUM_THREADS=1" \
         --env "PYTHONUNBUFFERED=1" \
+        --env "R_HOME=/usr/lib/R" \
         "$SIF_FILE" \
         python3 /workspace/benchmarking/tools/numba_warmup.py
     echo "Numba warmup complete."
@@ -122,6 +123,7 @@ singularity exec \
     --env "OPENBLAS_NUM_THREADS=$N_CORES" \
     --env "NUMBA_NUM_THREADS=$N_CORES" \
     --env "PYTHONUNBUFFERED=1" \
+    --env "R_HOME=/usr/lib/R" \
     "$SIF_FILE" \
     bash -c "$CMD"
 

@@ -1557,8 +1557,14 @@ def quality_control_summary(
         # 2x: one copy to load + one working copy
         estimated_memory_gb = n_obs * n_vars * _itemsize * 2 / 1e9
     else:
-        # For sparse formats the compressed size is a reasonable proxy
-        estimated_memory_gb = file_size_gb * 2
+        # For sparse HDF5 formats, the compressed file size significantly
+        # underestimates the in-memory footprint.  HDF5 gzip compression
+        # achieves 3-5× for sparse scRNA-seq data, so a 27 GB file expands to
+        # 80+ GB when loaded as a scipy CSR matrix.  QC operations then create
+        # additional working copies (boolean indexing, tocsr(), etc.), raising
+        # peak usage to ~4-6× the compressed file size.
+        # Use 4× as a conservative estimate to avoid OOM on large datasets.
+        estimated_memory_gb = file_size_gb * 4
     
     # Determine chunk size for streaming paths
     if chunk_size is None:
@@ -1598,10 +1604,15 @@ def quality_control_summary(
     }
     
     # Select strategy
-    if not force_streaming and estimated_memory_gb < memory_limit_gb:
+    # Cap the in-memory threshold at 50 GB to avoid OOM on nodes with very
+    # high memory_limit_gb (e.g., 500 GB auto-detected on 1 TB HPC nodes).
+    # On a 128 GB node this allows in-memory QC for files up to ~12.5 GB
+    # (estimated_memory = file_size × 4 < 50 GB → file < 12.5 GB).
+    _in_memory_threshold_gb = min(memory_limit_gb * 0.6, 50.0)
+    if not force_streaming and estimated_memory_gb < _in_memory_threshold_gb:
         # Option A: In-memory for small datasets
         logger.info(
-            f"Using in-memory QC (file: {file_size_gb:.2f}GB, limit: {memory_limit_gb:.2f}GB)"
+            f"Using in-memory QC (estimated: {estimated_memory_gb:.1f}GB, threshold: {_in_memory_threshold_gb:.1f}GB)"
         )
         return _qc_in_memory(path, **common_kwargs)
     

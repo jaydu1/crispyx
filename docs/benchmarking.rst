@@ -2,9 +2,9 @@ Benchmarking
 ============
 
 The benchmarking toolkit automates comparisons between the streaming
-implementations in this project. Generate the synthetic demo dataset with
-``python benchmarking/generate_demo_dataset.py`` (or supply your own data) and
-run the benchmark suite against any compatible ``.h5ad`` file that exposes
+implementations in this project. Supply your own data (or generate a synthetic
+demo dataset with ``python benchmarking/generate_demo_dataset.py``) and run the
+benchmark suite against any compatible ``.h5ad`` file that exposes
 ``perturbation`` and ``gene_symbols`` columns.
 
 Running benchmarks
@@ -12,10 +12,9 @@ Running benchmarks
 
 .. code-block:: bash
 
-   python benchmarking/run_benchmarks.py \
-       --data-path data/demo_benchmark.h5ad \
-       --time-limit 300 \
-       --memory-limit 4.0
+   cd benchmarking
+   ./run_benchmark.sh config/Adamson.yaml          # single dataset
+   ./run_benchmark.sh config/*.yaml                 # all datasets
 
 Outputs
 -------
@@ -64,4 +63,4 @@ estimates toward zero.
 Latest Adamson_subset benchmark
 -------------------------------
 
-For the most recent Adamson_subset run (2025-11-26), see :doc:`Adamson_subset_results`.
+For the most recent Adamson_subset run (2026-03-24), see :doc:`Adamson_subset_results`.

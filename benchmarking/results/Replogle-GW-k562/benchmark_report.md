@@ -4,17 +4,37 @@
 
 ### Preprocessing / QC
 
-| Package | Method | Status | Total (s) | Memory (MB) | Cells | Genes |
-| --- | --- | --- | --- | --- | --- | --- |
-| crispyx | QC filter | success | 1352.96 | 314959.51 | 1971608.0 | 8248.0 |
-| scanpy | QC filter | memory_limit | 65.34 | 79083.5 |  |  |
+| Package | Method | Status | Total (s) | Memory (MB) |
+| --- | --- | --- | --- | --- |
+| crispyx | QC filter | error | 0.9 |  |
+| scanpy | QC filter | memory_limit | 1108.37 | 126242.98 |
+| crispyx | pseudobulk (avg log) | error | 0.55 |  |
+| crispyx | pseudobulk | error | 0.52 |  |
+
+
+### DE: t-test
+
+| Package | Method | Status | Total (s) | Memory (MB) |
+| --- | --- | --- | --- | --- |
+| scanpy | t-test | error | 436.01 | 67600.28 |
+| crispyx | t-test | error | 2.58 | 325.82 |
+
+
+### DE: Wilcoxon
+
+| Package | Method | Status | Total (s) | Memory (MB) |
+| --- | --- | --- | --- | --- |
+| crispyx | Wilcoxon | error | 2.54 | 320.29 |
+| scanpy | Wilcoxon | memory_limit | 780.32 | 97825.33 |
 
 
 ### DE: NB GLM
 
-| Package | Method | Status | Total (s) | Memory (MB) | Groups |
-| --- | --- | --- | --- | --- | --- |
-| crispyx | NB-GLM | success | 6894.97 | 26493.15 | 9866 |
+| Package | Method | Status | Total (s) | Memory (MB) |
+| --- | --- | --- | --- | --- |
+| crispyx | NB-GLM | error | 5.61 | 322.75 |
+| edgeR | NB-GLM | error | 702.59 |  |
+| pertpy | NB-GLM | timeout | 86405.1 |  |
 
 
 ## 2. Performance Comparison
@@ -28,16 +48,6 @@ _Correlation metrics between crispyx and reference methods. ✅ >0.95, ⚠️ 0.
 _Overlap ratio of top-k DE genes between methods. ✅ >0.7, ⚠️ 0.5-0.7, ❌ <0.5_
 
 _No overlap data available._
-
-### Overlap Heatmaps (Top-100)
-
-#### Effect Size
-
-![Effect Size Top-100 Overlap](benchmark_effect_top_100_overlap.png)
-
-#### P-value
-
-![P-value Top-100 Overlap](benchmark_pvalue_top_100_overlap.png)
 
 ---
 

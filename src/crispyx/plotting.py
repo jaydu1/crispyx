@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Iterable, Literal, Sequence
 
 import anndata as ad
 import h5py
@@ -18,6 +18,7 @@ import scipy.sparse as sp
 
 from .data import (
     AnnData,
+    OverlapResult,
     iter_matrix_chunks,
     normalize_total_block,
     read_backed,
@@ -1328,3 +1329,96 @@ def plot_umap(
         return_fig=return_fig,
         **kwargs,
     )
+
+
+# =============================================================================
+# Overlap heatmap (Feature 5)
+# =============================================================================
+
+def plot_overlap_heatmap(
+    result,
+    *,
+    metric="jaccard",
+    ax=None,
+    cmap="Blues",
+    annot=True,
+    fmt=None,
+    title=None,
+):
+    """Heatmap of pairwise overlap statistics.
+
+    Parameters
+    ----------
+    result
+        :class:`~crispyx.data.OverlapResult` from
+        :func:`~crispyx.data.compute_overlap`.
+    metric
+        ``"jaccard"`` (default) or ``"count"``.
+    ax
+        Existing :class:`matplotlib.axes.Axes`; a new figure is created if
+        ``None``.
+    cmap
+        Matplotlib colormap name.
+    annot
+        Annotate each cell with the numeric value.
+    fmt
+        Number format. Defaults to ``".2f"`` for Jaccard and ``"d"`` for
+        counts.
+    title
+        Figure title. Defaults to ``"Jaccard similarity"`` or
+        ``"Overlap counts"``.
+
+    Returns
+    -------
+    matplotlib.axes.Axes or None
+    """
+    plt = _require_matplotlib()
+    if plt is None:
+        return None
+
+    data = result.jaccard_matrix if metric == "jaccard" else result.count_matrix
+    default_fmt = ".2f" if metric == "jaccard" else "d"
+    fmt = fmt or default_fmt
+    title = title or (
+        "Jaccard similarity" if metric == "jaccard" else "Overlap counts"
+    )
+    n = len(data)
+
+    try:
+        import seaborn as sns  # type: ignore[import]
+        if ax is None:
+            _, ax = plt.subplots(figsize=(max(4, n * 0.8), max(3, n * 0.7)))
+        sns.heatmap(
+            data,
+            ax=ax,
+            cmap=cmap,
+            annot=annot,
+            fmt=fmt,
+            linewidths=0.5,
+            square=True,
+            vmin=0,
+            vmax=1.0 if metric == "jaccard" else None,
+            cbar_kws={"shrink": 0.6},
+        )
+        ax.set_title(title)
+    except ImportError:
+        if ax is None:
+            _, ax = plt.subplots(figsize=(max(4, n * 0.8), max(3, n * 0.7)))
+        arr = data.to_numpy(dtype=float)
+        vmax = 1.0 if metric == "jaccard" else None
+        im = ax.imshow(arr, aspect="auto", cmap=cmap, vmin=0, vmax=vmax)
+        ax.set_xticks(range(n))
+        ax.set_xticklabels(data.columns, rotation=45, ha="right")
+        ax.set_yticks(range(n))
+        ax.set_yticklabels(data.index)
+        if annot:
+            for i in range(arr.shape[0]):
+                for j in range(arr.shape[1]):
+                    ax.text(
+                        j, i, f"{arr[i, j]:{fmt}}",
+                        ha="center", va="center", fontsize=8,
+                    )
+        ax.figure.colorbar(im, ax=ax, shrink=0.6)
+        ax.set_title(title)
+
+    return ax

@@ -16,10 +16,21 @@ if str(SRC_PATH) not in sys.path:
 
 from crispyx.data import (
     AnnData,
+    OverlapResult,
     calculate_nb_glm_chunk_size,
+    compute_overlap,
+    detect_gene_symbol_column,
+    detect_perturbation_column,
     ensure_gene_symbol_column,
+    infer_columns,
+    load_obs,
+    load_var,
+    normalise_perturbation_labels,
     read_h5ad_ondisk,
     resolve_control_label,
+    standardise_gene_names,
+    write_obs,
+    write_var,
 )
 from crispyx.pseudobulk import compute_average_log_expression
 
@@ -181,3 +192,335 @@ def test_calculate_nb_glm_chunk_size_handles_none_n_groups():
         available_memory_gb=64,
     )
     assert 32 <= chunk_size <= 256
+
+
+# ============================================================================
+# Helper: create a minimal h5ad with categorical obs column
+# ============================================================================
+
+def _create_full_dataset(tmp_path: Path) -> Path:
+    """Dataset with varied obs/var metadata for Feature 1-4 tests."""
+    import scipy.sparse as sp
+
+    rng = np.random.default_rng(42)
+    x = rng.poisson(1.0, size=(6, 4)).astype(np.float32)
+    obs = pd.DataFrame(
+        {
+            "perturbation": pd.Categorical(["ctrl", "ctrl", "KO1", "KO1", "KO2", "KO2"]),
+            "batch": ["A", "A", "A", "B", "B", "B"],
+        },
+        index=[f"cell_{i}" for i in range(6)],
+    )
+    var = pd.DataFrame(
+        {
+            "gene_symbols": ["BRCA1", "TP53", "EGFR", "KRAS"],
+            "ensembl_id": ["ENSG00000012048.22", "ENSG00000141510.1", "ENSG00000146648.2", "ENSG00000133703.3"],
+        },
+        index=["BRCA1", "TP53", "EGFR", "KRAS"],
+    )
+    adata = ad.AnnData(sp.csr_matrix(x), obs=obs, var=var)
+    path = tmp_path / "full.h5ad"
+    adata.write(path)
+    return path
+
+
+# ============================================================================
+# Feature 1: load_obs / load_var / write_obs / write_var
+# ============================================================================
+
+class TestBackedMetadataEditing:
+    def test_load_obs_returns_dataframe(self, tmp_path):
+        path = _create_full_dataset(tmp_path)
+        df = load_obs(path)
+        assert isinstance(df, pd.DataFrame)
+        assert list(df.index) == [f"cell_{i}" for i in range(6)]
+        assert "perturbation" in df.columns
+        assert "batch" in df.columns
+
+    def test_load_obs_preserves_categorical(self, tmp_path):
+        path = _create_full_dataset(tmp_path)
+        df = load_obs(path)
+        assert isinstance(df["perturbation"].dtype, pd.CategoricalDtype)
+
+    def test_load_var_returns_dataframe(self, tmp_path):
+        path = _create_full_dataset(tmp_path)
+        df = load_var(path)
+        assert isinstance(df, pd.DataFrame)
+        assert "gene_symbols" in df.columns
+        assert len(df) == 4
+
+    def test_write_obs_round_trip(self, tmp_path):
+        path = _create_full_dataset(tmp_path)
+        df = load_obs(path)
+        df["new_col"] = ["x"] * len(df)
+        write_obs(path, df)
+        df2 = load_obs(path)
+        assert "new_col" in df2.columns
+        assert list(df2["new_col"]) == ["x"] * len(df)
+
+    def test_write_var_round_trip(self, tmp_path):
+        path = _create_full_dataset(tmp_path)
+        df = load_var(path)
+        df["extra"] = [1, 2, 3, 4]
+        write_var(path, df)
+        df2 = load_var(path)
+        assert "extra" in df2.columns
+        assert list(df2["extra"]) == [1, 2, 3, 4]
+
+    def test_x_untouched_after_write_obs(self, tmp_path):
+        """write_obs must not corrupt the X matrix."""
+        path = _create_full_dataset(tmp_path)
+        import anndata as ad_mod
+        before = ad_mod.read_h5ad(path).X.toarray()
+        df = load_obs(path)
+        df["flag"] = 0
+        write_obs(path, df)
+        after = ad_mod.read_h5ad(path).X.toarray()
+        np.testing.assert_array_equal(before, after)
+
+    def test_write_obs_shape_mismatch_raises(self, tmp_path):
+        import pytest as _pytest
+        path = _create_full_dataset(tmp_path)
+        df = load_obs(path).iloc[:3]  # wrong size
+        with _pytest.raises(ValueError, match="rows"):
+            write_obs(path, df)
+
+    def test_write_var_shape_mismatch_raises(self, tmp_path):
+        import pytest as _pytest
+        path = _create_full_dataset(tmp_path)
+        df = load_var(path).iloc[:2]  # wrong size
+        with _pytest.raises(ValueError, match="rows"):
+            write_var(path, df)
+
+
+# ============================================================================
+# Feature 2: standardise_gene_names
+# ============================================================================
+
+class TestStandardiseGeneNames:
+    def test_strip_version_suffix(self, tmp_path):
+        path = _create_full_dataset(tmp_path)
+        result = standardise_gene_names(path, column="ensembl_id", inplace=False)
+        assert result is not None
+        assert not any("." in v for v in result)
+
+    def test_strip_version_inplace(self, tmp_path):
+        path = _create_full_dataset(tmp_path)
+        ret = standardise_gene_names(path, column="ensembl_id", inplace=True)
+        assert ret is None
+        df = load_var(path)
+        assert not any("." in v for v in df["ensembl_id"])
+
+    def test_mt_prefix_normalisation(self, tmp_path):
+        x = np.ones((2, 3), dtype=np.float32)
+        var = pd.DataFrame(index=["mt-nd1", "MT-CO1", "ACTB"])
+        adata = ad.AnnData(x, var=var)
+        path = tmp_path / "mt.h5ad"
+        adata.write(path)
+        result = standardise_gene_names(
+            path, column=None, strip_version=False, inplace=False
+        )
+        assert result is not None
+        assert result.tolist() == ["MT-nd1", "MT-CO1", "ACTB"]
+
+    def test_missing_column_raises(self, tmp_path):
+        import pytest as _pytest
+        path = _create_full_dataset(tmp_path)
+        with _pytest.raises(KeyError, match="nonexistent"):
+            standardise_gene_names(path, column="nonexistent", inplace=False)
+
+    def test_no_op_when_flags_off(self, tmp_path):
+        path = _create_full_dataset(tmp_path)
+        before = load_var(path)["gene_symbols"].tolist()
+        result = standardise_gene_names(
+            path,
+            column="gene_symbols",
+            strip_version=False,
+            normalise_mt_prefix=False,
+            inplace=False,
+        )
+        assert result is not None
+        assert result.tolist() == before
+
+
+# ============================================================================
+# Feature 3: normalise_perturbation_labels
+# ============================================================================
+
+class TestNormalisePerturbationLabels:
+    def _make_path(self, tmp_path, labels):
+        x = np.ones((len(labels), 2), dtype=np.float32)
+        obs = pd.DataFrame({"perturbation": labels}, index=range(len(labels)))
+        adata = ad.AnnData(x, obs=obs)
+        path = tmp_path / "pert.h5ad"
+        adata.write(path)
+        return path
+
+    def test_strip_prefixes(self, tmp_path):
+        path = self._make_path(tmp_path, ["sg-BRCA1", "sg-TP53", "sgctrl"])
+        result = normalise_perturbation_labels(
+            path, "perturbation", strip_prefixes=["sg-"], inplace=False
+        )
+        assert result is not None
+        assert result.tolist() == ["BRCA1", "TP53", "sgctrl"]
+
+    def test_strip_suffixes(self, tmp_path):
+        path = self._make_path(tmp_path, ["BRCA1_KO", "TP53_KD", "GENE3_other"])
+        result = normalise_perturbation_labels(
+            path, "perturbation", strip_suffixes=["_KO", "_KD"], inplace=False
+        )
+        assert result is not None
+        assert result.tolist() == ["BRCA1", "TP53", "GENE3_other"]
+
+    def test_canonical_control_unification(self, tmp_path):
+        labels = ["ctrl", "NTC", "GENE1", "scramble", "non-targeting"]
+        path = self._make_path(tmp_path, labels)
+        result = normalise_perturbation_labels(
+            path, "perturbation", canonical_control="NTC", inplace=False
+        )
+        assert result is not None
+        for idx in [0, 1, 3, 4]:
+            assert result.iloc[idx] == "NTC"
+        assert result.iloc[2] == "GENE1"
+
+    def test_custom_control_aliases(self, tmp_path):
+        path = self._make_path(tmp_path, ["MyCtrl", "GENE2"])
+        result = normalise_perturbation_labels(
+            path, "perturbation",
+            control_aliases=["myctrl"],
+            canonical_control="NTC",
+            inplace=False,
+        )
+        assert result is not None
+        assert result.iloc[0] == "NTC"
+        assert result.iloc[1] == "GENE2"
+
+    def test_strip_suffix_regex(self, tmp_path):
+        path = self._make_path(tmp_path, ["GENE1_P1P2", "GENE2_P3", "ctrl"])
+        result = normalise_perturbation_labels(
+            path, "perturbation",
+            strip_suffix_regex=r"_P\d+P?\d*$",
+            inplace=False,
+        )
+        assert result is not None
+        assert result.tolist()[0] == "GENE1"
+        assert result.tolist()[1] == "GENE2"
+
+    def test_inplace_writes_back(self, tmp_path):
+        path = self._make_path(tmp_path, ["sg-BRCA1", "ctrl"])
+        normalise_perturbation_labels(
+            path, "perturbation", strip_prefixes=["sg-"], inplace=True
+        )
+        df = load_obs(path)
+        assert df["perturbation"].tolist() == ["BRCA1", "NTC"]
+
+    def test_missing_column_raises(self, tmp_path):
+        import pytest as _pytest
+        path = self._make_path(tmp_path, ["a", "b"])
+        with _pytest.raises(KeyError, match="missing_col"):
+            normalise_perturbation_labels(path, "missing_col", inplace=False)
+
+
+# ============================================================================
+# Feature 4: detect_perturbation_column / detect_gene_symbol_column / infer_columns
+# ============================================================================
+
+class TestAutoDetect:
+    def test_detect_perturbation_column_finds_standard_name(self, tmp_path):
+        path = _create_full_dataset(tmp_path)
+        col = detect_perturbation_column(path, verbose=False)
+        assert col == "perturbation"
+
+    def test_detect_perturbation_column_returns_none_for_numeric_cols(self, tmp_path):
+        x = np.ones((4, 2), dtype=np.float32)
+        obs = pd.DataFrame({"count": [1, 2, 3, 4]})
+        adata = ad.AnnData(x, obs=obs)
+        path = tmp_path / "numeric.h5ad"
+        adata.write(path)
+        # Only numeric column: low score, should return None (int dtype → no +2)
+        col = detect_perturbation_column(path, verbose=False)
+        # Column name "count" is not in aliases → score = 0+0+1 (4 unique, 2–5000)
+        # → could be returned or not; we just check it doesn't crash
+        assert col is None or isinstance(col, str)
+
+    def test_detect_perturbation_column_boosts_control_label(self, tmp_path):
+        x = np.ones((4, 2), dtype=np.float32)
+        obs = pd.DataFrame({
+            "pert": pd.Categorical(["ctrl", "ctrl", "KO1", "KO2"]),
+            "sample": pd.Categorical(["s1", "s2", "s3", "s4"]),
+        })
+        adata = ad.AnnData(x, obs=obs)
+        path = tmp_path / "ctrl.h5ad"
+        adata.write(path)
+        col = detect_perturbation_column(path, control_label="ctrl", verbose=False)
+        assert col == "pert"
+
+    def test_detect_gene_symbol_column(self, tmp_path):
+        path = _create_full_dataset(tmp_path)
+        col = detect_gene_symbol_column(path, verbose=False)
+        assert col == "gene_symbols"
+
+    def test_infer_columns_returns_dict(self, tmp_path):
+        path = _create_full_dataset(tmp_path)
+        result = infer_columns(path, verbose=False)
+        assert "perturbation_column" in result
+        assert "gene_name_column" in result
+        assert result["perturbation_column"] == "perturbation"
+        assert result["gene_name_column"] == "gene_symbols"
+
+
+# ============================================================================
+# Feature 5: compute_overlap / OverlapResult
+# ============================================================================
+
+class TestComputeOverlap:
+    def test_diagonal_equals_set_size(self):
+        sets = {"A": {"x", "y", "z"}, "B": {"x", "w"}}
+        result = compute_overlap(sets)
+        assert result.count_matrix.loc["A", "A"] == 3
+        assert result.count_matrix.loc["B", "B"] == 2
+
+    def test_jaccard_matrix_symmetric(self):
+        sets = {"A": {1, 2, 3}, "B": {2, 3, 4}}
+        result = compute_overlap(sets)
+        j = result.jaccard_matrix
+        assert abs(j.loc["A", "B"] - j.loc["B", "A"]) < 1e-12
+
+    def test_jaccard_values_in_range(self):
+        sets = {"A": set(range(10)), "B": set(range(5, 15)), "C": set()}
+        result = compute_overlap(sets)
+        jv = result.jaccard_matrix.values.flatten()
+        assert (jv >= 0).all() and (jv <= 1).all()
+
+    def test_jaccard_diagonal_is_one(self):
+        sets = {"A": {1, 2, 3}, "B": {4, 5}}
+        result = compute_overlap(sets)
+        np.testing.assert_allclose(result.jaccard_matrix.values.diagonal(), 1.0)
+
+    def test_empty_set_intersection_zero(self):
+        sets = {"A": {1, 2}, "B": set()}
+        result = compute_overlap(sets)
+        assert result.count_matrix.loc["A", "B"] == 0
+        assert result.jaccard_matrix.loc["A", "B"] == 0.0
+
+    def test_set_sizes_correct(self):
+        sets = {"A": [1, 2, 3], "B": [1, 2]}
+        result = compute_overlap(sets)
+        assert result.set_sizes["A"] == 3
+        assert result.set_sizes["B"] == 2
+
+    def test_metric_count_only(self):
+        sets = {"A": {1, 2}, "B": {2, 3}}
+        result = compute_overlap(sets, metric="count")
+        assert result.count_matrix.loc["A", "B"] == 1
+        # jaccard_arr was never written, all zeros
+        assert result.jaccard_matrix.values.sum() == 0.0
+
+    def test_list_input_converted_to_set(self):
+        result = compute_overlap({"A": [1, 1, 2], "B": [2, 3]})
+        assert result.set_sizes["A"] == 2  # deduped
+        assert result.count_matrix.loc["A", "B"] == 1
+
+    def test_returns_overlap_result_instance(self):
+        result = compute_overlap({"X": {"a"}, "Y": {"b"}})
+        assert isinstance(result, OverlapResult)

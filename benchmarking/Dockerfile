@@ -35,6 +35,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     # R and build tools
     r-base \
     r-base-dev \
+    # Threaded BLAS for R — replaces single-threaded reference BLAS
+    libopenblas-dev \
     # Build dependencies for Python packages
     build-essential \
     gcc \
@@ -56,7 +58,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     # Cleanup
     && apt-get clean \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    # Configure R to use OpenBLAS instead of reference BLAS
+    && update-alternatives --set libblas.so.3-x86_64-linux-gnu \
+       /usr/lib/x86_64-linux-gnu/openblas-pthread/libblas.so.3
 
 # Install Bioconductor and R packages
 # Pin versions for reproducibility

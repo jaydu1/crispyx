@@ -313,10 +313,12 @@ def test_ensure_gene_symbol_column_fallback_to_index():
 def test_t_test_with_n_jobs(small_adata, tmp_path):
     """Test that t_test works with n_jobs parameter."""
     path, adata = small_adata
+    norm_path = tmp_path / "small_norm_njobs.h5ad"
+    _log_normalise_sparse(adata, norm_path)
     
     # Run with n_jobs=2
     results_parallel = t_test(
-        path,
+        norm_path,
         perturbation_column="perturbation",
         control_label="ctrl",
         gene_name_column="gene_symbols",
@@ -328,7 +330,7 @@ def test_t_test_with_n_jobs(small_adata, tmp_path):
     
     # Run without parallelization
     results_serial = t_test(
-        path,
+        norm_path,
         perturbation_column="perturbation",
         control_label="ctrl",
         gene_name_column="gene_symbols",
@@ -412,3 +414,68 @@ def test_wilcoxon_test_with_n_jobs(small_adata, tmp_path):
             rtol=1e-10,
             atol=1e-10,
         )
+
+
+def test_deseq2_size_factors_streaming_parity(tmp_path):
+    """Verify streaming DESeq2 size factors match the dense path exactly."""
+    from crispyx._size_factors import _deseq2_style_size_factors
+    from crispyx.data import iter_matrix_chunks, read_backed
+
+    # Create a small dataset where all genes are expressed in every cell
+    np.random.seed(42)
+    n_cells, n_genes = 200, 50
+    # Poisson counts — ensure every cell-gene has count >= 1
+    X = np.random.poisson(lam=5, size=(n_cells, n_genes)).astype(np.float32) + 1
+    adata = ad.AnnData(X=sp.csr_matrix(X))
+    adata.obs["pert"] = ["ctrl"] * 100 + ["pert_A"] * 100
+
+    h5ad_path = tmp_path / "test_sf.h5ad"
+    adata.write_h5ad(str(h5ad_path))
+
+    # Dense path (small data, threshold not hit)
+    sf_dense = _deseq2_style_size_factors(str(h5ad_path), chunk_size=64)
+
+    # Replicate the streaming logic directly to verify correctness
+    backed = read_backed(str(h5ad_path))
+    n_c = backed.n_obs
+    all_expressed = np.ones(n_genes, dtype=bool)
+    try:
+        for _, block in iter_matrix_chunks(backed, axis=0, chunk_size=64, convert_to_dense=False):
+            csr = sp.csr_matrix(block)
+            csc = csr.tocsc()
+            nnz_per_gene = np.diff(csc.indptr)
+            all_expressed[nnz_per_gene < csr.shape[0]] = False
+    finally:
+        backed.file.close()
+
+    all_expressed_idx = np.where(all_expressed)[0]
+    n_all_expressed = len(all_expressed_idx)
+    assert n_all_expressed == n_genes  # all genes expressed in all cells
+
+    # Streaming geo_means
+    log_sum = np.zeros(n_all_expressed, dtype=np.float64)
+    backed = read_backed(str(h5ad_path))
+    try:
+        for slc, block in iter_matrix_chunks(backed, axis=0, chunk_size=64, convert_to_dense=True):
+            block_arr = np.asarray(block, dtype=np.float64)
+            log_sum += np.log(np.maximum(block_arr[:, all_expressed_idx], 1e-300)).sum(axis=0)
+    finally:
+        backed.file.close()
+    geo_means = np.exp(log_sum / n_c)
+
+    # Streaming median of ratios
+    sf_streaming = np.full(n_c, np.nan, dtype=np.float64)
+    backed = read_backed(str(h5ad_path))
+    try:
+        for slc, block in iter_matrix_chunks(backed, axis=0, chunk_size=64, convert_to_dense=True):
+            block_arr = np.asarray(block, dtype=np.float64)
+            ratios = block_arr[:, all_expressed_idx] / geo_means
+            sf_streaming[slc] = np.median(ratios, axis=1)
+    finally:
+        backed.file.close()
+
+    # Apply same scaling as _deseq2_style_size_factors
+    scale_factor = np.exp(np.mean(np.log(np.clip(sf_streaming, 1e-12, None))))
+    sf_streaming = sf_streaming / scale_factor
+
+    np.testing.assert_allclose(sf_streaming, sf_dense, rtol=1e-10, atol=1e-12)

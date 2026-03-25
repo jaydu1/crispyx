@@ -33,8 +33,11 @@ from .data import (
     AnnData,
     calculate_optimal_chunk_size,
     calculate_optimal_gene_chunk_size,
+    calculate_wilcoxon_chunk_size,
     calculate_nb_glm_chunk_size,
+    drop_file_cache,
     ensure_gene_symbol_column,
+    get_matrix_storage_format,
     get_perturbation_slice,
     iter_matrix_chunks,
     needs_sorting_for_nbglm,
@@ -54,6 +57,7 @@ from .glm import (
     estimate_global_dispersion_streaming,
     fit_dispersion_trend,
     precompute_control_statistics,
+    precompute_control_statistics_streaming,
     precompute_global_dispersion,
     precompute_global_dispersion_from_path,
     shrink_dispersions,
@@ -68,6 +72,7 @@ from ._kernels import (
     _wilcoxon_sparse_batch_numba,
     _wilcoxon_all_perts_numba,
     _presort_control_nonzeros,
+    _compute_ctrl_tie_sums,
     _wilcoxon_presorted_ctrl_numba,
     _wilcoxon_batch_perts_presorted_numba,
     _ZERO_PARTITION_THRESHOLD,
@@ -96,6 +101,7 @@ from ._statistics import (
 )
 from ._memory import (
     _estimate_max_workers,
+    _get_available_memory_mb,
 )
 
 logger = logging.getLogger(__name__)
@@ -654,19 +660,19 @@ def t_test(
                 raise ValueError(
                     "t_test only supports sparse input matrices. Please provide a scipy sparse matrix (e.g., CSR/CSC)."
                 )
-            # Optionally warn if data looks like counts
+            # Raise if data looks like raw counts (matches scanpy's check_nonnegative_integers)
             if np.issubdtype(chunk.dtype, np.integer):
-                logger.warning(
-                    "Detected integer count data in t_test; input should be normalized/log-transformed. "
-                    "For reproducibility, please preprocess explicitly upstream."
+                raise ValueError(
+                    "Detected integer count data in t_test. "
+                    "Please log-normalize your data first (e.g. cx.pp.normalize_total_log1p)."
                 )
             elif np.issubdtype(chunk.dtype, np.floating):
                 non_zero = chunk.data[chunk.data > 0]
                 is_count_like = non_zero.size > 0 and np.all(np.isclose(non_zero, np.round(non_zero)))
                 if is_count_like:
-                    logger.warning(
-                        "Detected count-like floating point values in t_test; input should be normalized/log-transformed. "
-                        "Please ensure preprocessing is applied upstream for consistent results."
+                    raise ValueError(
+                        "Detected count-like (integer-valued) floating point data in t_test. "
+                        "Please log-normalize your data first (e.g. cx.pp.normalize_total_log1p)."
                     )
             break  # Only check the first chunk
 
@@ -1311,6 +1317,22 @@ def nb_glm_test(
     # Large datasets with many perturbations benefit from having cells sorted
     # by perturbation label, enabling contiguous reads instead of random access
     path = resolve_data_path(data)
+
+    # Warn if the on-disk matrix is stored in CSC format – row-slicing
+    # (used by size-factor computation and control-matrix loading) is
+    # extremely slow on CSC.  Recommend the CSR standardized file.
+    _storage_fmt = get_matrix_storage_format(path)
+    if _storage_fmt == "csc":
+        import warnings
+        warnings.warn(
+            f"The input file '{path.name}' stores its matrix in CSC format. "
+            "NB-GLM performs row-wise access (size factors, control matrix, "
+            "per-perturbation slices) which is very slow on CSC. "
+            "Use the CSR-format standardized file for much better performance.",
+            UserWarning,
+            stacklevel=2,
+        )
+
     if needs_sorting_for_nbglm(path, perturbation_column=perturbation_column):
         sorted_path = path.parent / f"{path.stem}_sorted.h5ad"
         if not sorted_path.exists():
@@ -2219,23 +2241,56 @@ def nb_glm_test(
         iter_memmap = _create_memmap("iterations", np.int32, fill=0)
         convergence_memmap = _create_memmap("converged", np.bool_, fill=False)
 
-        # Load control cells matrix once (all genes) - this is small enough to fit in memory
-        # since control is typically a subset of all cells
-        backed = read_backed(path)
-        try:
-            control_matrix = backed.X[control_mask, :]
-            if sp.issparse(control_matrix):
-                control_matrix = sp.csr_matrix(control_matrix, dtype=np.float64)
-            else:
-                control_matrix = np.asarray(control_matrix, dtype=np.float64)
-        finally:
-            backed.file.close()
-        
-        # Pre-compute control expression counts
-        if sp.issparse(control_matrix):
-            control_expr_counts = np.asarray(control_matrix.getnnz(axis=0)).ravel()
+        # Load control cells matrix once (all genes)
+        # For very large control groups, skip loading and use streaming path
+        control_matrix_gb = control_n * n_genes * 8 / 1e9  # dense float64
+        if memory_limit_gb is not None:
+            _ctrl_mem_limit = min(memory_limit_gb, _get_available_memory_mb() / 1000)
         else:
-            control_expr_counts = np.sum(control_matrix > 0, axis=0)
+            _ctrl_mem_limit = _get_available_memory_mb() / 1000
+        # Streaming threshold: control dense + 3 work arrays > 30% available memory
+        _ctrl_streaming_threshold = max_dense_fraction * _ctrl_mem_limit
+        use_streaming_control = (control_matrix_gb * 4) > _ctrl_streaming_threshold
+
+        if use_streaming_control:
+            logger.info(
+                f"Large control group: {control_n:,} cells × {n_genes:,} genes = "
+                f"{control_matrix_gb:.1f} GB dense. Using streaming control statistics."
+            )
+            control_matrix = None  # Not loaded — streaming will read from disk
+            # Compute control_expr_counts via streaming
+            control_expr_counts = np.zeros(n_genes, dtype=np.int64)
+            backed = read_backed(path)
+            try:
+                ctrl_indices = np.where(control_mask)[0]
+                _chunk = 4096
+                for _start in range(0, control_n, _chunk):
+                    _end = min(_start + _chunk, control_n)
+                    _idx = ctrl_indices[_start:_end]
+                    _blk = backed.X[_idx, :]
+                    if sp.issparse(_blk):
+                        control_expr_counts += np.asarray(_blk.getnnz(axis=0)).ravel()
+                    else:
+                        control_expr_counts += np.asarray((_blk > 0).sum(axis=0)).ravel()
+            finally:
+                backed.file.close()
+            drop_file_cache(path)  # Free page cache from streaming reads
+        else:
+            backed = read_backed(path)
+            try:
+                control_matrix = backed.X[control_mask, :]
+                if sp.issparse(control_matrix):
+                    control_matrix = sp.csr_matrix(control_matrix, dtype=np.float64)
+                else:
+                    control_matrix = np.asarray(control_matrix, dtype=np.float64)
+            finally:
+                backed.file.close()
+            drop_file_cache(path)  # Free page cache from control matrix read
+            # Pre-compute control expression counts
+            if sp.issparse(control_matrix):
+                control_expr_counts = np.asarray(control_matrix.getnnz(axis=0)).ravel()
+            else:
+                control_expr_counts = np.sum(control_matrix > 0, axis=0)
         
         # Compute pts_rest once (same for all perturbations)
         pts_rest_shared = np.divide(
@@ -2370,6 +2425,20 @@ def nb_glm_test(
             dispersion_scope == "global" and 
             shrink_dispersion
         )
+        
+        # When frozen control is enabled but streaming was not, retroactively
+        # switch to streaming.  The dense IRLS peak is 4× control_matrix_gb;
+        # streaming avoids that by processing chunks.  The loaded control
+        # matrix is freed because frozen stats replace it.
+        if can_use_frozen_control and not use_streaming_control and control_matrix is not None:
+            use_streaming_control = True
+            del control_matrix
+            control_matrix = None
+            gc.collect()
+            logger.info(
+                "Switching to streaming control statistics for frozen control mode "
+                f"(avoids {control_matrix_gb * 4:.1f} GB dense IRLS peak)."
+            )
         
         # Memory estimation for joblib parallel execution
         # IMPORTANT: joblib's loky backend serializes (pickles) all function arguments
@@ -2588,17 +2657,44 @@ def nb_glm_test(
                 # Note: Auto-detected freeze_control already logged in auto-detection block
             
             logger.info("Precomputing control cell statistics for cache optimization...")
-            control_offset = offset[control_mask]
-            control_cache = precompute_control_statistics(
-                control_matrix=control_matrix,
-                control_offset=control_offset,
-                max_iter=max_iter,
-                tol=tol,
-                min_mu=min_mu,
-                dispersion_method="moments",  # Fast initial estimate
-                global_size_factors=size_factors,  # Store global SF in cache
-                freeze_control=freeze_control,  # Enable frozen control mode
-            )
+            control_offset_arr = offset[control_mask]
+            if use_streaming_control:
+                # Streaming path: read control cells from disk in chunks
+                # Forces freeze_control=True (raw matrix never materialised)
+                if not freeze_control:
+                    logger.info(
+                        "Forcing freeze_control=True for streaming control statistics "
+                        "(raw control matrix too large to fit in memory)."
+                    )
+                    freeze_control = True
+                control_cache = precompute_control_statistics_streaming(
+                    path=path,
+                    control_mask=control_mask,
+                    control_offset=control_offset_arr,
+                    max_iter=max_iter,
+                    tol=tol,
+                    min_mu=min_mu,
+                    global_size_factors=size_factors,
+                    freeze_control=True,
+                )
+                drop_file_cache(path)  # Free page cache from streaming IRLS
+            else:
+                control_cache = precompute_control_statistics(
+                    control_matrix=control_matrix,
+                    control_offset=control_offset_arr,
+                    max_iter=max_iter,
+                    tol=tol,
+                    min_mu=min_mu,
+                    dispersion_method="moments",  # Fast initial estimate
+                    global_size_factors=size_factors,  # Store global SF in cache
+                    freeze_control=freeze_control,  # Enable frozen control mode
+                )
+                # If frozen control, the cache holds sufficient statistics —
+                # the raw control_matrix is no longer needed.
+                if freeze_control and control_matrix is not None:
+                    del control_matrix
+                    control_matrix = None
+                    gc.collect()
             
             # Precompute global dispersion if dispersion_scope='global'
             if dispersion_scope == "global" and shrink_dispersion and use_map_dispersion:
@@ -2613,6 +2709,7 @@ def nb_glm_test(
                         all_cell_offset=offset,
                         fit_type="parametric",
                     )
+                    drop_file_cache(path)  # Free page cache from streaming reads
                 else:
                     # Load all cells for global dispersion estimation
                     backed = read_backed(path)
@@ -2640,6 +2737,7 @@ def nb_glm_test(
                     )
                     del all_cell_matrix  # Free memory
                     gc.collect()  # Force garbage collection before spawning workers
+                    drop_file_cache(path)  # Free page cache from full matrix read
                 
                 logger.info(f"Global dispersion precomputed: prior_var={control_cache.global_disp_prior_var:.4f}")
         
@@ -3080,6 +3178,22 @@ def _wilcoxon_test_streaming(
         f"(chunk_size={chunk_size})"
     )
 
+    def _check_not_count_like_streaming(chunk: sp.spmatrix) -> None:
+        """Raise ValueError if the first gene chunk looks like raw counts."""
+        if np.issubdtype(chunk.dtype, np.integer):
+            raise ValueError(
+                "Detected integer count data in wilcoxon_test. "
+                "Please log-normalize your data first (e.g. cx.pp.normalize_total_log1p)."
+            )
+        if np.issubdtype(chunk.dtype, np.floating):
+            non_zero = chunk.data[chunk.data > 0]
+            is_count_like = non_zero.size > 0 and np.all(np.isclose(non_zero, np.round(non_zero)))
+            if is_count_like:
+                raise ValueError(
+                    "Detected count-like (integer-valued) floating point data in wilcoxon_test. "
+                    "Please log-normalize your data first (e.g. cx.pp.normalize_total_log1p)."
+                )
+
     def _save_streaming_checkpoint(batch_idx: int) -> None:
         checkpoint_data = {
             "total_group_batches": n_batches,
@@ -3123,6 +3237,7 @@ def _wilcoxon_test_streaming(
                 batch_pert_idx = {label: np.where(labels == label)[0]
                                   for label in batch_candidates}
 
+                dtype_checked_streaming = False
                 for slc, block in iter_matrix_chunks(
                     backed, axis=1, chunk_size=chunk_size, convert_to_dense=False
                 ):
@@ -3130,6 +3245,9 @@ def _wilcoxon_test_streaming(
                         raise ValueError(
                             "wilcoxon_test only supports sparse input matrices."
                         )
+                    if not dtype_checked_streaming and batch_idx == 0:
+                        _check_not_count_like_streaming(block)
+                        dtype_checked_streaming = True
                     csr_block = sp.csr_matrix(block)  # Keep native dtype (float32)
                     n_chunk_genes = csr_block.shape[1]
 
@@ -3196,6 +3314,9 @@ def _wilcoxon_test_streaming(
                         # speedup: avoids redundant sort across 4955 groups)
                         ctrl_sorted_flat, ctrl_offsets, ctrl_n_nz, ctrl_n_z = \
                             _presort_control_nonzeros(control_dense)
+                        ctrl_tie_sums_s = _compute_ctrl_tie_sums(
+                            ctrl_sorted_flat, ctrl_offsets, ctrl_n_nz
+                        )
 
                         # Per-perturbation: pre-stack then call batched kernel
                         # (single prange over n_perts, avoids serial launch overhead)
@@ -3229,6 +3350,7 @@ def _wilcoxon_test_streaming(
                             ctrl_offsets,
                             ctrl_n_nz,
                             ctrl_n_z,
+                            ctrl_tie_sums_s,
                             all_pert_stacked_s,
                             pert_row_offsets_s,
                             valid_masks_2d_s,
@@ -3241,11 +3363,11 @@ def _wilcoxon_test_streaming(
                         )
 
                         gene_pos = slc.start + valid_gene_indices
-                        for idx in range(bs_local):
-                            batch_u[idx, gene_pos] = valid_u_s[idx]
-                            batch_z[idx, gene_pos] = valid_z_s[idx]
-                            batch_p[idx, gene_pos] = valid_p_s[idx]
-                            batch_effect[idx, gene_pos] = valid_eff_s[idx]
+                        # Vectorized 2-D fancy-index write (bs_local calls → 4 calls)
+                        batch_u[:, gene_pos] = valid_u_s
+                        batch_z[:, gene_pos] = valid_z_s
+                        batch_p[:, gene_pos] = valid_p_s
+                        batch_effect[:, gene_pos] = valid_eff_s
 
                     # LFC and pts for this chunk
                     for idx in range(bs):
@@ -3441,12 +3563,12 @@ def wilcoxon_test(
                 f"{'...' if len(_missing_perts) > 3 else ''} contain no cells"
             )
         
-        # Calculate adaptive gene chunk_size if not provided
-        # Wilcoxon iterates over genes (columns), so use gene chunk calculator
-        # Pass n_groups to account for output array memory scaling
+        # Calculate adaptive gene chunk_size if not provided.
+        # Use the dedicated Wilcoxon calculator: no n_groups cap (output arrays
+        # are memmapped to disk so RAM is independent of n_groups).
         if chunk_size is None:
-            chunk_size = calculate_optimal_gene_chunk_size(
-                backed.n_obs, backed.n_vars, n_groups=len(candidates),
+            chunk_size = calculate_wilcoxon_chunk_size(
+                backed.n_obs, backed.n_vars,
                 available_memory_gb=memory_limit_gb,
             )
     finally:
@@ -3540,25 +3662,31 @@ def wilcoxon_test(
             control_idx = np.where(control_mask)[0]
             pert_idx = {label: np.where(labels == label)[0] for label in candidates}
 
+            # Pre-build flat perturbation indices and row offsets once
+            # (avoids rebuilding inside the per-chunk stacking loop).
+            all_pert_flat_idx = np.concatenate([pert_idx[label] for label in candidates])
+            total_pert_cells = len(all_pert_flat_idx)
+            pert_row_offsets = np.zeros(n_groups + 1, dtype=np.int64)
+            for idx, label in enumerate(candidates):
+                pert_row_offsets[idx + 1] = pert_row_offsets[idx] + len(pert_idx[label])
+
             dtype_checked = False
 
-            def _warn_if_count_like(chunk: sp.spmatrix) -> bool:
+            def _check_not_count_like(chunk: sp.spmatrix) -> None:
+                """Raise ValueError if the chunk looks like raw counts."""
                 if np.issubdtype(chunk.dtype, np.integer):
-                    logger.warning(
-                        "Detected integer count data in wilcoxon_test; input should be normalized/log-transformed. "
-                        "For reproducibility, please preprocess explicitly upstream."
+                    raise ValueError(
+                        "Detected integer count data in wilcoxon_test. "
+                        "Please log-normalize your data first (e.g. cx.pp.normalize_total_log1p)."
                     )
-                    return True
                 if np.issubdtype(chunk.dtype, np.floating):
                     non_zero = chunk.data[chunk.data > 0]
                     is_count_like = non_zero.size > 0 and np.all(np.isclose(non_zero, np.round(non_zero)))
                     if is_count_like:
-                        logger.warning(
-                            "Detected count-like floating point values in wilcoxon_test; input should be normalized/log-transformed. "
-                            "Please ensure preprocessing is applied upstream for consistent results."
+                        raise ValueError(
+                            "Detected count-like (integer-valued) floating point data in wilcoxon_test. "
+                            "Please log-normalize your data first (e.g. cx.pp.normalize_total_log1p)."
                         )
-                    return bool(is_count_like)
-                return False
 
             # Track progress
             current_chunk = 0
@@ -3590,7 +3718,7 @@ def wilcoxon_test(
                             raise ValueError(
                                 "wilcoxon_test only supports sparse input matrices. Please provide a scipy sparse matrix (e.g., CSR/CSC)."
                             )
-                        _warn_if_count_like(block)
+                        _check_not_count_like(block)
                         dtype_checked = True
 
                     csr_block = sp.csr_matrix(block)  # Keep native dtype (float32)
@@ -3672,6 +3800,9 @@ def wilcoxon_test(
                         # speedup: avoids redundant sort across all groups)
                         ctrl_sorted_flat, ctrl_offsets, ctrl_n_nz, ctrl_n_z = \
                             _presort_control_nonzeros(control_dense)
+                        ctrl_tie_sums = _compute_ctrl_tie_sums(
+                            ctrl_sorted_flat, ctrl_offsets, ctrl_n_nz
+                        )
                         
                         # 7. Pre-allocate output arrays for valid genes
                         valid_u = np.zeros((n_groups, n_valid_genes), dtype=np.float64)
@@ -3683,23 +3814,9 @@ def wilcoxon_test(
                         # Single prange(n_perts) replaces n_perts serial kernel
                         # launches, eliminating the ~25ms prange thread-pool startup
                         # overhead per call (~50x speedup on kernel time).
-                        total_pert_cells = sum(
-                            len(pert_idx[label]) for label in candidates
-                        )
-                        all_pert_stacked = np.empty(
-                            (total_pert_cells, n_valid_genes), dtype=all_valid_dense.dtype
-                        )
-                        pert_row_offsets = np.zeros(n_groups + 1, dtype=np.int64)
-                        valid_masks_2d = np.empty(
-                            (n_groups, n_valid_genes), dtype=np.bool_
-                        )
-                        for idx, label in enumerate(candidates):
-                            rows = pert_idx[label]
-                            start = pert_row_offsets[idx]
-                            end = start + len(rows)
-                            pert_row_offsets[idx + 1] = end
-                            all_pert_stacked[start:end] = all_valid_dense[rows, :]
-                            valid_masks_2d[idx] = valid_masks[idx][valid_gene_indices]
+                        # Vectorised: single fancy-index replaces n_groups-iteration loop.
+                        all_pert_stacked = all_valid_dense[all_pert_flat_idx, :]
+                        valid_masks_2d = np.array([vm[valid_gene_indices] for vm in valid_masks])
 
                         _wilcoxon_batch_perts_presorted_numba(
                             control_dense,
@@ -3707,6 +3824,7 @@ def wilcoxon_test(
                             ctrl_offsets,
                             ctrl_n_nz,
                             ctrl_n_z,
+                            ctrl_tie_sums,
                             all_pert_stacked,
                             pert_row_offsets,
                             valid_masks_2d,
@@ -3719,47 +3837,41 @@ def wilcoxon_test(
                         )
                         
                         # 9. Map results back to full chunk gene indices
-                        for idx in range(n_groups):
-                            chunk_u[idx, valid_gene_indices] = valid_u[idx]
-                            chunk_z[idx, valid_gene_indices] = valid_z[idx]
-                            chunk_p[idx, valid_gene_indices] = valid_p[idx]
-                            chunk_effect[idx, valid_gene_indices] = valid_effect[idx]
+                        # Vectorised: single 2-D fancy-index write per array
+                        # replaces n_groups Python-loop iterations.
+                        chunk_u[:, valid_gene_indices] = valid_u
+                        chunk_z[:, valid_gene_indices] = valid_z
+                        chunk_p[:, valid_gene_indices] = valid_p
+                        chunk_effect[:, valid_gene_indices] = valid_effect
 
-                    # 10. Compute LFC and pts for all perturbations (vectorized)
-                    for idx, label in enumerate(candidates):
-                        group_expr = pert_expr_counts[idx]
-                        group_mean = pert_means[idx]
-                        n_pert = pert_n_cells[idx]
-                        valid = valid_masks[idx]
-                        
-                        # pts
-                        pts = np.divide(
-                            group_expr,
-                            float(n_pert),
-                            out=np.zeros_like(group_expr, dtype=float),
-                            where=n_pert > 0,
-                        )
-                        pts = np.where(valid, pts, 0.0)
-                        pts_rest = np.where(valid, control_pts, 0.0)
-                        
-                        # Log2 fold change
-                        lfc = np.log2((np.expm1(group_mean) + 1e-9) / control_mean_expm1)
-                        lfc = np.where(valid, lfc, 0.0)
-                        
-                        chunk_pts[idx] = pts
-                        chunk_pts_rest[idx] = pts_rest
-                        chunk_lfc[idx] = lfc
+                    # 10. Compute LFC and pts — batch vectorised
+                    # (replaces n_groups Python-loop iterations)
+                    all_expr = np.array(pert_expr_counts)         # (n_groups, n_chunk_genes)
+                    all_means = np.array(pert_means)              # (n_groups, n_chunk_genes)
+                    all_n = np.array(pert_n_cells, dtype=np.float64)  # (n_groups,)
+                    valid_arr = np.array(valid_masks)             # (n_groups, n_chunk_genes)
 
-                    # 13. Write results to memmap
-                    for idx in range(n_groups):
-                        gene_indices = chunk_gene_indices
-                        u_matrix[idx, gene_indices] = chunk_u[idx]
-                        pvalue_matrix[idx, gene_indices] = chunk_p[idx]
-                        effect_matrix[idx, gene_indices] = chunk_effect[idx]
-                        z_matrix[idx, gene_indices] = chunk_z[idx]
-                        lfc_matrix[idx, gene_indices] = chunk_lfc[idx]
-                        pts_matrix[idx, gene_indices] = chunk_pts[idx]
-                        pts_rest_matrix[idx, gene_indices] = chunk_pts_rest[idx]
+                    n_col = all_n[:, np.newaxis]                  # (n_groups, 1)
+                    raw_pts = np.where(n_col > 0, all_expr / n_col, 0.0)
+                    chunk_pts[:] = np.where(valid_arr, raw_pts, 0.0).astype(np.float32)
+                    chunk_pts_rest[:] = np.where(
+                        valid_arr, control_pts[np.newaxis, :], 0.0
+                    ).astype(np.float32)
+
+                    raw_lfc = np.log2(
+                        (np.expm1(all_means) + 1e-9) / control_mean_expm1[np.newaxis, :]
+                    )
+                    chunk_lfc[:] = np.where(valid_arr, raw_lfc, 0.0)
+
+                    # 13. Write results to memmap — vectorized 2-D slice
+                    # (7 calls instead of 7 × n_groups; better cache locality)
+                    u_matrix[:, slc] = chunk_u
+                    pvalue_matrix[:, slc] = chunk_p
+                    effect_matrix[:, slc] = chunk_effect
+                    z_matrix[:, slc] = chunk_z
+                    lfc_matrix[:, slc] = chunk_lfc
+                    pts_matrix[:, slc] = chunk_pts
+                    pts_rest_matrix[:, slc] = chunk_pts_rest
                     
                     # Release transient chunk arrays and return freed pages to OS
                     # (prevents glibc arena fragmentation across many gene chunks)
@@ -3768,9 +3880,9 @@ def wilcoxon_test(
                     del pert_n_cells, valid_masks
                     if n_valid_genes > 0:
                         del all_valid_dense, control_dense
-                        del ctrl_sorted_flat, ctrl_offsets, ctrl_n_nz, ctrl_n_z
+                        del ctrl_sorted_flat, ctrl_offsets, ctrl_n_nz, ctrl_n_z, ctrl_tie_sums
                         del all_pert_stacked, valid_u, valid_z, valid_p, valid_effect
-                        del pert_row_offsets, valid_masks_2d
+                        del valid_masks_2d
                     _release_chunk_memory()
 
                     # Update progress and checkpoint

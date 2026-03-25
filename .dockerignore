@@ -1,6 +1,6 @@
 # Exclude large data files and build artifacts
 data/
-notebooks/tutorial_outputs/
+docs/tutorial_outputs/
 
 # Benchmarking outputs (can be 100s of GB)
 benchmarking/results/

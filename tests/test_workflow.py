@@ -331,8 +331,13 @@ def test_scanpy_style_namespaces_match_direct(tmp_path):
         pseudo_wrapped_mem.var_names, pseudo_direct_mem.var_names
     )
 
+    # Normalise QC-filtered data before t-test (which rejects count-like data)
+    qc_norm = _log_normalise_sparse(qc_wrapped_mem)
+    qc_norm_path = tmp_path / "qc_filtered_ttest_norm.h5ad"
+    qc_norm.write(qc_norm_path)
+
     wald_wrapped = cx.tl.rank_genes_groups(
-        qc_wrapped,
+        qc_norm_path,
         perturbation_column="perturbation",
         method="t-test",
         control_label="ctrl",
@@ -342,7 +347,7 @@ def test_scanpy_style_namespaces_match_direct(tmp_path):
         min_cells_expressed=0,
     )
     wald_direct = t_test(
-        qc_direct.filtered,
+        qc_norm_path,
         perturbation_column="perturbation",
         control_label="ctrl",
         gene_name_column="gene_symbols",

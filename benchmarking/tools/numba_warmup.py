@@ -16,6 +16,7 @@ sys.path.insert(0, "/workspace/src")
 import numpy as np
 from crispyx._kernels import (
     _presort_control_nonzeros,
+    _compute_ctrl_tie_sums,
     _wilcoxon_batch_perts_presorted_numba,
     _wilcoxon_single_pert_presorted,
     _ZERO_PARTITION_THRESHOLD,
@@ -27,6 +28,7 @@ for dt in (np.float32, np.float64):
     ctrl = rng.exponential(1.0, (100, 32)).astype(dt)
     ctrl[ctrl < 0.5] = 0.0
     flat, off, nnz, nz = _presort_control_nonzeros(ctrl)
+    tie_sums = _compute_ctrl_tie_sums(flat, off, nnz)
 
     stk = rng.exponential(0.5, (150, 32)).astype(dt)
     stk[stk < 0.5] = 0.0
@@ -38,7 +40,7 @@ for dt in (np.float32, np.float64):
     e = np.zeros((6, 32), dtype=np.float64)
 
     _wilcoxon_batch_perts_presorted_numba(
-        ctrl, flat, off, nnz, nz, stk, offsets, vm,
+        ctrl, flat, off, nnz, nz, tie_sums, stk, offsets, vm,
         True, _ZERO_PARTITION_THRESHOLD, u, z, p, e,
     )
 

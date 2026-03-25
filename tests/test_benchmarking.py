@@ -82,8 +82,11 @@ def test_create_benchmark_suite_infers_control_label(tmp_path: Path) -> None:
     assert methods  # sanity check
     # Only check methods that don't depend on other methods (lfcShrink methods
     # don't have control_label since they process results from base methods)
+    # Also exclude format-conversion methods (crispyx_standardize_csr) which
+    # don't operate on perturbation labels.
     primary_methods = {
-        name: method for name, method in methods.items() if method.depends_on is None
+        name: method for name, method in methods.items()
+        if method.depends_on is None and "control_label" in method.kwargs
     }
     control_labels = {
         method.kwargs.get("control_label") for method in primary_methods.values()

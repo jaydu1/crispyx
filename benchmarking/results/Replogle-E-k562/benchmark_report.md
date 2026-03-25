@@ -6,35 +6,35 @@
 
 | Package | Method | Status | Total (s) | Memory (MB) | Cells | Genes |
 | --- | --- | --- | --- | --- | --- | --- |
-| crispyx | QC filter | success | 222.4 | 8662.86 | 304114.0 | 8563.0 |
-| scanpy | QC filter | success | 68.33 | 40198.45 | 304114.0 | 8563.0 |
-| crispyx | pseudobulk (avg log) | success | 34.74 | 947.57 |  |  |
-| crispyx | pseudobulk | success | 27.89 | 872.97 |  |  |
+| crispyx | QC filter | success | 39.74 | 30583.45 | 304114.0 | 8563.0 |
+| scanpy | QC filter | success | 83.77 | 40468.15 | 304114.0 | 8563.0 |
+| crispyx | pseudobulk (avg log) | success | 138.9 | 1581.11 |  |  |
+| crispyx | pseudobulk | success | 30.39 | 1373.11 |  |  |
 
 
 ### DE: t-test
 
 | Package | Method | Status | Total (s) | Memory (MB) | Groups |
 | --- | --- | --- | --- | --- | --- |
-| scanpy | t-test | success | 136.61 | 14699.11 | 2057 |
-| crispyx | t-test | success | 52.49 | 1525.5 | 2057 |
+| scanpy | t-test | success | 181.83 | 14844.59 | 2057 |
+| crispyx | t-test | success | 82.7 | 1708.09 | 2057 |
 
 
 ### DE: Wilcoxon
 
 | Package | Method | Status | Total (s) | Memory (MB) | Groups |
 | --- | --- | --- | --- | --- | --- |
-| crispyx | Wilcoxon | success | 526.47 | 23009.71 | 2057 |
-| scanpy | Wilcoxon | success | 4910.08 | 23561.61 | 2057 |
+| crispyx | Wilcoxon | success | 622.28 | 17029.66 | 2057 |
+| scanpy | Wilcoxon | success | 20530.74 | 23824.7 | 2057 |
 
 
 ### DE: NB GLM
 
 | Package | Method | Status | Total (s) | Memory (MB) | Groups |
 | --- | --- | --- | --- | --- | --- |
-| crispyx | NB-GLM | success | 8628.82 | 33064.37 | 2057.0 |
-| edgeR | NB-GLM | memory_limit | 2437.11 |  |  |
-| pertpy | NB-GLM | timeout | 10860.11 |  |  |
+| crispyx | NB-GLM | success | 7311.27 | 5692.43 | 2057.0 |
+| edgeR | NB-GLM | timeout | 21605.37 |  |  |
+| pertpy | NB-GLM | error | 17780.0 | 28908.0 |  |
 
 
 ## 2. Performance Comparison
@@ -47,21 +47,21 @@ _crispyx as baseline. Negative values = crispyx is faster/uses less memory._
 
 | crispyx method | compared to | Time Δ | Time % |  | Mem Δ | Mem % |   |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| QC filter | scanpy QC filter | +154.1s | 325.5% | ❌ | -31535.6 MB | 21.6% | ✅ |
+| QC filter | scanpy QC filter | -44.0s | 47.4% | ✅ | -9884.7 MB | 75.6% | ✅ |
 
 
 #### DE: t-test
 
 | crispyx method | compared to | Time Δ | Time % |  | Mem Δ | Mem % |   |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| t-test | scanpy t-test | -84.1s | 38.4% | ✅ | -13173.6 MB | 10.4% | ✅ |
+| t-test | scanpy t-test | -99.1s | 45.5% | ✅ | -13136.5 MB | 11.5% | ✅ |
 
 
 #### DE: Wilcoxon
 
 | crispyx method | compared to | Time Δ | Time % |  | Mem Δ | Mem % |   |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| Wilcoxon | scanpy Wilcoxon | -4383.6s | 10.7% | ✅ | -551.9 MB | 97.7% | ⚠️ |
+| Wilcoxon | scanpy Wilcoxon | -19908.5s | 3.0% | ✅ | -6795.0 MB | 71.5% | ✅ |
 
 
 ## 3. Accuracy
@@ -79,7 +79,7 @@ _Correlation metrics between crispyx and reference methods. ✅ >0.95, ⚠️ 0.
 
 | crispyx method | compared to | Eff ρ |  | Eff ρₛ |   | Stat ρ |    | Stat ρₛ |     | log-Pval ρ |      | log-Pval ρₛ |       |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| t-test | scanpy t-test | 1.000<br><small>±0.000</small> | ✅ | 1.000<br><small>±0.000</small> | ✅ | - |  | - |  | 1.000<br><small>±0.000</small> | ✅ | 1.000<br><small>±0.000</small> | ✅ |
+| t-test | scanpy t-test | 1.000<br><small>±0.000</small> | ✅ | 1.000<br><small>±0.000</small> | ✅ | 1.000<br><small>±0.000</small> | ✅ | 1.000<br><small>±0.000</small> | ✅ | 1.000<br><small>±0.000</small> | ✅ | 1.000<br><small>±0.000</small> | ✅ |
 
 
 ### DE: Wilcoxon
@@ -110,8 +110,8 @@ _Overlap ratio of top-k DE genes between methods. ✅ >0.7, ⚠️ 0.5-0.7, ❌ 
 
 
 _Note: Some methods are missing due to errors:_
-- NB-GLM vs edgeR NB-GLM: _method error: edger_de_glm (memory_limit)_
-- NB-GLM vs pertpy NB-GLM: _method error: pertpy_de_pydeseq2 (timeout)_
+- NB-GLM vs edgeR NB-GLM: _method error: edger_de_glm (timeout)_
+- NB-GLM vs pertpy NB-GLM: _method error: pertpy_de_pydeseq2 (error)_
 
 ### Overlap Heatmaps (Top-100)
 

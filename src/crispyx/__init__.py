@@ -16,17 +16,30 @@ except PackageNotFoundError:
 
 from .data import (
     AnnData,
+    OverlapResult,
     calculate_optimal_chunk_size,
     calculate_optimal_gene_chunk_size,
+    calculate_wilcoxon_chunk_size,
+    compute_overlap,
     convert_to_csc,
+    convert_to_csr,
+    detect_gene_symbol_column,
+    detect_perturbation_column,
     ensure_gene_symbol_column,
+    infer_columns,
+    load_obs,
+    load_var,
     normalize_total_log1p,
+    normalise_perturbation_labels,
     read_h5ad_ondisk,
     read_backed,
     resolve_control_label,
     resolve_data_path,
     resolve_output_path,
     sort_by_perturbation,
+    standardise_gene_names,
+    write_obs,
+    write_var,
 )
 from .de import (
     RankGenesGroupsResult,
@@ -45,6 +58,7 @@ from .profiling import (
 from .plotting import (
     materialize_rank_genes_groups,
     plot_ma,
+    plot_overlap_heatmap,
     plot_pca,
     plot_pca_loadings,
     plot_pca_variance_ratio,
@@ -303,6 +317,50 @@ class _PreprocessingNamespace:
             Backed AnnData pointing to the CSC output file.
         """
         return convert_to_csc(
+            data,
+            output_path=output_path,
+            chunk_size=chunk_size,
+            output_dir=output_dir,
+            data_name=data_name,
+            verbose=verbose,
+        )
+
+    def convert_to_csr(
+        self,
+        data: str | Path | ad.AnnData,
+        *,
+        output_path: str | Path | None = None,
+        chunk_size: int | None = None,
+        output_dir: str | Path | None = None,
+        data_name: str | None = None,
+        verbose: bool = True,
+    ) -> AnnData:
+        """Convert a backed h5ad file's matrix to CSR format for fast row access.
+
+        If the file is already CSR, returns it unchanged.  Otherwise performs a
+        two-pass streaming conversion and writes the result to disk.
+
+        Parameters
+        ----------
+        data
+            Path to h5ad file or backed AnnData.
+        output_path
+            Explicit output path.  If None, derived from output_dir/data_name.
+        chunk_size
+            Rows (or columns for CSC source) per streaming chunk.  Default auto.
+        output_dir
+            Output directory.  Defaults to input file's directory.
+        data_name
+            Custom name suffix.
+        verbose
+            Print progress.
+
+        Returns
+        -------
+        AnnData
+            Backed AnnData pointing to the CSR output file.
+        """
+        return convert_to_csr(
             data,
             output_path=output_path,
             chunk_size=chunk_size,
@@ -803,6 +861,10 @@ class _ToolsNamespace:
             memory_limit_gb=memory_limit_gb,
         )
 
+    def compute_overlap(self, sets_dict, *, metric="both"):
+        """Compute pairwise overlap statistics. See :func:`crispyx.compute_overlap`."""
+        return compute_overlap(sets_dict, metric=metric)
+
 
 class _PlottingNamespace:
     """Scanpy-style plotting entry points for crispyx."""
@@ -847,6 +909,10 @@ class _PlottingNamespace:
         """Plot UMAP embedding. Wrapper around scanpy.pl.umap."""
         return plot_umap(data, **kwargs)
 
+    def overlap_heatmap(self, result, **kwargs):
+        """Plot pairwise overlap heatmap. See :func:`crispyx.plot_overlap_heatmap`."""
+        return plot_overlap_heatmap(result, **kwargs)
+
 pp = _PreprocessingNamespace()
 pb = _PseudobulkNamespace()
 tl = _ToolsNamespace()
@@ -877,8 +943,10 @@ __all__ = [
     "resolve_output_path",
     "calculate_optimal_chunk_size",
     "calculate_optimal_gene_chunk_size",
+    "calculate_wilcoxon_chunk_size",
     "normalize_total_log1p",
     "convert_to_csc",
+    "convert_to_csr",
     # Profiling utilities
     "Profiler",
     "MemoryProfiler",
@@ -896,4 +964,17 @@ __all__ = [
     "plot_top_genes_bar",
     "plot_qc_perturbation_counts",
     "plot_qc_summary",
+    "plot_overlap_heatmap",
+    # Data preparation utilities (v0.7.5)
+    "load_obs",
+    "load_var",
+    "write_obs",
+    "write_var",
+    "standardise_gene_names",
+    "normalise_perturbation_labels",
+    "detect_perturbation_column",
+    "detect_gene_symbol_column",
+    "infer_columns",
+    "OverlapResult",
+    "compute_overlap",
 ]

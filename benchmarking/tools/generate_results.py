@@ -416,14 +416,40 @@ def _anndata_to_de_dict_raw(adata) -> Dict[str, Any]:
     return stream_result_dict
 
 
+def _make_gene_index_unique(gene_index: pd.Index) -> pd.Index:
+    """Append positional suffix to duplicate gene names (e.g. MATR3, MATR3-1).
+
+    Prevents many-to-many merges in ``compute_de_comparison_metrics`` when
+    datasets contain duplicate gene symbols (e.g. Feng gwsf/gwsnf/ts).
+    """
+    if not gene_index.duplicated().any():
+        return gene_index
+    counts: dict[str, int] = {}
+    unique: list[str] = []
+    for g in gene_index:
+        if g in counts:
+            counts[g] += 1
+            unique.append(f"{g}-{counts[g]}")
+        else:
+            counts[g] = 0
+            unique.append(g)
+    return pd.Index(unique)
+
+
 def _streaming_de_to_frame(result: Mapping[str, Any]) -> pd.DataFrame:
     """Convert a streaming differential expression mapping to a tidy DataFrame."""
     frames = []
+    _gene_cache: dict[int, pd.Index] = {}
     for perturbation, entry in result.items():
         genes = getattr(entry, "genes", None)
         if genes is None:
             continue
-        gene_index = pd.Index(genes).astype(str)
+        genes_id = id(genes)
+        if genes_id in _gene_cache:
+            gene_index = _gene_cache[genes_id]
+        else:
+            gene_index = _make_gene_index_unique(pd.Index(genes).astype(str))
+            _gene_cache[genes_id] = gene_index
         n_rows = len(gene_index)
         frame = pd.DataFrame(
             {
@@ -482,6 +508,14 @@ def standardise_de_dataframe(df: Optional[pd.DataFrame]) -> pd.DataFrame:
     result = result[STANDARD_DE_COLUMNS]
     result["perturbation"] = result["perturbation"].astype(str).str.strip()
     result["gene"] = result["gene"].astype(str).str.strip()
+    # Deduplicate gene names within each perturbation to prevent many-to-many
+    # merges when datasets contain duplicate gene symbols (e.g. Feng datasets).
+    if result.duplicated(subset=["perturbation", "gene"]).any():
+        cumcounts = result.groupby(["perturbation", "gene"], sort=False).cumcount()
+        mask = cumcounts > 0
+        if mask.any():
+            result = result.copy()
+            result.loc[mask, "gene"] = result.loc[mask, "gene"] + "-" + cumcounts[mask].astype(str)
     result["effect_size"] = pd.to_numeric(result["effect_size"], errors="coerce")
     result["statistic"] = pd.to_numeric(result["statistic"], errors="coerce")
     result["pvalue"] = pd.to_numeric(result["pvalue"], errors="coerce")

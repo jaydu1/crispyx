@@ -469,6 +469,124 @@ def run_preprocess_csc(
     }
 
 
+def run_preprocess_csr(
+    input_path: Path,
+    output_path: Path,
+    *,
+    chunk_size: int | None = None,
+) -> Dict[str, Any]:
+    """Convert standardized dataset to CSR for efficient NB-GLM row access.
+
+    If ``input_path`` is already CSR the conversion is skipped.  A symlink
+    from ``output_path`` → ``input_path`` is created so downstream steps can
+    always reference ``output_path``.
+    """
+    import time
+
+    from crispyx.data import convert_to_csr, get_matrix_storage_format
+
+    t_start = time.perf_counter()
+
+    if get_matrix_storage_format(input_path) == "csr":
+        # Ensure output_path exists even when we skip conversion.
+        if not output_path.exists():
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.symlink_to(input_path.resolve())
+        return {
+            "result_path": str(output_path),
+            "process_seconds": time.perf_counter() - t_start,
+            "was_already_csr": True,
+        }
+
+    needs_run = not output_path.exists()
+    if not needs_run and input_path.exists():
+        if input_path.stat().st_mtime > output_path.stat().st_mtime:
+            needs_run = True
+    if needs_run:
+        convert_to_csr(
+            input_path,
+            output_path=output_path,
+            chunk_size=chunk_size,
+            verbose=True,
+        )
+    return {
+        "result_path": str(output_path),
+        "process_seconds": time.perf_counter() - t_start,
+        "was_already_csr": False,
+    }
+
+
+def run_wilcoxon_with_csc(
+    input_path: Path,
+    csc_path: Path,
+    *,
+    perturbation_column: str,
+    control_label: str,
+    output_dir: Path,
+    gene_name_column: str | None = None,
+    data_name: str = "de_wilcoxon",
+    n_jobs: int | None = None,
+    memory_limit_gb: float | None = None,
+    csc_chunk_size: int | None = None,
+) -> Dict[str, Any]:
+    """Ensure CSC format then run Wilcoxon DE, combining both in one timed step.
+
+    CSR column slicing is O(total_nnz) per gene chunk for large datasets;
+    CSC reduces this to O(nnz_in_chunk) total.  On large screens (Feng-gwsf)
+    this gives ~18x speedup.  On small datasets (<2 GB) the conversion overhead
+    dominates (~few seconds) while Wilcoxon itself is already fast, so the net
+    effect on total runtime is negligible.
+
+    Both conversion time and DE time are included in the benchmark measurement
+    because the conversion is an implementation detail of the Wilcoxon pipeline:
+    one combined number is more informative than split accounting where the
+    "wilcoxon" time would look artificially short.
+
+    ``csc_chunk_size`` is the cell/row chunk size used for CSC conversion (from QC).
+    Gene chunk size for Wilcoxon is computed independently by ``wilcoxon_test``
+    via ``calculate_optimal_gene_chunk_size``, which applies a tighter cap
+    (max 512) appropriate for column-oriented operations with large control groups.
+
+    Returns a dict so that :func:`_summarise_wilcoxon_csc` can expose the
+    timing breakdown (``csc_conversion_seconds``, ``wilcoxon_seconds``,
+    ``was_already_csc``) as extra benchmark columns.
+    """
+    import time
+
+    # Step 1: Ensure CSC format (cheap no-op when already CSC or cached).
+    t_csc_start = time.perf_counter()
+    csc_result = run_preprocess_csc(input_path, csc_path, chunk_size=csc_chunk_size)
+    csc_seconds = time.perf_counter() - t_csc_start
+    was_already_csc = csc_result.get("was_already_csc", False)
+    data_path = Path(csc_result["result_path"])
+
+    # Step 2: Run Wilcoxon on the CSC file.
+    # chunk_size=None: wilcoxon_test auto-calculates gene chunk size via
+    # calculate_optimal_gene_chunk_size (max_chunk=512), independent of the
+    # QC cell-chunk size. This avoids the O(n_ctrl * chunk_size) dense
+    # allocation exploding for datasets with large control groups like Feng-gwsnf.
+    t_de_start = time.perf_counter()
+    de_result = wilcoxon_test(
+        data=data_path,
+        perturbation_column=perturbation_column,
+        control_label=control_label,
+        gene_name_column=gene_name_column,
+        output_dir=output_dir,
+        data_name=data_name,
+        n_jobs=n_jobs,
+        memory_limit_gb=memory_limit_gb,
+        chunk_size=None,  # auto-calculated per calculate_optimal_gene_chunk_size
+    )
+    de_seconds = time.perf_counter() - t_de_start
+
+    return {
+        "de_result": de_result,
+        "csc_conversion_seconds": 0.0 if was_already_csc else csc_seconds,
+        "wilcoxon_seconds": de_seconds,
+        "was_already_csc": was_already_csc,
+    }
+
+
 def run_scanpy_de(
     dataset_path: Path,
     *,
@@ -2019,6 +2137,9 @@ def _anndata_to_de_dict(adata) -> Dict[str, Any]:
             # Determine which effect size layer/matrix to use
             if "logfoldchange" in adata.layers:
                 effect_size_values = _extract_row(adata.layers["logfoldchange"], idx)
+            elif "logfoldchanges" in adata.layers:
+                # crispyx t-test/Wilcoxon store LFCs in "logfoldchanges" (plural)
+                effect_size_values = _extract_row(adata.layers["logfoldchanges"], idx)
             elif adata.X is not None:
                 # t_test stores effect sizes in .X matrix
                 effect_size_values = _extract_row(adata.X, idx)
@@ -2123,15 +2244,41 @@ def _anndata_to_de_dict_raw(adata) -> Dict[str, Any]:
     return stream_result_dict
 
 
+def _make_gene_index_unique(gene_index: pd.Index) -> pd.Index:
+    """Append positional suffix to duplicate gene names (e.g. MATR3, MATR3-1).
+
+    Prevents many-to-many merges in ``compute_de_comparison_metrics`` when
+    datasets contain duplicate gene symbols (e.g. Feng gwsf/gwsnf/ts).
+    """
+    if not gene_index.duplicated().any():
+        return gene_index
+    counts: dict[str, int] = {}
+    unique: list[str] = []
+    for g in gene_index:
+        if g in counts:
+            counts[g] += 1
+            unique.append(f"{g}-{counts[g]}")
+        else:
+            counts[g] = 0
+            unique.append(g)
+    return pd.Index(unique)
+
+
 def _streaming_de_to_frame(result: Mapping[str, Any]) -> pd.DataFrame:
     """Convert a streaming differential expression mapping to a tidy DataFrame."""
 
     frames = []
+    _gene_cache: dict[int, pd.Index] = {}
     for perturbation, entry in result.items():
         genes = getattr(entry, "genes", None)
         if genes is None:
             continue
-        gene_index = pd.Index(genes).astype(str)
+        genes_id = id(genes)
+        if genes_id in _gene_cache:
+            gene_index = _gene_cache[genes_id]
+        else:
+            gene_index = _make_gene_index_unique(pd.Index(genes).astype(str))
+            _gene_cache[genes_id] = gene_index
         n_rows = len(gene_index)
         frame = pd.DataFrame(
             {
@@ -2191,6 +2338,14 @@ def _standardise_de_dataframe(df: Optional[pd.DataFrame]) -> pd.DataFrame:
     result = result[STANDARD_DE_COLUMNS]
     result["perturbation"] = result["perturbation"].astype(str).str.strip()
     result["gene"] = result["gene"].astype(str).str.strip()
+    # Deduplicate gene names within each perturbation to prevent many-to-many
+    # merges when datasets contain duplicate gene symbols (e.g. Feng datasets).
+    if result.duplicated(subset=["perturbation", "gene"]).any():
+        cumcounts = result.groupby(["perturbation", "gene"], sort=False).cumcount()
+        mask = cumcounts > 0
+        if mask.any():
+            result = result.copy()
+            result.loc[mask, "gene"] = result.loc[mask, "gene"] + "-" + cumcounts[mask].astype(str)
     result["effect_size"] = pd.to_numeric(result["effect_size"], errors="coerce")
     result["statistic"] = pd.to_numeric(result["statistic"], errors="coerce")
     result["pvalue"] = pd.to_numeric(result["pvalue"], errors="coerce")
@@ -3356,6 +3511,34 @@ def _summarise_de_mapping(result: Any, context: Dict[str, Any]) -> Dict[str, Any
     return summary
 
 
+def _summarise_wilcoxon_csc(result: Any, context: Dict[str, Any]) -> Dict[str, Any]:
+    """Summarise result from :func:`run_wilcoxon_with_csc`.
+
+    Delegates DE metric extraction to :func:`_summarise_de_mapping` and adds
+    ``csc_conversion_seconds``, ``wilcoxon_seconds``, and ``was_already_csc``
+    as extra columns so the benchmark report shows the timing breakdown.
+    """
+    if not isinstance(result, dict) or "de_result" not in result:
+        # Fallback for unexpected result shape
+        return _summarise_de_mapping(result, context)
+
+    de_result = result["de_result"]
+    summary = _summarise_de_mapping(de_result, context)
+
+    # Attach timing breakdown as extra reporting columns
+    csc_secs = result.get("csc_conversion_seconds")
+    de_secs = result.get("wilcoxon_seconds")
+    was_already_csc = result.get("was_already_csc", False)
+
+    if csc_secs is not None:
+        summary["csc_conversion_seconds"] = round(csc_secs, 3)
+    if de_secs is not None:
+        summary["wilcoxon_seconds"] = round(de_secs, 3)
+    summary["was_already_csc"] = was_already_csc
+
+    return summary
+
+
 def _summarise_runner_result(result: Any, context: Dict[str, Any]) -> Dict[str, Any]:
     """Summarise result from a standalone runner function."""
     # Handle dictionary result (new format)
@@ -4180,57 +4363,7 @@ def _run_with_limits(
     # to avoid RLIMIT_AS issues with virtual address space limits
     use_cgroups = _is_cgroups_available() and 'crispyx' in method.name.lower()
     
-    # Special handling for edgeR: run directly without multiprocessing to avoid R/fork issues
-    # Still need to set environment variables for this process
-    if 'edger_direct' in method.name.lower():
-        set_thread_env_vars(n_threads)
-        
-        # Use MemoryTracker for memory measurement
-        tracker = MemoryTracker(sample_interval=0.1)
-        tracker.start()
-        
-        start = time.perf_counter()
-        try:
-            result = method.function(**method.kwargs)
-            elapsed = time.perf_counter() - start
-            
-            # Stop memory tracking
-            tracker.stop()
-            
-            # Use absolute peak memory (total RSS)
-            peak_memory_mb = tracker.get_peak_absolute_mb()
-            
-            # Calculate average memory from samples (absolute values)
-            avg_memory_mb = tracker.get_average_absolute_mb()
-            
-            summary = method.summary(result, context)
-            return {
-                "status": "success",
-                "elapsed_seconds": elapsed,
-                "peak_memory_mb": peak_memory_mb,
-                "avg_memory_mb": avg_memory_mb,
-                "summary": summary,
-            }
-        except Exception as exc:
-            # Stop memory tracking
-            try:
-                tracker.stop()
-            except RuntimeError:
-                pass  # Already stopped or never started
-            
-            elapsed = time.perf_counter() - start
-            
-            avg_memory_mb = tracker.get_average_absolute_mb()
-            
-            return {
-                "status": "error",
-                "elapsed_seconds": elapsed,
-                "peak_memory_mb": None,
-                "avg_memory_mb": avg_memory_mb,
-                "error": str(exc),
-                "traceback": traceback.format_exc(),
-            }
-    
+
     # Use spawn context for R/rpy2 compatibility, to avoid OpenMP fork issues
     # triggered by some scanpy workflows, AND for crispyx methods that use Numba
     # (forking inherits the parent's already-initialized Numba threads).
@@ -4239,6 +4372,7 @@ def _run_with_limits(
         'pertpy' in method.name.lower() 
         or 'scanpy' in method.name.lower()
         or 'crispyx_de' in method.name.lower()  # All crispyx DE methods use Numba kernels
+        or 'edger' in method.name.lower()  # R/rpy2 needs spawn context
     )
     mp_context = mp.get_context('spawn') if needs_spawn else mp
     
@@ -4466,6 +4600,15 @@ def create_benchmark_suite(
     # preprocessed_csc_path: CSC conversion of preprocessed_path — created by
     # crispyx_preprocess_csc.  Used by crispyx_de_wilcoxon for fast column access.
     preprocessed_csc_path = preprocessing_dir / f"preprocessed_csc_{dataset_path.name}"
+    # standardized_csr_path: CSR conversion of dataset_path — created by
+    # crispyx_standardize_csr.  Used by crispyx_de_nb_glm for fast row access.
+    # If the input is already CSR (e.g. from early conversion in
+    # _run_single_benchmark), point directly at it.
+    from crispyx.data import get_matrix_storage_format as _get_fmt
+    if _get_fmt(dataset_path) == "csr":
+        standardized_csr_path = dataset_path
+    else:
+        standardized_csr_path = preprocessing_dir / f"standardized_csr_{dataset_path.name}"
 
     methods = {
         "crispyx_qc_filtered": BenchmarkMethod(
@@ -4509,6 +4652,17 @@ def create_benchmark_suite(
             summary=_summarise_runner_result,
             depends_on="crispyx_preprocess",
         ),
+        "crispyx_standardize_csr": BenchmarkMethod(
+            name="crispyx_standardize_csr",
+            description="Convert standardized dataset to CSR for fast NB-GLM row access",
+            function=run_preprocess_csr,
+            kwargs={
+                "input_path": dataset_path,
+                "output_path": standardized_csr_path,
+                "chunk_size": final_chunk_size,
+            },
+            summary=_summarise_runner_result,
+        ),
         "crispyx_pb_avg_log": BenchmarkMethod(
             name="crispyx_pb_avg_log",
             description="Average log-normalised expression per perturbation",
@@ -4550,25 +4704,29 @@ def create_benchmark_suite(
         ),
         "crispyx_de_wilcoxon": BenchmarkMethod(
             name="crispyx_de_wilcoxon",
-            description="Wilcoxon rank-sum differential expression",
-            function=wilcoxon_test,
+            description="Wilcoxon DE with CSR\u2192CSC conversion (conversion + DE timed together)",
+            function=run_wilcoxon_with_csc,
             kwargs={
-                "data": preprocessed_csc_path,
+                "input_path": preprocessed_path,
+                "csc_path": preprocessed_csc_path,
                 **shared_kwargs,
                 "output_dir": de_dir,
                 "data_name": "de_wilcoxon",
                 "n_jobs": n_cores,
                 "memory_limit_gb": memory_limit_gb,
+                # csc_chunk_size: cell-row chunk size for CSC conversion (from QC)
+                # wilcoxon gene_chunk_size is calculated independently by wilcoxon_test
+                "csc_chunk_size": final_chunk_size,
             },
-            summary=_summarise_de_mapping,
-            depends_on="crispyx_preprocess_csc",
+            summary=_summarise_wilcoxon_csc,
+            depends_on="crispyx_preprocess",
         ),
         "crispyx_de_nb_glm": BenchmarkMethod(
             name="crispyx_de_nb_glm",
             description="NB-GLM base fitting (no shrinkage)",
             function=run_nb_glm_base,
             kwargs={
-                "path": dataset_path,
+                "path": standardized_csr_path,
                 **shared_kwargs,
                 "output_dir": de_dir,
                 "n_jobs": n_cores,
@@ -4580,6 +4738,7 @@ def create_benchmark_suite(
                 "memory_limit_gb": memory_limit_gb,
             },
             summary=_summarise_runner_result,
+            depends_on="crispyx_standardize_csr",
         ),
         # NB-GLM with PyDESeq2-parity configuration (for benchmarking parity)
         "crispyx_de_nb_glm_pydeseq2": BenchmarkMethod(
@@ -4587,7 +4746,7 @@ def create_benchmark_suite(
             description="NB-GLM with PyDESeq2-parity settings (fisher SE, per-comparison SF/disp)",
             function=run_nb_glm_base,
             kwargs={
-                "path": dataset_path,
+                "path": standardized_csr_path,
                 **shared_kwargs,
                 "output_dir": de_dir,
                 "n_jobs": n_cores,
@@ -4601,6 +4760,7 @@ def create_benchmark_suite(
                 "memory_limit_gb": memory_limit_gb,
             },
             summary=_summarise_runner_result,
+            depends_on="crispyx_standardize_csr",
         ),
         # lfcShrink with global prior scale (faster)
         "crispyx_de_lfcshrink": BenchmarkMethod(
@@ -5110,8 +5270,27 @@ def _run_single_benchmark(
         output_dir=config.output_dir,
         force=config.force_restandardize,
     )
-    
-    context = _load_dataset_context(standardized_path)
+
+    # Ensure a CSR copy exists for efficient row-wise access (adaptive QC,
+    # NB-GLM, size factors).  On CSC or dense standardized files this avoids
+    # the O(total_nnz)-per-row-slice pathology that caused multi-hour hangs.
+    from crispyx.data import get_matrix_storage_format
+
+    standardized_csr_path = standardized_path  # default: already CSR
+    if get_matrix_storage_format(standardized_path) != "csr":
+        preprocessing_dir = config.output_dir / "preprocessing"
+        preprocessing_dir.mkdir(parents=True, exist_ok=True)
+        csr_path = preprocessing_dir / f"standardized_csr_{standardized_path.stem.removeprefix('standardized_')}.h5ad"
+        csr_result = run_preprocess_csr(
+            standardized_path, csr_path,
+            chunk_size=config.chunk_size,
+        )
+        standardized_csr_path = Path(csr_result["result_path"])
+        if not config.quiet:
+            print(f"  ✓ CSR-converted standardized file: {standardized_csr_path.name}")
+
+    # Use CSR path for adaptive QC (row-wise matrix access) and context loading.
+    context = _load_dataset_context(standardized_csr_path)
     context["dataset_path"] = str(standardized_path)
     context["output_dir"] = config.output_dir
     
@@ -5126,7 +5305,7 @@ def _run_single_benchmark(
         if not config.quiet:
             print(f"\nCalculating adaptive QC parameters (mode: {config.adaptive_qc_mode})...")
         
-        adata_temp = ad.read_h5ad(standardized_path, backed='r')
+        adata_temp = ad.read_h5ad(standardized_csr_path, backed='r')
         try:
             qc_params_used = calculate_adaptive_qc_thresholds(
                 adata_temp, "perturbation", mode=config.adaptive_qc_mode, chunk_size=config.chunk_size
@@ -5177,7 +5356,7 @@ def _run_single_benchmark(
     save_cache_config(config.output_dir, qc_params_used, str(standardized_path))
 
     available_methods = create_benchmark_suite(
-        dataset_path=standardized_path,
+        dataset_path=standardized_csr_path,
         output_dir=config.output_dir,
         perturbation_column="perturbation",  # Always 'perturbation' after standardization
         control_label="control",  # Always 'control' after standardization
@@ -5192,6 +5371,8 @@ def _run_single_benchmark(
     # These methods are useful for specific validation but not needed for standard benchmarks
     # Methods with _pydeseq2 suffix are specifically designed to match PyDESeq2's exact behavior
     OPTIONAL_METHODS = {
+        "crispyx_preprocess_csc",  # CSR→CSC conversion; auto-included when crispyx_de_wilcoxon is selected
+        "crispyx_standardize_csr",  # CSC/dense→CSR conversion; auto-included when crispyx_de_nb_glm is selected
         "crispyx_de_lfcshrink",  # LFC shrinkage step (runs separately from NB-GLM base)
         "crispyx_de_nb_glm_pydeseq2",  # NB-GLM with PyDESeq2-parity settings for benchmarking
         "crispyx_de_lfcshrink_pydeseq2",  # LFC shrinkage with PyDESeq2-parity base
@@ -5237,6 +5418,30 @@ def _run_single_benchmark(
                 elif opt_name not in available_methods:
                     import warnings
                     warnings.warn(f"Unknown optional method '{opt_name}' will be skipped")
+
+    # Auto-include dependencies: if a selected method has a depends_on that is
+    # not yet in selected_names but exists in available_methods, add it now.
+    # This ensures e.g. crispyx_preprocess_csc is included whenever
+    # crispyx_de_wilcoxon is selected, without running it when wilcoxon is absent.
+    def _resolve_dependencies(names: list[str], methods: Dict[str, BenchmarkMethod]) -> list[str]:
+        """Return names extended with any missing depends_on prerequisites."""
+        resolved: list[str] = list(names)
+        resolved_set: set[str] = set(names)
+        # Iterate until stable (handles transitive chains)
+        changed = True
+        while changed:
+            changed = False
+            for name in list(resolved):
+                method = methods.get(name)
+                if method and method.depends_on:
+                    dep = method.depends_on
+                    if dep in methods and dep not in resolved_set:
+                        resolved.append(dep)
+                        resolved_set.add(dep)
+                        changed = True
+        return resolved
+
+    selected_names = _resolve_dependencies(selected_names, available_methods)
 
     # Sort methods topologically to respect dependencies
     # Methods with depends_on must run after their dependency

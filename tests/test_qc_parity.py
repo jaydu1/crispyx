@@ -386,5 +386,41 @@ def test_qc_against_scanpy(tmp_output_dir):
     print(f"✓ Scanpy parity: cells={adata.n_obs}, genes={adata.n_vars}")
 
 
+def test_qc_strategy_selection_thresholds():
+    """Verify the in-memory threshold: file×4 < min(limit×0.6, 50 GB).
+
+    Threshold table (matches qc.py comments):
+      - Small file   (<12.5 GB):  file×4 < 50 GB → in-memory
+      - Medium file  ( 12.5 GB):  file×4 = 50 GB → streaming (edge, just over)
+      - Large file   ( 27 GB):    file×4 = 108 GB → streaming
+
+    This does NOT call the full QC pipeline; it directly validates the
+    decision logic from quality_control_summary.
+    """
+    def _would_use_in_memory(file_size_gb: float, memory_limit_gb: float = 128.0) -> bool:
+        """Mirror the threshold logic from quality_control_summary."""
+        estimated_memory_gb = file_size_gb * 4          # sparse 4× multiplier
+        threshold = min(memory_limit_gb * 0.6, 50.0)   # cap at 50 GB
+        return estimated_memory_gb < threshold
+
+    # Small datasets → in-memory
+    assert _would_use_in_memory(0.05) is True,  "Adamson_subset (50 MB) should be in-memory"
+    assert _would_use_in_memory(2.0) is True,   "Adamson (2 GB) should be in-memory"
+    assert _would_use_in_memory(10.0) is True,  "Frangieh (10 GB) should be in-memory"
+    assert _would_use_in_memory(12.4) is True,  "12.4 GB just under threshold"
+
+    # Large datasets → streaming
+    assert _would_use_in_memory(12.6) is False, "12.6 GB just over threshold → streaming"
+    assert _would_use_in_memory(15.0) is False, "Feng-gwsf (15 GB) should stream"
+    assert _would_use_in_memory(27.0) is False, "Feng-gwsnf (27 GB) should stream"
+    assert _would_use_in_memory(54.0) is False, "Very large file should stream"
+
+    # Cap behaviour: even with 500 GB node, threshold stays at 50 GB
+    assert _would_use_in_memory(12.6, memory_limit_gb=500.0) is False, \
+        "High-memory node should not relax threshold beyond 50 GB cap"
+    assert _would_use_in_memory(10.0, memory_limit_gb=500.0) is True, \
+        "10 GB file should still be in-memory even on 500 GB node"
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

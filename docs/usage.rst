@@ -1,10 +1,19 @@
 Usage Guide
 ===========
 
-The core workflow mirrors the steps demonstrated in the tutorial notebook and
-now adopts a Scanpy-style API so existing notebooks can migrate with minimal
-changes. Each operation streams data from disk so large ``.h5ad`` files can be
-processed on commodity hardware.
+crispyx provides a Scanpy-style API for streaming CRISPR screen analysis.
+Each operation reads data from disk so large ``.h5ad`` files can be processed
+on commodity hardware without loading the full count matrix into memory.
+
+The typical workflow is:
+
+1. **Load** – open a dataset on disk
+2. **QC** – filter cells, perturbations, and genes
+3. **Preprocess** – normalise and log-transform (streaming)
+4. **Dimension reduction** – PCA and KNN graph construction
+5. **Pseudo-bulk** – aggregate per perturbation
+6. **Differential expression** – t-test, Wilcoxon, or NB-GLM
+7. **Plot** – visualise results with Scanpy-style helpers
 
 Quick start
 -----------
@@ -124,6 +133,87 @@ KNN results are stored in:
 backed data, PCA and neighbors results are written directly to the h5ad file.
 This keeps ``.X`` on disk while persisting embeddings, loadings, and neighbor
 graphs for later use. No ``copy=True`` is needed in typical workflows.
+
+CSC preprocessing for Wilcoxon
+------------------------------
+
+For large datasets, convert the preprocessed CSR file to CSC format before
+running Wilcoxon DE. CSR storage forces a full scan of all ``data`` and
+``indices`` arrays for each gene chunk (O(total_nnz) per chunk); CSC storage
+makes each chunk access O(nnz_in_chunk), so total I/O drops from
+``n_chunks × file_size`` to ``file_size``. This gives approximately 18×
+speedup on large screens (Feng-gwsf: 3.35 h → ~11 min):
+
+.. code-block:: python
+
+   # Convert normalized CSR file to CSC (streaming, no full-matrix load)
+   adata_csc = cx.pp.convert_to_csc(
+       adata_norm,
+       output_dir="results/",
+   )
+   # adata_csc is returned immediately and unchanged if input is already CSC.
+   # Use adata_csc as input to rank_genes_groups() for fast Wilcoxon.
+
+The function auto-detects whether the source file is already CSC and returns
+it unchanged with no I/O. In the benchmark pipeline, CSC conversion is
+bundled inside ``crispyx_de_wilcoxon`` (via ``run_wilcoxon_with_csc``) so
+that the reported wall-time includes both conversion and DE — giving a single
+honest total cost rather than a split accounting that would make Wilcoxon
+appear faster than it is. Benchmark results include sub-columns
+``csc_conversion_seconds``, ``wilcoxon_seconds``, and ``was_already_csc``
+for fine-grained breakdown.
+
+.. note::
+
+   For small datasets (files < ~12.5 GB), the CSC conversion overhead is
+   negligible (< 1 s on fast NVMe) and the total wilcoxon time is dominated
+   by process startup (2–3 s). For large screens (Feng-gwsf 15 GB, Feng-gwsnf
+   27 GB) the CSC conversion itself takes ~60–120 s but eliminates the ~18×
+   repeated full-file scans that CSR imposes.
+
+CSR preprocessing for NB-GLM
+-----------------------------
+
+NB-GLM operations (size factors, control matrix loading, per-perturbation
+slicing) are all row-wise. CSC or dense storage makes each row access
+O(total_nnz) per slice, causing severe slowdowns or hangs. Convert to CSR
+before running NB-GLM:
+
+.. code-block:: python
+
+   # Convert standardised file to CSR (streaming, no full-matrix load)
+   adata_csr = cx.pp.convert_to_csr(
+       adata,
+       output_dir="results/",
+   )
+   # Returns immediately if already CSR.
+
+   # NB-GLM on CSR file
+   result = cx.nb_glm_test(
+       adata_csr,
+       perturbation_column="perturbation",
+   )
+
+The function uses format-aware streaming: CSC sources are read in
+column-chunks (axis=1) and scattered into CSR buffers; dense sources are
+read in row-chunks (axis=0). For large datasets, the streaming control
+statistics function automatically activates — fitting the intercept-only
+model in chunks of 4,096 control cells instead of densifying the full
+control matrix. This keeps peak memory at O(chunk_size × n_genes) rather
+than O(n_control × n_genes). When ``freeze_control`` is auto-enabled,
+streaming is used unconditionally. DESeq2-style size factors
+(``size_factor_method="deseq2"``) also stream automatically when the
+intermediate counts array would exceed 4 GB, computing geometric means
+and per-cell median ratios in chunks. After each streaming phase,
+``drop_file_cache()`` evicts file data from the kernel page cache so that
+cgroup-limited environments (e.g. SLURM) do not count cached pages toward
+the memory limit.
+
+.. note::
+
+   If ``nb_glm_test()`` detects CSC storage, it emits a ``UserWarning``
+   advising conversion to CSR. In the benchmark pipeline, CSR conversion
+   is handled automatically via the ``crispyx_standardize_csr`` step.
 
 Differential expression
 -----------------------
@@ -334,6 +424,131 @@ Benchmarking
 ------------
 
 The ``benchmarking`` directory ships with a reusable script that measures time
-and memory usage across the main methods. Execute
-``python benchmarking/run_benchmarks.py`` to generate CSV and Markdown reports
-for any compatible dataset.
+and memory usage across the main methods:
+
+.. code-block:: bash
+
+   cd benchmarking
+   ./run_benchmark.sh config/Adamson.yaml
+
+See :doc:`benchmarking` for configuration options and output structure.
+
+Data Preparation Utilities
+--------------------------
+
+crispyx 0.7.5 adds five utility families for cleaning heterogeneous datasets
+before running QC or differential expression.
+
+Editing backed metadata without loading X
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Load only the ``obs`` or ``var`` table from a backed file, edit it in Python,
+and write it back — without ever reading the expression matrix:
+
+.. code-block:: python
+
+   # Load obs metadata (X is never read)
+   obs = cx.load_obs("data/counts.h5ad")
+   obs["batch"] = obs["batch"].str.upper()
+
+   # Write back (must have the same number of rows)
+   cx.write_obs("data/counts.h5ad", obs)
+
+   # Same for var
+   var = cx.load_var("data/counts.h5ad")
+   var["gene_symbols"] = var["gene_symbols"].str.upper()
+   cx.write_var("data/counts.h5ad", var)
+
+Gene name standardisation
+~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Normalise Ensembl version suffixes, mitochondrial prefixes, and optionally
+map IDs to HGNC symbols via ``mygene`` (``pip install mygene``):
+
+.. code-block:: python
+
+   # Strip version suffix + mt normalisation (in-place)
+   cx.standardise_gene_names(
+       "data/counts.h5ad",
+       column="ensembl_id",          # var column; None uses var_names
+       strip_version=True,           # ENSG00000123.4 → ENSG00000123
+       normalise_mt_prefix=True,     # mt-ND1 → MT-ND1
+   )
+
+   # Online Ensembl → symbol lookup (returns Series without modifying file)
+   symbols = cx.standardise_gene_names(
+       "data/counts.h5ad",
+       column="ensembl_id",
+       lookup_symbols=True,
+       species="human",
+       unmapped_action="warn",
+       inplace=False,
+   )
+
+Perturbation label normalisation
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Strip guide prefixes/suffixes and unify diverse control labels:
+
+.. code-block:: python
+
+   cx.normalise_perturbation_labels(
+       "data/counts.h5ad",
+       column="perturbation",
+       strip_prefixes=["sg-", "sg"],
+       strip_suffixes=["_KO", "_KD", "_P1P2"],
+       canonical_control="NTC",     # maps ctrl/scramble/NTC/non-targeting → NTC
+   )
+
+   # Or return normalised labels without writing
+   labels = cx.normalise_perturbation_labels(
+       "data/counts.h5ad",
+       column="perturbation",
+       inplace=False,
+   )
+
+Auto-detecting metadata columns
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Let crispyx infer which obs/var columns hold perturbation labels and gene
+symbols:
+
+.. code-block:: python
+
+   # Detect individually
+   pert_col = cx.detect_perturbation_column("data/counts.h5ad")
+   gene_col  = cx.detect_gene_symbol_column("data/counts.h5ad")
+
+   # Or in one call
+   cols = cx.infer_columns("data/counts.h5ad")
+   print(cols)
+   # {"perturbation_column": "perturbation", "gene_name_column": "gene_symbols"}
+
+   # Pass detected columns directly to downstream functions
+   adata = cx.tl.rank_genes_groups(
+       "data/counts.h5ad",
+       perturbation_column=cols["perturbation_column"],
+       gene_name_column=cols["gene_name_column"],
+       method="wilcoxon",
+   )
+
+Overlap analysis
+~~~~~~~~~~~~~~~~
+
+Compare sets of genes or perturbations across datasets:
+
+.. code-block:: python
+
+   result = cx.tl.compute_overlap({
+       "Adamson": set(adamson_genes),
+       "Replogle": set(replogle_genes),
+       "Nadig":    set(nadig_genes),
+   })
+
+   print(result.jaccard_matrix)
+   print(result.count_matrix)
+   print(result.set_sizes)
+
+   # Plot as a heatmap
+   ax = cx.pl.overlap_heatmap(result, metric="jaccard", cmap="Blues")
+   ax = cx.pl.overlap_heatmap(result, metric="count", annot=True, fmt="d")

@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import logging
+import os as _os
+import re as _re
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterator, Mapping, Sequence
+from typing import Any, Iterator, Literal, Mapping, Sequence
 
 import h5py
 import anndata as ad
@@ -13,6 +16,27 @@ import pandas as pd
 import scipy.sparse as sp
 
 logger = logging.getLogger(__name__)
+
+
+def drop_file_cache(path: str | Path) -> None:
+    """Advise the kernel to drop page cache for *path* (Linux only).
+
+    On cgroup-limited systems (SLURM), page-cache pages count toward the
+    memory limit.  Calling this after a streaming read prevents the cached
+    file data from consuming the cgroup budget.
+
+    The call is a no-op on non-Linux platforms or when the file cannot be
+    opened.
+    """
+    try:
+        fd = _os.open(str(path), _os.O_RDONLY)
+        try:
+            _os.posix_fadvise(fd, 0, 0, _os.POSIX_FADV_DONTNEED)
+        finally:
+            _os.close(fd)
+    except (OSError, AttributeError):
+        pass
+
 
 from numba import njit, prange
 
@@ -1306,7 +1330,7 @@ def convert_to_csc(
     data: str | Path | "AnnData" | ad.AnnData,
     *,
     output_path: str | Path | None = None,
-    chunk_size: int = 4096,
+    chunk_size: int | None = None,
     output_dir: str | Path | None = None,
     data_name: str | None = None,
     verbose: bool = True,
@@ -1379,6 +1403,8 @@ def convert_to_csc(
     try:
         n_obs = backed.n_obs
         n_vars = backed.n_vars
+        if chunk_size is None:
+            chunk_size = calculate_optimal_chunk_size(n_obs, n_vars)
         obs = backed.obs.copy()
         var = backed.var.copy()
         obs.index = obs.index.astype(str)
@@ -1487,6 +1513,246 @@ def convert_to_csc(
     if verbose:
         print(
             f"  ✓ CSC file written: {n_obs} cells × {n_vars} genes,"
+            f" {total_nnz:,} non-zeros"
+        )
+
+    return AnnData(output_path)
+
+
+def convert_to_csr(
+    data: str | Path | "AnnData" | ad.AnnData,
+    *,
+    output_path: str | Path | None = None,
+    chunk_size: int | None = None,
+    output_dir: str | Path | None = None,
+    data_name: str | None = None,
+    verbose: bool = True,
+) -> "AnnData":
+    """Convert a backed h5ad file's matrix from CSC (or dense) to CSR format.
+
+    CSR format allows O(nnz_in_chunk) row-slicing instead of O(total_nnz)
+    that CSC requires.  This is needed for efficient NB-GLM, size factor
+    computation, and any operation that iterates over cell (row) chunks.
+
+    The conversion mirrors :func:`convert_to_csc`: two streaming passes over the
+    source file so peak memory is bounded by ``total_nnz × (sizeof(float32) +
+    sizeof(col_dtype))`` bytes (the output buffers) plus one chunk working buffer.
+
+    If the input file is already CSR, no file is written; the function returns a
+    backed AnnData pointing to the original file.
+
+    Parameters
+    ----------
+    data
+        Path to source h5ad file (CSC or dense), or a backed AnnData.
+    output_path
+        Explicit path for the output file.  If ``None``, a path is derived from
+        ``output_dir``/``data_name`` with ``"_csr"`` appended to the stem.
+    chunk_size
+        Number of rows (cells) to read at a time during both passes.
+        Default is calculated automatically.
+    output_dir
+        Directory for the output file.  Defaults to the source file's directory.
+    data_name
+        Custom name used when building the output filename.
+    verbose
+        Print progress messages.
+
+    Returns
+    -------
+    AnnData
+        Backed (read-only) AnnData pointing to the written CSR h5ad file,
+        or to the source file if it was already CSR.
+    """
+    source_path = resolve_data_path(data, require_exists=True)
+
+    # Fast path: input is already CSR — return it directly.
+    fmt = get_matrix_storage_format(source_path)
+    if fmt == "csr":
+        if verbose:
+            print(f"File is already CSR, skipping conversion: {source_path}")
+        return AnnData(source_path)
+
+    # Resolve output path.
+    if output_path is None:
+        output_path = resolve_output_path(
+            source_path,
+            suffix="csr",
+            output_dir=output_dir,
+            data_name=data_name,
+        )
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    source_is_csc = fmt == "csc"
+
+    if verbose:
+        print(f"Converting {fmt}→CSR (two-pass streaming): {source_path} → {output_path}")
+
+    # Choose the optimal reading axis based on source format.
+    # CSC: column-chunks (axis=1) are fast, row-chunks are O(total_nnz).
+    # Dense / CSR: row-chunks (axis=0) are fast.
+    read_axis = 1 if source_is_csc else 0
+
+    # ------------------------------------------------------------------ Pass 1
+    # Count non-zeros per row and collect metadata.
+    backed = read_backed(source_path)
+    try:
+        n_obs = backed.n_obs
+        n_vars = backed.n_vars
+        if chunk_size is None:
+            chunk_size = calculate_optimal_chunk_size(n_obs, n_vars)
+        obs = backed.obs.copy()
+        var = backed.var.copy()
+        obs.index = obs.index.astype(str)
+        var.index = var.index.astype(str)
+
+        row_nnz = np.zeros(n_obs, dtype=np.int64)
+        total_nnz = 0
+
+        if source_is_csc:
+            # Column chunks: convert each to CSC, count NNZ per row via indices.
+            for _slc, block in iter_matrix_chunks(
+                backed, axis=1, chunk_size=chunk_size, convert_to_dense=False
+            ):
+                if sp.issparse(block):
+                    csc = sp.csc_matrix(block)
+                    np.add.at(row_nnz, csc.indices, 1)
+                    total_nnz += csc.nnz
+                else:
+                    # Dense column block: count non-zeros per row.
+                    dense = np.asarray(block)
+                    nz_mask = dense != 0
+                    row_nnz += nz_mask.sum(axis=1)
+                    total_nnz += int(nz_mask.sum())
+        else:
+            # Row chunks: convert to CSR, count NNZ per row via indptr diffs.
+            for _slc, block in iter_matrix_chunks(
+                backed, axis=0, chunk_size=chunk_size, convert_to_dense=False
+            ):
+                csr = _ensure_csr(block)
+                row_counts = np.diff(csr.indptr)
+                row_nnz[_slc] += row_counts
+                total_nnz += csr.nnz
+    finally:
+        backed.file.close()
+
+    # Empty matrix edge case.
+    if total_nnz == 0:
+        placeholder = sp.csr_matrix((n_obs, n_vars), dtype=np.float32)
+        adata = ad.AnnData(placeholder, obs=obs, var=var)
+        adata.write(output_path)
+        return AnnData(output_path)
+
+    # CSR indptr: length n_obs + 1.
+    idx_dtype = np.int32 if total_nnz <= np.iinfo(np.int32).max else np.int64
+    indptr = np.zeros(n_obs + 1, dtype=idx_dtype)
+    np.cumsum(row_nnz, out=indptr[1:])
+
+    # Column-index dtype: int32 suffices for up to ~2 billion genes.
+    col_dtype = np.int32 if n_vars <= np.iinfo(np.int32).max else np.int64
+
+    # ------------------------------------------------------------------ Pass 2
+    # Re-read and scatter non-zeros into the global CSR output arrays.
+    out_data = np.empty(total_nnz, dtype=np.float32)
+    out_col_indices = np.empty(total_nnz, dtype=col_dtype)
+    # offset[r] = next write position in the CSR arrays for row r.
+    offset = indptr[:-1].astype(np.int64)
+
+    backed = read_backed(source_path)
+    try:
+        if source_is_csc:
+            # Column-chunk reading: fast on CSC.  Mirror of convert_to_csc's
+            # row-chunk scatter, but transposed.
+            col_global = 0
+            for _slc, block in iter_matrix_chunks(
+                backed, axis=1, chunk_size=chunk_size, convert_to_dense=False
+            ):
+                if sp.issparse(block):
+                    csc = sp.csc_matrix(block)
+                else:
+                    csc = sp.csc_matrix(np.asarray(block))
+                n_chunk_cols = csc.shape[1]
+                if csc.nnz == 0:
+                    col_global += n_chunk_cols
+                    continue
+
+                # Global column index for every non-zero in this chunk.
+                local_col_ids = np.repeat(
+                    np.arange(n_chunk_cols, dtype=col_dtype),
+                    np.diff(csc.indptr),
+                ) + col_dtype(col_global)
+
+                rows = csc.indices         # row index of each non-zero
+                vals = csc.data.astype(np.float32)
+
+                # Sort non-zeros by row so we can process contiguous groups.
+                row_order = np.argsort(rows, kind="stable")
+                sorted_rows = rows[row_order]
+                sorted_vals = vals[row_order]
+                sorted_cols = local_col_ids[row_order]
+
+                # Compute within-row sequential ranks: 0, 1, 2, … per row.
+                unique_rows, row_counts = np.unique(sorted_rows, return_counts=True)
+                row_ends = np.cumsum(row_counts)
+                row_starts = row_ends - row_counts
+                within_row = np.arange(len(sorted_rows)) - np.repeat(row_starts, row_counts)
+
+                # Absolute write positions: base offset for each row + rank.
+                positions = np.repeat(offset[unique_rows], row_counts) + within_row
+
+                out_data[positions] = sorted_vals
+                out_col_indices[positions] = sorted_cols
+
+                # Advance row write offsets.
+                offset[unique_rows] += row_counts.astype(np.int64)
+                col_global += n_chunk_cols
+        else:
+            # Row-chunk reading: fast on dense.  Each chunk is already CSR-ordered.
+            for _slc, block in iter_matrix_chunks(
+                backed, axis=0, chunk_size=chunk_size, convert_to_dense=False
+            ):
+                csr = _ensure_csr(block)
+                if csr.nnz == 0:
+                    continue
+                # Bulk copy: the chunk spans rows [_slc.start : _slc.stop].
+                # Global write position: indptr[_slc.start] to indptr[_slc.stop].
+                dst_start = int(indptr[_slc.start])
+                dst_end = dst_start + csr.nnz
+                out_data[dst_start:dst_end] = csr.data.astype(np.float32)
+                out_col_indices[dst_start:dst_end] = csr.indices.astype(col_dtype)
+    finally:
+        backed.file.close()
+
+    # Restore indptr (was not mutated in the row-chunk path, but reset for
+    # the column-chunk path which advanced offset instead).
+    indptr[0] = 0
+    np.cumsum(row_nnz, out=indptr[1:])
+
+    # ------------------------------------------------------------------ Write
+    hdf5_chunk_size = min(262144, max(8192, total_nnz // 16))
+
+    # Bootstrap a minimal skeleton so anndata writes valid obs/var groups.
+    placeholder = sp.csr_matrix((n_obs, n_vars), dtype=np.float32)
+    adata = ad.AnnData(placeholder, obs=obs, var=var)
+    adata.write(output_path)
+
+    # Replace the X group with a proper CSR encoding.
+    with h5py.File(output_path, "r+", libver="latest") as dest:
+        if "X" in dest:
+            del dest["X"]
+        grp = dest.create_group("X")
+        grp.attrs["encoding-type"] = np.bytes_("csr_matrix")
+        grp.attrs["encoding-version"] = np.bytes_("0.1.0")
+        grp.attrs["shape"] = np.array([n_obs, n_vars], dtype=np.int64)
+        chunk_arg = (hdf5_chunk_size,) if total_nnz >= hdf5_chunk_size else None
+        grp.create_dataset("data", data=out_data, chunks=chunk_arg)
+        grp.create_dataset("indices", data=out_col_indices, chunks=chunk_arg)
+        grp.create_dataset("indptr", data=indptr)
+
+    if verbose:
+        print(
+            f"  ✓ CSR file written: {n_obs} cells × {n_vars} genes,"
             f" {total_nnz:,} non-zeros"
         )
 
@@ -1682,6 +1948,89 @@ def calculate_optimal_gene_chunk_size(
         f"available memory: {available_memory_gb:.1f}GB)"
     )
     
+    return chunk_size
+
+
+def calculate_wilcoxon_chunk_size(
+    n_obs: int,
+    n_vars: int,
+    *,
+    available_memory_gb: float | None = None,
+    min_chunk: int = 32,
+    max_chunk: int = 4096,
+) -> int:
+    """Calculate optimal gene chunk size for Wilcoxon rank-sum tests.
+
+    Unlike :func:`calculate_optimal_gene_chunk_size`, this function has **no
+    n_groups cap**.  Wilcoxon writes all output arrays (effect, pvalue, z-score,
+    etc.) to on-disk memory-mapped files immediately, so peak RAM per chunk is
+    independent of the number of perturbation groups.  The only effective cap is
+    a per-chunk transient-memory budget:
+
+        transient ≈ chunk_size × (n_obs × 4  +  n_ctrl × 8  +  n_pert × 4)
+                  ≈ chunk_size × n_obs × 12 bytes
+
+    The budget is set to 15 % of ``available_memory_gb`` so that a single chunk
+    never exceeds ~1/7th of the node RAM.
+
+    Parameters
+    ----------
+    n_obs
+        Number of cells in the dataset.
+    n_vars
+        Number of genes in the dataset (used only for logging).
+    available_memory_gb
+        Available memory in GB.  When *None*, detected via :mod:`psutil`.
+        On HPC nodes, pass the SLURM ``--mem`` value so the cap reflects the
+        actual job allocation rather than system-wide free memory.
+    min_chunk
+        Floor for the returned chunk size (default 32).
+    max_chunk
+        Ceiling for the returned chunk size (default 4096).  The cell-budget
+        cap is applied *before* this ceiling, so ``max_chunk`` is only active
+        for small/sparse datasets where the cell cap would be very large.
+
+    Returns
+    -------
+    int
+        Recommended gene chunk size, clamped to ``[min_chunk, max_chunk]``.
+
+    Examples
+    --------
+    >>> # Feng-gwsnf: 396K cells, 128 GB → 4067
+    >>> calculate_wilcoxon_chunk_size(396458, 32373, available_memory_gb=128)
+    4067
+    >>> # Feng-ts: 1.16M cells, 128 GB → 1378
+    >>> calculate_wilcoxon_chunk_size(1161864, 33165, available_memory_gb=128)
+    1378
+    """
+    if available_memory_gb is None:
+        try:
+            import psutil
+            available_memory_gb = psutil.virtual_memory().available / 1e9
+        except ImportError:
+            logger.warning(
+                "psutil not installed, using default 16GB for Wilcoxon chunk size calculation. "
+                "Install with: pip install psutil"
+            )
+            available_memory_gb = 16.0
+
+    # Per-chunk transient memory budget: 15% of available RAM.
+    # transient ≈ chunk_size × n_obs × 12 bytes
+    # (dense float32 block + ctrl float64 presort + pert float32 stack).
+    _PER_CHUNK_BUDGET_FRACTION = 0.15
+    per_chunk_budget = available_memory_gb * _PER_CHUNK_BUDGET_FRACTION * 1e9
+    per_chunk_bytes_per_gene = n_obs * 12
+    cell_cap = max(min_chunk, int(per_chunk_budget / per_chunk_bytes_per_gene))
+
+    chunk_size = max(min_chunk, min(cell_cap, max_chunk))
+
+    logger.info(
+        f"Calculated Wilcoxon chunk size: {chunk_size} "
+        f"(dataset: {n_obs} cells × {n_vars} genes, "
+        f"available memory: {available_memory_gb:.1f}GB)"
+    )
+
     return chunk_size
 
 
@@ -2424,6 +2773,10 @@ def sort_by_perturbation(
     - perturbation_boundaries: Dict mapping perturbation labels to (start, end) indices
     - sorted_by: The column used for sorting
     - timestamp: When the sorting was performed
+
+    For sparse inputs the output is always written in CSR format, since sorting
+    benefits row-wise (per-perturbation) access patterns used by NB-GLM. CSC
+    files used by Wilcoxon do not need perturbation sorting.
     """
     import datetime
     
@@ -2529,28 +2882,35 @@ def sort_by_perturbation(
     storage_format = get_matrix_storage_format(path)
     is_dense = storage_format == "dense"
     
-    if is_dense:
-        # For dense storage: write directly as dense
-        _write_sorted_dense(
-            source_path=path,
-            output_path=output_path,
-            sort_indices=sort_indices,
-            obs_sorted=obs_sorted,
-            var=var,
-            uns=uns,
-            chunk_size=chunk_size,
-        )
-    else:
-        # For sparse storage: stream as CSR
-        _write_sorted_sparse(
-            source_path=path,
-            output_path=output_path,
-            sort_indices=sort_indices,
-            obs_sorted=obs_sorted,
-            var=var,
-            uns=uns,
-            chunk_size=chunk_size,
-        )
+    try:
+        if is_dense:
+            # For dense storage: write directly as dense
+            _write_sorted_dense(
+                source_path=path,
+                output_path=output_path,
+                sort_indices=sort_indices,
+                obs_sorted=obs_sorted,
+                var=var,
+                uns=uns,
+                chunk_size=chunk_size,
+            )
+        else:
+            # For sparse storage: stream as CSR
+            _write_sorted_sparse(
+                source_path=path,
+                output_path=output_path,
+                sort_indices=sort_indices,
+                obs_sorted=obs_sorted,
+                var=var,
+                uns=uns,
+                chunk_size=chunk_size,
+            )
+    except Exception:
+        # Remove partial output to avoid corrupt file on next run
+        if output_path.exists():
+            logger.warning(f"  Removing partial sorted file: {output_path}")
+            output_path.unlink()
+        raise
     
     logger.info(f"Saved sorted dataset: {output_path}")
     logger.info(f"  Perturbation groups: {len(label_order)} (control + {len(unique_labels)} perturbations)")
@@ -2650,35 +3010,122 @@ def _write_sorted_sparse(
     uns: dict,
     chunk_size: int,
 ) -> None:
-    """Write sorted file for sparse input matrix."""
-    # For sparse, we need to read and reorder
-    # This is memory-intensive for very large datasets
-    
+    """Write sorted file for sparse input matrix.
+
+    Uses chunked I/O to avoid loading the full matrix into memory.
+    Rows are read in output order (chunk_size at a time), converted
+    to CSR components, and appended to resizable HDF5 datasets.
+    Peak memory is proportional to chunk_size × n_genes, not n_cells × n_genes.
+    """
     backed = read_backed(source_path)
     try:
         n_cells = backed.n_obs
-        
-        # Read full sparse matrix (required for reordering)
-        logger.info("  Loading sparse matrix for reordering...")
-        X_sparse = backed.X[:]
-        if sp.issparse(X_sparse):
-            X_sparse = sp.csr_matrix(X_sparse)
+        n_genes = backed.n_vars
+
+        # Determine dtype from a small sample
+        sample = backed.X[:1]
+        if sp.issparse(sample):
+            data_dtype = sample.dtype
         else:
-            X_sparse = sp.csr_matrix(X_sparse)
+            data_dtype = np.float32
+
+        logger.info(
+            f"  Streaming sorted sparse write: {n_cells:,} cells, "
+            f"chunk_size={chunk_size}"
+        )
+
+        # Build CSR structure incrementally via h5py
+        with h5py.File(output_path, "w") as f:
+            x_grp = f.create_group("X")
+            x_grp.attrs["encoding-type"] = "csr_matrix"
+            x_grp.attrs["encoding-version"] = "0.1.0"
+            x_grp.attrs["shape"] = np.array([n_cells, n_genes], dtype=np.int64)
+
+            # Resizable datasets for data and indices; indptr is pre-allocated
+            ds_data = x_grp.create_dataset(
+                "data",
+                shape=(0,),
+                maxshape=(None,),
+                dtype=data_dtype,
+                chunks=(min(262144, max(1, n_cells)),),
+            )
+            ds_indices = x_grp.create_dataset(
+                "indices",
+                shape=(0,),
+                maxshape=(None,),
+                dtype=np.int32,
+                chunks=(min(262144, max(1, n_cells)),),
+            )
+            ds_indptr = x_grp.create_dataset(
+                "indptr",
+                shape=(n_cells + 1,),
+                dtype=np.int64,
+            )
+
+            nnz_written = 0
+            ds_indptr[0] = 0
+
+            for start in range(0, n_cells, chunk_size):
+                end = min(start + chunk_size, n_cells)
+                # Original row indices for this output chunk
+                orig_idx = sort_indices[start:end]
+
+                # Read rows from source (sorted for sequential access)
+                read_order = np.argsort(orig_idx)
+                sorted_orig_idx = orig_idx[read_order]
+                block = backed.X[sorted_orig_idx, :]
+
+                # Undo read_order to restore output order
+                inverse_order = np.argsort(read_order)
+                if sp.issparse(block):
+                    block = sp.csr_matrix(block)[inverse_order, :]
+                else:
+                    block = sp.csr_matrix(block[inverse_order, :])
+
+                csr = sp.csr_matrix(block, dtype=data_dtype)
+
+                chunk_nnz = csr.nnz
+                if chunk_nnz > 0:
+                    new_total = nnz_written + chunk_nnz
+                    ds_data.resize((new_total,))
+                    ds_indices.resize((new_total,))
+                    ds_data[nnz_written:new_total] = csr.data
+                    ds_indices[nnz_written:new_total] = csr.indices
+
+                # Write indptr for this chunk (int64 to avoid overflow
+                # when cumulative nnz exceeds INT32_MAX ≈ 2.1 billion)
+                chunk_indptr = csr.indptr[1:].astype(np.int64) + nnz_written
+                ds_indptr[start + 1 : end + 1] = chunk_indptr
+
+                nnz_written += chunk_nnz
+
+                if (start // chunk_size) % 50 == 0:
+                    logger.debug(
+                        f"  Written {end:,}/{n_cells:,} cells "
+                        f"({nnz_written:,} nnz)..."
+                    )
     finally:
         backed.file.close()
-    
-    # Reorder
-    X_sorted = X_sparse[sort_indices, :]
-    
-    # Create AnnData and write
-    adata_sorted = ad.AnnData(
-        X=X_sorted,
+
+    # Write obs, var, uns metadata using anndata
+    temp_path = output_path.with_suffix(".meta.h5ad")
+    adata_meta = ad.AnnData(
+        X=sp.csr_matrix((len(obs_sorted), len(var)), dtype=np.float32),
         obs=obs_sorted,
         var=var,
         uns=uns,
     )
-    adata_sorted.write(output_path)
+    adata_meta.write(temp_path)
+
+    with h5py.File(temp_path, "r") as src:
+        with h5py.File(output_path, "a") as dst:
+            for key in ["obs", "var", "uns"]:
+                if key in src:
+                    if key in dst:
+                        del dst[key]
+                    src.copy(key, dst)
+
+    temp_path.unlink()
 
 
 def get_perturbation_slice(
@@ -2729,3 +3176,673 @@ def get_perturbation_slice(
     finally:
         if should_close:
             adata.file.close()
+
+
+# =============================================================================
+# Feature 1 — Backed metadata helpers (load/write obs and var without X)
+# =============================================================================
+
+def _read_dataframe_from_h5(grp: "h5py.Group") -> pd.DataFrame:
+    """Read an AnnData-encoded HDF5 group as a pandas DataFrame."""
+    index_key = str(grp.attrs.get("_index", "_index"))
+    column_order = list(grp.attrs.get("column-order", []))
+
+    raw_index = grp[index_key][()]
+    if raw_index.dtype.kind in ("S", "O"):
+        raw_index = raw_index.astype(str)
+    index = pd.Index(raw_index)
+
+    all_keys = [k for k in grp.keys() if k != index_key]
+    ordered_keys = [k for k in column_order if k in grp] + [
+        k for k in all_keys if k not in set(column_order)
+    ]
+
+    columns: dict[str, Any] = {}
+    for key in ordered_keys:
+        item = grp[key]
+        if isinstance(item, h5py.Group):
+            enc = str(item.attrs.get("encoding-type", ""))
+            if enc == "categorical":
+                cats_raw = item["categories"][()]
+                if cats_raw.dtype.kind in ("S", "O"):
+                    cats_raw = cats_raw.astype(str)
+                cats = pd.Index(cats_raw)
+                codes = item["codes"][()].astype(np.intp)
+                ordered = bool(item.attrs.get("ordered", False))
+                columns[key] = pd.Categorical.from_codes(
+                    codes, categories=cats, ordered=ordered
+                )
+        else:
+            val = item[()]
+            if val.dtype.kind in ("S", "O"):
+                val = val.astype(str)
+            columns[key] = val
+
+    return pd.DataFrame(columns, index=index)
+
+
+def _write_dataframe_to_h5(grp: "h5py.Group", df: pd.DataFrame) -> None:
+    """Write a pandas DataFrame to an h5py Group in AnnData 0.2.0 encoding."""
+    str_dtype = h5py.string_dtype(encoding="utf-8")
+
+    grp.attrs["encoding-type"] = "dataframe"
+    grp.attrs["encoding-version"] = "0.2.0"
+    grp.attrs["_index"] = "_index"
+    grp.attrs["column-order"] = np.array(list(df.columns), dtype=object)
+
+    idx_ds = grp.create_dataset(
+        "_index", data=df.index.astype(str).to_numpy(), dtype=str_dtype
+    )
+    idx_ds.attrs["encoding-type"] = "string-array"
+    idx_ds.attrs["encoding-version"] = "0.2.0"
+
+    for col in df.columns:
+        series = df[col]
+        if isinstance(series.dtype, pd.CategoricalDtype):
+            cat_grp = grp.create_group(col)
+            cat_grp.attrs["encoding-type"] = "categorical"
+            cat_grp.attrs["encoding-version"] = "0.2.0"
+            cat_grp.attrs["ordered"] = bool(series.cat.ordered)
+            cats = series.cat.categories.astype(str).to_numpy()
+            cd = cat_grp.create_dataset("categories", data=cats, dtype=str_dtype)
+            cd.attrs["encoding-type"] = "string-array"
+            cd.attrs["encoding-version"] = "0.2.0"
+            codes = series.cat.codes.to_numpy()
+            codes_dtype = np.int8 if len(series.cat.categories) < 128 else np.int16
+            co = cat_grp.create_dataset("codes", data=codes.astype(codes_dtype))
+            co.attrs["encoding-type"] = "array"
+            co.attrs["encoding-version"] = "0.2.0"
+        elif series.dtype.kind in ("O", "U", "S"):
+            vals = series.fillna("").astype(str).to_numpy()
+            ds = grp.create_dataset(col, data=vals, dtype=str_dtype)
+            ds.attrs["encoding-type"] = "string-array"
+            ds.attrs["encoding-version"] = "0.2.0"
+        else:
+            ds = grp.create_dataset(col, data=series.to_numpy())
+            ds.attrs["encoding-type"] = "array"
+            ds.attrs["encoding-version"] = "0.2.0"
+
+
+def load_obs(path: str | Path) -> pd.DataFrame:
+    """Load the obs metadata table from an h5ad file without reading X.
+
+    Parameters
+    ----------
+    path
+        Path to the h5ad file.
+
+    Returns
+    -------
+    pd.DataFrame
+        Full obs DataFrame in memory.
+    """
+    with h5py.File(Path(path), "r") as f:
+        if "obs" not in f:
+            raise KeyError("h5ad file has no 'obs' group.")
+        return _read_dataframe_from_h5(f["obs"])
+
+
+def load_var(path: str | Path) -> pd.DataFrame:
+    """Load the var metadata table from an h5ad file without reading X.
+
+    Parameters
+    ----------
+    path
+        Path to the h5ad file.
+
+    Returns
+    -------
+    pd.DataFrame
+        Full var DataFrame in memory.
+    """
+    with h5py.File(Path(path), "r") as f:
+        if "var" not in f:
+            raise KeyError("h5ad file has no 'var' group.")
+        return _read_dataframe_from_h5(f["var"])
+
+
+def write_obs(path: str | Path, df: pd.DataFrame) -> None:
+    """Overwrite the obs metadata table in an h5ad file without touching X.
+
+    Parameters
+    ----------
+    path
+        Path to the h5ad file (modified in-place).
+    df
+        New obs DataFrame. Must have the same number of rows as the existing
+        obs table. Index values are written as cell barcodes.
+
+    Raises
+    ------
+    ValueError
+        If the DataFrame length does not match the existing n_obs.
+    """
+    path = Path(path)
+    with h5py.File(path, "r+") as f:
+        old_n = len(f["obs"]["_index"])
+        if len(df) != old_n:
+            raise ValueError(
+                f"DataFrame has {len(df)} rows but the file has {old_n} cells."
+            )
+        del f["obs"]
+        grp = f.create_group("obs")
+        _write_dataframe_to_h5(grp, df)
+
+
+def write_var(path: str | Path, df: pd.DataFrame) -> None:
+    """Overwrite the var metadata table in an h5ad file without touching X.
+
+    Parameters
+    ----------
+    path
+        Path to the h5ad file (modified in-place).
+    df
+        New var DataFrame. Must have the same number of rows as the existing
+        var table.
+
+    Raises
+    ------
+    ValueError
+        If the DataFrame length does not match the existing n_vars.
+    """
+    path = Path(path)
+    with h5py.File(path, "r+") as f:
+        old_n = len(f["var"]["_index"])
+        if len(df) != old_n:
+            raise ValueError(
+                f"DataFrame has {len(df)} rows but the file has {old_n} genes."
+            )
+        del f["var"]
+        grp = f.create_group("var")
+        _write_dataframe_to_h5(grp, df)
+
+
+# =============================================================================
+# Feature 2 — Gene name standardisation
+# =============================================================================
+
+def standardise_gene_names(
+    path: str | Path,
+    *,
+    column: str | None = None,
+    strip_version: bool = True,
+    normalise_mt_prefix: bool = True,
+    lookup_symbols: bool = False,
+    species: str = "human",
+    unmapped_action: Literal["keep", "error", "warn"] = "warn",
+    inplace: bool = True,
+) -> "pd.Series | None":
+    """Standardise gene identifiers in the var metadata table.
+
+    Applies a deterministic normalisation pipeline:
+
+    1. Strip Ensembl version suffixes (``ENSG00000123.4`` → ``ENSG00000123``).
+    2. Normalise ``mt-`` prefix to ``MT-`` (human mitochondrial convention).
+    3. Optionally resolve Ensembl IDs to HGNC symbols via ``mygene``
+       (requires ``pip install mygene``). A ``tqdm`` progress bar is shown
+       during batched lookups.
+
+    Parameters
+    ----------
+    path
+        Path to the h5ad file.
+    column
+        var column to normalise. ``None`` normalises the index (var_names).
+    strip_version
+        Strip ``".N"`` Ensembl version suffixes.
+    normalise_mt_prefix
+        Convert lower-case ``mt-`` prefix to ``MT-``.
+    lookup_symbols
+        If True, query ``mygene`` to map Ensembl IDs → gene symbols.
+    species
+        Species string passed to ``mygene`` (default ``"human"``).
+    unmapped_action
+        What to do for IDs not found by mygene: ``"keep"`` leaves them
+        unchanged, ``"warn"`` emits a warning, ``"error"`` raises.
+    inplace
+        If True, write the result back to the file and return ``None``.
+        If False, return a Series without modifying the file.
+
+    Returns
+    -------
+    pd.Series or None
+        Normalised gene names when ``inplace=False``, else ``None``.
+    """
+    path = Path(path)
+    df = load_var(path)
+
+    if column is None:
+        names = pd.Series(df.index.astype(str).to_numpy(), name="_index")
+    else:
+        if column not in df.columns:
+            raise KeyError(
+                f"Column '{column}' not found in var. "
+                f"Available: {list(df.columns)}"
+            )
+        names = df[column].astype(str).copy()
+
+    # Step 1: strip Ensembl version suffix
+    if strip_version:
+        names = names.str.replace(r"\.\d+$", "", regex=True)
+
+    # Step 2: normalise mt- prefix
+    if normalise_mt_prefix:
+        names = names.str.replace(r"^mt-", "MT-", regex=True)
+
+    # Step 3: optional online lookup via mygene
+    if lookup_symbols:
+        try:
+            import mygene  # type: ignore[import]
+        except ImportError:
+            raise ImportError(
+                "The 'mygene' package is required for online symbol lookup. "
+                "Install it with: pip install mygene"
+            )
+        mg = mygene.MyGeneInfo()
+        unique_ids = names.unique().tolist()
+        symbol_map: dict[str, str] = {}
+        batch_size = 1000
+        batches = list(range(0, len(unique_ids), batch_size))
+        try:
+            from tqdm import tqdm as _tqdm  # type: ignore[import]
+            it = _tqdm(batches, desc="mygene lookup", unit="batch")
+        except ImportError:
+            it = iter(batches)
+        for start in it:
+            batch = unique_ids[start : start + batch_size]
+            hits = mg.querymany(
+                batch,
+                scopes="ensembl.gene,symbol",
+                fields="symbol",
+                species=species,
+                verbose=False,
+                as_dataframe=False,
+            )
+            for hit in hits:
+                query_id = hit.get("query", "")
+                symbol = hit.get("symbol", "")
+                if symbol and not hit.get("notfound", False):
+                    symbol_map[query_id] = symbol
+        unmapped = [i for i in unique_ids if i not in symbol_map]
+        if unmapped:
+            msg = f"{len(unmapped)} gene IDs could not be mapped to symbols."
+            if unmapped_action == "error":
+                raise ValueError(msg + f" First 10: {unmapped[:10]}")
+            elif unmapped_action == "warn":
+                logger.warning("%s They will be left unchanged.", msg)
+        names = names.map(lambda x: symbol_map.get(x, x))
+
+    if not inplace:
+        return names
+
+    if column is None:
+        df.index = pd.Index(names.to_numpy(), name=df.index.name)
+    else:
+        df[column] = names.to_numpy()
+
+    write_var(path, df)
+    return None
+
+
+# =============================================================================
+# Feature 3 — Perturbation label normalisation
+# =============================================================================
+
+_DEFAULT_CONTROL_ALIASES: frozenset[str] = frozenset({
+    "ntc", "non-targeting", "non_targeting", "nontarget", "non-target",
+    "non_target", "control", "ctrl", "scramble", "scrambled",
+    "non-targeting control", "non-targeting-control",
+})
+
+
+def normalise_perturbation_labels(
+    path: str | Path,
+    column: str,
+    *,
+    strip_prefixes: list[str] | None = None,
+    strip_suffixes: list[str] | None = None,
+    strip_suffix_regex: str | None = None,
+    control_aliases: list[str] | None = None,
+    canonical_control: str = "NTC",
+    inplace: bool = True,
+) -> "pd.Series | None":
+    """Normalise perturbation labels stored in an obs column.
+
+    Applies transformations in order:
+
+    1. Strip specified prefixes via vectorised ``pd.Series.str.replace``.
+    2. Strip specified suffixes via vectorised ``pd.Series.str.replace``.
+    3. Apply a custom regex substitution (``strip_suffix_regex``).
+    4. Map known control aliases to ``canonical_control``.
+
+    Parameters
+    ----------
+    path
+        Path to the h5ad file.
+    column
+        obs column containing perturbation labels.
+    strip_prefixes
+        List of prefix strings to remove (e.g. ``["sg-", "sg"]``).
+    strip_suffixes
+        List of suffix strings to remove (e.g. ``["_KO", "_KD", "_P1P2"]``).
+    strip_suffix_regex
+        A Python regex applied via ``pd.Series.str.replace`` after
+        prefix/suffix stripping.
+    control_aliases
+        Additional strings (case-insensitive) treated as control labels.
+        The built-in aliases (``ntc``, ``ctrl``, ``scramble``, …) are always
+        included.
+    canonical_control
+        Canonical control label substituted for all matched aliases.
+    inplace
+        If True, write result back and return ``None``.
+        If False, return a Series without modifying the file.
+
+    Returns
+    -------
+    pd.Series or None
+        Normalised labels when ``inplace=False``, else ``None``.
+    """
+    path = Path(path)
+    df = load_obs(path)
+
+    if column not in df.columns:
+        raise KeyError(
+            f"Column '{column}' not found in obs. "
+            f"Available: {list(df.columns)}"
+        )
+    labels = df[column].astype(str)
+
+    # Step 1: strip prefixes (vectorised)
+    if strip_prefixes:
+        for prefix in strip_prefixes:
+            labels = labels.str.replace(
+                "^" + _re.escape(prefix), "", regex=True
+            )
+
+    # Step 2: strip suffixes (vectorised)
+    if strip_suffixes:
+        for suffix in strip_suffixes:
+            labels = labels.str.replace(
+                _re.escape(suffix) + "$", "", regex=True
+            )
+
+    # Step 3: custom regex substitution (vectorised)
+    if strip_suffix_regex:
+        labels = labels.str.replace(strip_suffix_regex, "", regex=True)
+
+    # Step 4: unify control labels
+    all_aliases = set(_DEFAULT_CONTROL_ALIASES)
+    if control_aliases:
+        all_aliases.update(a.lower() for a in control_aliases)
+    is_control = labels.str.lower().isin(all_aliases)
+    labels = labels.where(~is_control, other=canonical_control)
+
+    if not inplace:
+        return labels
+
+    if isinstance(df[column].dtype, pd.CategoricalDtype):
+        df[column] = pd.Categorical(labels.to_numpy())
+    else:
+        df[column] = labels.to_numpy()
+
+    write_obs(path, df)
+    return None
+
+
+# =============================================================================
+# Feature 4 — Auto-detection of metadata columns
+# =============================================================================
+
+_PERTURBATION_COL_ALIASES: frozenset[str] = frozenset({
+    "perturbation", "gene", "gene_target", "condition",
+    "guide_identity", "target_gene_name", "gene_name", "sgrna",
+    "guide", "guide_id", "sgrna_name", "target",
+})
+
+_GENE_SYMBOL_COL_ALIASES: frozenset[str] = frozenset({
+    "gene_symbols", "gene_name", "gene", "symbol",
+    "hgnc_symbol", "gene_symbol", "feature_name",
+})
+
+_CTRL_TERMS: frozenset[str] = frozenset({
+    "ctrl", "control", "nontarget", "non-target", "non_target",
+    "ntc", "scramble", "scrambled",
+})
+
+
+def detect_perturbation_column(
+    adata: "str | Path | AnnData | ad.AnnData",
+    *,
+    control_label: str | None = None,
+    min_unique: int = 2,
+    verbose: bool = True,
+) -> str | None:
+    """Heuristically identify the obs column containing perturbation labels.
+
+    Scoring:
+
+    * +3 if column name matches known aliases (``perturbation``,
+      ``gene_target``, …).
+    * +2 if dtype is categorical or object.
+    * +1 if unique-value count is in [``min_unique``, 5000].
+    * +2 if at least one value matches a known control synonym or
+      ``control_label`` when provided.
+
+    Parameters
+    ----------
+    adata
+        Backed AnnData, :class:`~crispyx.data.AnnData`, or path to h5ad file.
+    control_label
+        Known control label; boosts the score for columns containing it.
+    min_unique
+        Minimum number of unique values required for the +1 bonus.
+    verbose
+        Log the detected column name.
+
+    Returns
+    -------
+    str or None
+        Column name with the highest score, or ``None`` if no column scores
+        above zero.
+    """
+    path = resolve_data_path(adata)
+    obs = load_obs(path)
+
+    scores: dict[str, int] = {}
+    for col in obs.columns:
+        score = 0
+        if col.lower() in _PERTURBATION_COL_ALIASES:
+            score += 3
+        dtype = obs[col].dtype
+        if isinstance(dtype, pd.CategoricalDtype) or dtype == object:
+            score += 2
+        try:
+            n_unique = int(obs[col].nunique())
+        except Exception:
+            n_unique = 0
+        if min_unique <= n_unique <= 5000:
+            score += 1
+        lower_vals = obs[col].astype(str).str.lower()
+        if control_label is not None:
+            if (lower_vals == control_label.lower()).any():
+                score += 2
+        else:
+            if lower_vals.isin(_CTRL_TERMS).any():
+                score += 2
+        scores[col] = score
+
+    if not scores:
+        return None
+    best_col, best_score = max(scores.items(), key=lambda x: x[1])
+    if best_score <= 0:
+        return None
+    if verbose:
+        logger.info(
+            "Detected perturbation column: '%s' (score=%d).", best_col, best_score
+        )
+    return best_col
+
+
+def detect_gene_symbol_column(
+    adata: "str | Path | AnnData | ad.AnnData",
+    *,
+    verbose: bool = True,
+) -> str | None:
+    """Heuristically identify the var column containing gene symbols.
+
+    Scoring:
+
+    * +3 if column name matches known aliases (``gene_symbols``, ``symbol``, …).
+    * +2 if values pass :func:`_validate_gene_symbols` without error.
+    * +1 if values do **not** start with Ensembl prefixes.
+
+    Returns ``None`` when no column qualifies, which signals that
+    ``var_names`` should be used as a fallback.
+
+    Parameters
+    ----------
+    adata
+        Backed AnnData, :class:`~crispyx.data.AnnData`, or path to h5ad file.
+    verbose
+        Log the detected column name.
+
+    Returns
+    -------
+    str or None
+    """
+    path = resolve_data_path(adata)
+    var = load_var(path)
+
+    ensembl_3 = frozenset(p[:3].upper() for p in ENSEMBL_PREFIXES)
+    scores: dict[str, int] = {}
+    for col in var.columns:
+        score = 0
+        if col.lower() in _GENE_SYMBOL_COL_ALIASES:
+            score += 3
+        try:
+            _validate_gene_symbols(var[col].astype(str))
+            score += 2
+        except ValueError:
+            pass
+        prefixes = var[col].astype(str).str.upper().str.slice(0, 3)
+        if not prefixes.isin(ensembl_3).any():
+            score += 1
+        scores[col] = score
+
+    if not scores:
+        return None
+    best_col, best_score = max(scores.items(), key=lambda x: x[1])
+    if best_score <= 0:
+        return None
+    if verbose:
+        logger.info(
+            "Detected gene symbol column: '%s' (score=%d).", best_col, best_score
+        )
+    return best_col
+
+
+def infer_columns(
+    adata: "str | Path | AnnData | ad.AnnData",
+    *,
+    control_label: str | None = None,
+    verbose: bool = True,
+) -> dict[str, str | None]:
+    """Detect perturbation and gene-symbol columns in a single call.
+
+    Parameters
+    ----------
+    adata
+        Backed AnnData, :class:`~crispyx.data.AnnData`, or path to h5ad file.
+    control_label
+        Known control label forwarded to :func:`detect_perturbation_column`.
+    verbose
+        Log detected column names.
+
+    Returns
+    -------
+    dict
+        ``{"perturbation_column": ..., "gene_name_column": ...}`` where each
+        value is the detected column name or ``None``.
+    """
+    return {
+        "perturbation_column": detect_perturbation_column(
+            adata, control_label=control_label, verbose=verbose
+        ),
+        "gene_name_column": detect_gene_symbol_column(adata, verbose=verbose),
+    }
+
+
+# =============================================================================
+# Feature 5 — Overlap analysis utilities
+# =============================================================================
+
+@dataclass
+class OverlapResult:
+    """Pairwise overlap statistics between named sets.
+
+    Attributes
+    ----------
+    count_matrix
+        (n_sets × n_sets) DataFrame of pairwise intersection sizes.
+    jaccard_matrix
+        (n_sets × n_sets) DataFrame of Jaccard similarity coefficients.
+    set_sizes
+        Series of sizes for each input set.
+    """
+
+    count_matrix: pd.DataFrame
+    jaccard_matrix: pd.DataFrame
+    set_sizes: pd.Series
+
+
+def compute_overlap(
+    sets_dict: dict[str, "set | list"],
+    *,
+    metric: Literal["count", "jaccard", "both"] = "both",
+) -> OverlapResult:
+    """Compute pairwise overlap statistics between named sets.
+
+    Parameters
+    ----------
+    sets_dict
+        Mapping of name → set (or list, converted to set).
+    metric
+        Which matrices to populate: ``"count"``, ``"jaccard"``, or
+        ``"both"`` (default).
+
+    Returns
+    -------
+    OverlapResult
+        Object with ``count_matrix``, ``jaccard_matrix``, and ``set_sizes``.
+
+    Examples
+    --------
+    >>> result = cx.tl.compute_overlap({
+    ...     "dataset_A": {"BRCA1", "TP53", "EGFR"},
+    ...     "dataset_B": {"TP53", "KRAS"},
+    ... })
+    >>> result.jaccard_matrix
+    """
+    names = list(sets_dict.keys())
+    sets: dict[str, set] = {k: set(v) for k, v in sets_dict.items()}
+    n = len(names)
+
+    count_arr = np.zeros((n, n), dtype=np.int64)
+    jaccard_arr = np.zeros((n, n), dtype=np.float64)
+
+    for i, name_i in enumerate(names):
+        for j, name_j in enumerate(names):
+            inter = len(sets[name_i] & sets[name_j])
+            if metric in ("count", "both"):
+                count_arr[i, j] = inter
+            if metric in ("jaccard", "both"):
+                union = len(sets[name_i] | sets[name_j])
+                jaccard_arr[i, j] = inter / union if union > 0 else 0.0
+
+    sizes = pd.Series({k: len(v) for k, v in sets.items()}, name="set_size")
+    return OverlapResult(
+        count_matrix=pd.DataFrame(count_arr, index=names, columns=names),
+        jaccard_matrix=pd.DataFrame(jaccard_arr, index=names, columns=names),
+        set_sizes=sizes,
+    )
