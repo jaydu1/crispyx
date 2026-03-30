@@ -15,7 +15,7 @@ set -e
 # ============================================================================
 # IMPORTANT: Set PROJECT_ROOT to the absolute path of your project on HPC
 # ============================================================================
-PROJECT_ROOT="${PROJECT_ROOT:-/lustre1/g/ids_du/Streamlining-CRISPR-Screen-Analysis}"
+PROJECT_ROOT="${PROJECT_ROOT:-/lustre1/g/ids_du/crispyx}"
 
 # Derived paths from PROJECT_ROOT
 SINGULARITY_DIR="$PROJECT_ROOT/benchmarking/singularity"

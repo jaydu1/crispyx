@@ -7,7 +7,7 @@ This directory contains scripts for running CRISPYx benchmarks on HPC systems us
 ### 1. Build the Docker Image (Local Machine)
 
 ```bash
-cd /path/to/Streamlining-CRISPR-Screen-Analysis
+cd /path/to/crispyx
 DOCKER_BUILDKIT=1 docker build -t crispyx-benchmark -f benchmarking/Dockerfile .
 ```
 

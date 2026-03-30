@@ -12,7 +12,7 @@
 set -e
 
 # Project root (modify for your HPC)
-PROJECT_ROOT="${PROJECT_ROOT:-/lustre1/g/ids_du/Streamlining-CRISPR-Screen-Analysis}"
+PROJECT_ROOT="${PROJECT_ROOT:-/lustre1/g/ids_du/crispyx}"
 CONFIG_DIR="$PROJECT_ROOT/benchmarking/config"
 SLURM_SCRIPT="$PROJECT_ROOT/benchmarking/singularity/slurm_benchmark.sh"
 

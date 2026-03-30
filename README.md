@@ -4,7 +4,7 @@
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![PyPI](https://img.shields.io/pypi/v/crispyx?label=pypi&color=orange)](https://pypi.org/project/crispyx)
 [![PyPI Downloads](https://static.pepy.tech/personalized-badge/crispyx?period=total&units=INTERNATIONAL_SYSTEM&left_color=BLACK&right_color=BRIGHTGREEN&left_text=downloads)](https://pepy.tech/projects/crispyx)
-[![Tests](https://github.com/jaydu1/Streamlining-CRISPR-Screen-Analysis/actions/workflows/tests.yml/badge.svg)](https://github.com/jaydu1/Streamlining-CRISPR-Screen-Analysis/actions/workflows/tests.yml)
+[![Tests](https://github.com/jaydu1/crispyx/actions/workflows/tests.yml/badge.svg)](https://github.com/jaydu1/crispyx/actions/workflows/tests.yml)
 
 ## Motivation
 
@@ -52,6 +52,26 @@ de_results = adata.uns["rank_genes_groups"].load()
 
 For the full workflow (normalisation, PCA, pseudo-bulk, NB-GLM, LFC shrinkage, plotting, data preparation utilities), see the [Usage Guide](docs/usage.rst) and the [tutorial notebook](docs/crispyx_tutorial.ipynb).
 
+## Performance
+
+Benchmarked across 12 CRISPR screen datasets (21k–1.97M cells), crispyx consistently outperforms Scanpy, Pertpy/PyDESeq2, and edgeR in both speed and memory:
+
+| Metric | crispyx vs Scanpy | crispyx vs Pertpy/PyDESeq2 |
+|---|---|---|
+| **t-test** | **2–11× faster** | — |
+| **Wilcoxon** | **2–43× faster** | — |
+| **NB-GLM** | — | **2× faster**, completes where Pertpy OOMs |
+| **Peak memory** | **2–6× lower** | Runs within 64 GB where Pertpy exceeds 120 GB |
+| **Accuracy** | Pearson *r* > 0.999 vs Scanpy | Pearson *r* > 0.97 vs PyDESeq2 |
+
+crispyx succeeds on **all 12 datasets**, while Scanpy times out or OOMs on the largest screens and Pertpy/edgeR fail on most genome-wide datasets.
+
+<p align="center">
+  <img src="benchmarking/figures/benchmark_figure.png" width="800" alt="Benchmark results: crispyx vs reference methods">
+</p>
+
+See [benchmarking/](benchmarking/) for full results and reproduction scripts.
+
 ## Installation
 
 ```bash
@@ -82,4 +102,4 @@ sphinx-build docs docs/_build
 
 ## Contributing
 
-Suggestions, bug reports, and contributions are welcome! Please open an [issue](https://github.com/jaydu1/Streamlining-CRISPR-Screen-Analysis/issues) or submit a pull request.
+Suggestions, bug reports, and contributions are welcome! Please open an [issue](https://github.com/jaydu1/crispyx/issues) or submit a pull request.

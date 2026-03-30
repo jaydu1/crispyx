@@ -15,7 +15,7 @@ FROM python:3.11-slim-bookworm
 
 LABEL org.opencontainers.image.title="CRISPYx Benchmark"
 LABEL org.opencontainers.image.description="Reproducible benchmarking environment for CRISPR screen analysis"
-LABEL org.opencontainers.image.source="https://github.com/jaydu1/Streamlining-CRISPR-Screen-Analysis"
+LABEL org.opencontainers.image.source="https://github.com/jaydu1/crispyx"
 
 # Prevent interactive prompts during package installation
 ENV DEBIAN_FRONTEND=noninteractive
