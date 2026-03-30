@@ -40,6 +40,12 @@ docs = [
     "sphinx-rtd-theme>=1.2",
 ]
 
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+crispyx = ["py.typed"]
+
 [tool.pytest.ini_options]
 addopts = "-q"
 filterwarnings = [
