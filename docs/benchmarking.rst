@@ -57,10 +57,5 @@ The benchmark suite includes the following NB-GLM variants:
 * ``crispyx_de_nb_glm_shrunk``: NB-GLM with apeGLM LFC shrinkage (recommended)
 
 The shrinkage variant applies adaptive Cauchy prior shrinkage to log-fold changes,
-which improves accuracy by preserving large effects while shrinking uncertain 
+which improves accuracy by preserving large effects while shrinking uncertain
 estimates toward zero.
-
-Latest Adamson_subset benchmark
--------------------------------
-
-For the most recent Adamson_subset run (2026-03-24), see :doc:`Adamson_subset_results`.

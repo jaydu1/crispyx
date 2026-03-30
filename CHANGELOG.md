@@ -2,6 +2,39 @@
 
 All notable changes to crispyx are documented here.
 
+## [0.7.6] - 2026-03-25
+
+### Changed
+- **Simplified `__init__.py`** (980 → 155 lines): Extracted all four Scanpy-style
+  namespace classes (`_PreprocessingNamespace`, `_PseudobulkNamespace`,
+  `_ToolsNamespace`, `_PlottingNamespace`) and their helpers (`_infer_control_label`,
+  `_t_test_results_to_rank_genes`) into a new `src/crispyx/_namespaces.py` module.
+  `__init__.py` now contains only imports, namespace instantiation, and `__all__`.
+
+### Removed
+- **Backward-compatibility aliases and parameters**:
+  - `_resolve_backed_path` alias in `__init__.py` (use `resolve_data_path`).
+  - `write_normalized_log1p` alias in `data.py` (use `normalize_total_log1p`).
+  - `"wald"` method mapping in `_ToolsNamespace.rank_genes_groups()` (use `"t-test"`).
+  - `max_workers` parameter from `nb_glm_test()` in `de.py` (memory-limited worker
+    count is now always applied unconditionally).
+  - Log2→ln backward-compatibility branch in `shrink_lfc()` — now raises `ValueError`
+    if the required ln-scale layers are missing.
+
+- **Unused Numba kernels** from `_kernels.py`:
+  - `_rankdata_avg_1d_numba` (superseded by `_rankdata_2d_numba`).
+  - `_wilcoxon_statistics_numba` (deprecated, never called).
+  - `_wilcoxon_batch_numba` (deprecated placeholder with `pass` body).
+
+### Improved
+- **Numpydoc-style docstrings** added to public API methods:
+  - `RankGenesGroupsResult`: `__getitem__`, `__iter__`, `__len__`, `items`,
+    `to_rank_genes_groups_dict`, `to_full_order_dict`.
+  - `DifferentialExpressionResult.result_path`.
+  - `AnnData.__init__`, `obs`, `var`, `uns` properties.
+  - `NBGLMFitter.fit_matrix`.
+  - `_tie_correction`, `_resolve_candidates` (private helpers).
+
 ## [0.7.5] - 2026-03-03
 
 ### Added

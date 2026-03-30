@@ -24,6 +24,7 @@ extensions = [
     "sphinx.ext.autosummary",
     "sphinx.ext.napoleon",
     "sphinx.ext.viewcode",
+    "nbsphinx",
 ]
 
 autosummary_generate = True
@@ -33,5 +34,11 @@ napoleon_numpy_docstring = True
 napoleon_use_param = True
 napoleon_use_rtype = True
 
-html_theme = "alabaster"
+# -- nbsphinx settings -------------------------------------------------------
+nbsphinx_execute = "never"  # use pre-existing cell outputs
+
+exclude_patterns = ["_build", "tutorial_outputs"]
+
+# -- HTML output --------------------------------------------------------------
+html_theme = "sphinx_rtd_theme"
 html_static_path: list[str] = []

@@ -12,7 +12,19 @@ import numpy as np
 
 
 def _tie_correction(ranks: np.ndarray) -> np.ndarray:
-    """Compute tie correction factors for each column of ``ranks``."""
+    """Compute tie correction factors for each column of ``ranks``.
+
+    Parameters
+    ----------
+    ranks : ndarray of shape (n_obs, n_genes)
+        Rank matrix (1-based, with ties averaged).
+
+    Returns
+    -------
+    ndarray of shape (n_genes,)
+        Correction factor per gene in ``[0, 1]``.  A value of 1 means
+        no ties; lower values indicate more ties.
+    """
 
     n_genes = ranks.shape[1]
     correction = np.ones(n_genes, dtype=np.float64)

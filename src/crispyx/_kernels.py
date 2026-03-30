@@ -592,47 +592,6 @@ def _wls_solve_2x2_numba(
 # Wilcoxon rank-sum test kernels
 # =============================================================================
 
-@nb.njit(cache=True)
-def _rankdata_avg_1d_numba(arr: np.ndarray) -> np.ndarray:
-    """Compute average ranks for a 1D array (matching scipy.stats.rankdata method='average').
-    
-    This is a numba-accelerated implementation that exactly matches scipy's rankdata
-    with method='average' for tie handling.
-    
-    Parameters
-    ----------
-    arr : (n,)
-        Input array to rank.
-        
-    Returns
-    -------
-    ranks : (n,)
-        Ranks with ties averaged (1-based).
-    """
-    n = arr.shape[0]
-    if n == 0:
-        return np.empty(0, dtype=np.float64)
-    
-    # Get sort indices
-    order = np.argsort(arr)
-    ranks = np.empty(n, dtype=np.float64)
-    
-    # Assign ranks with tie averaging
-    i = 0
-    while i < n:
-        j = i
-        # Find all elements equal to arr[order[i]]
-        while j < n - 1 and arr[order[j + 1]] == arr[order[i]]:
-            j += 1
-        # Average rank for tied elements: (i+1 + j+1) / 2
-        avg_rank = (i + j + 2) / 2.0
-        for k in range(i, j + 1):
-            ranks[order[k]] = avg_rank
-        i = j + 1
-    
-    return ranks
-
-
 @nb.njit(parallel=True, cache=True)
 def _rankdata_2d_numba(arr: np.ndarray, ranks_out: np.ndarray) -> None:
     """Compute average ranks for each column of a 2D array in parallel.
@@ -705,122 +664,6 @@ def _tie_correction_numba(ranks: np.ndarray, correction_out: np.ndarray) -> None
             i = j + 1
         
         correction_out[g] = 1.0 - tie_sum / denom
-
-
-@nb.njit(parallel=True, cache=True)
-def _wilcoxon_statistics_numba(
-    ranks: np.ndarray,
-    n_pert: int,
-    n_control: int,
-    tie_correction: np.ndarray,
-    u_stat_out: np.ndarray,
-    z_score_out: np.ndarray,
-    pvalue_out: np.ndarray,
-) -> None:
-    """Compute Wilcoxon U-statistic, z-score, and p-value for all genes in parallel.
-    
-    Assumes ranks matrix has perturbation cells in rows [0:n_pert) and
-    control cells in rows [n_pert:n_pert+n_control).
-    
-    Parameters
-    ----------
-    ranks : (n_samples, n_genes)
-        Rank matrix with perturbation rows first, then control rows.
-    n_pert : int
-        Number of perturbation cells.
-    n_control : int
-        Number of control cells.
-    tie_correction : (n_genes,)
-        Tie correction factors.
-    u_stat_out : (n_genes,)
-        Output U-statistics.
-    z_score_out : (n_genes,)
-        Output z-scores.
-    pvalue_out : (n_genes,)
-        Output p-values (two-sided).
-    """
-    n_genes = ranks.shape[1]
-    n_total = float(n_pert + n_control)
-    n_pert_f = float(n_pert)
-    n_control_f = float(n_control)
-    
-    expected = n_pert_f * (n_total + 1.0) / 2.0
-    
-    for g in nb.prange(n_genes):
-        # Sum ranks for perturbation group
-        rank_sum = 0.0
-        for i in range(n_pert):
-            rank_sum += ranks[i, g]
-        
-        # U-statistic
-        u_stat = rank_sum - n_pert_f * (n_pert_f + 1.0) / 2.0
-        u_stat_out[g] = u_stat
-        
-        # Standard deviation with tie correction
-        std = math.sqrt(
-            tie_correction[g] * n_pert_f * n_control_f * (n_total + 1.0) / 12.0
-        )
-        
-        if std > 0:
-            z = (rank_sum - expected) / std
-            z_score_out[g] = z
-            # Two-sided p-value using normal approximation
-            # P = 2 * (1 - Phi(|z|)) = 2 * Phi(-|z|) for standard normal
-            abs_z = abs(z)
-            # Use error function approximation for normal CDF
-            # Phi(x) = 0.5 * (1 + erf(x / sqrt(2)))
-            # 2 * (1 - Phi(|z|)) = 2 * 0.5 * (1 - erf(|z| / sqrt(2))) = erfc(|z| / sqrt(2))
-            pvalue_out[g] = math.erfc(abs_z / math.sqrt(2.0))
-        else:
-            z_score_out[g] = 0.0
-            pvalue_out[g] = 1.0
-
-
-@nb.njit(parallel=True, cache=True)
-def _wilcoxon_batch_numba(
-    all_cells_dense: np.ndarray,
-    control_indices: np.ndarray,
-    pert_indices_list: list,
-    pert_valid_masks: list,
-    valid_gene_indices: np.ndarray,
-    tie_correct: bool,
-    u_out: np.ndarray,
-    z_out: np.ndarray,
-    p_out: np.ndarray,
-    effect_out: np.ndarray,
-) -> None:
-    """Batch compute Wilcoxon statistics for all perturbations in parallel.
-    
-    This is the core optimized kernel that processes all perturbations in a single
-    call, parallelizing across perturbations using numba's prange.
-    
-    Parameters
-    ----------
-    all_cells_dense : (n_cells, n_valid_genes)
-        Dense matrix of all cells for valid genes only.
-    control_indices : (n_control,)
-        Row indices of control cells in all_cells_dense.
-    pert_indices_list : list of arrays
-        List of row index arrays for each perturbation group.
-    pert_valid_masks : list of bool arrays
-        List of validity masks (in valid_gene_indices space) for each perturbation.
-    valid_gene_indices : (n_valid_genes,)
-        Indices of valid genes in the original chunk.
-    tie_correct : bool
-        Whether to apply tie correction.
-    u_out : (n_pert_groups, n_chunk_genes)
-        Output U-statistics.
-    z_out : (n_pert_groups, n_chunk_genes)
-        Output z-scores.
-    p_out : (n_pert_groups, n_chunk_genes)
-        Output p-values.
-    effect_out : (n_pert_groups, n_chunk_genes)
-        Output effect sizes.
-    """
-    # This function cannot be easily parallelized across perturbations because
-    # each perturbation has different valid genes and cell counts.
-    # The parallelization happens within _rankdata_2d_numba and _tie_correction_numba
-    pass  # Placeholder - the actual logic is in the main loop
 
 
 @nb.njit(parallel=True, cache=True)
@@ -1808,11 +1651,8 @@ def _wilcoxon_single_pert_presorted(
         if n_zeros < n_total:
             # --- Binary-search ranking (always) ---
             # O(n_pert_nz * log(n_ctrl_nz)) — works for any zero fraction.
-            # The old threshold gate (zero_frac >= 0.5) was a legacy from
-            # the O(n_ctrl_nz + n_pert_nz) merge-sort era.  With binary
-            # search the cost is always dominated by the tiny pert side,
-            # so there is no reason to fall back to the O(n_total * log(n_total))
-            # argsort path for dense genes.
+            # O(n_pert_nz * log(n_ctrl_nz)) — binary search is always
+            # faster than O(n_total * log(n_total)) argsort for dense genes.
             n_ctrl_nz = ctrl_n_nonzero[g]
             n_pert_nonzero = n_pert - n_pert_zeros
 

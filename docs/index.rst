@@ -10,8 +10,7 @@ run without materialising the full matrix — even the largest screens can be
 processed with modest resources.
 
 The API mirrors Scanpy (``cx.pp``, ``cx.pb``, ``cx.tl``, ``cx.pl``) so existing
-workflows can migrate with minimal changes. See the
-`tutorial notebook <https://github.com/jinhongd/Streamlining-CRISPR-Screen-Analysis/blob/main/docs/crispyx_tutorial.ipynb>`_
+workflows can migrate with minimal changes. See the :doc:`tutorial <crispyx_tutorial>`
 for an end-to-end walkthrough.
 
 .. toctree::
@@ -19,5 +18,6 @@ for an end-to-end walkthrough.
    :caption: Contents
 
    usage
+   crispyx_tutorial
    benchmarking
    api

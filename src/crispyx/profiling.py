@@ -511,32 +511,30 @@ class Profiler:
 
 
 # =============================================================================
-# Backward-compatible wrapper classes
+# Specialized profiler subclasses
 # =============================================================================
 
 class TimingProfiler(Profiler):
-    """Timing-only profiler for backward compatibility.
-    
-    This is a thin wrapper around `Profiler` with `timing=True`.
+    """Timing-only profiler.
+
+    Thin wrapper around ``Profiler`` with ``timing=True``.
     """
-    
+
     def __init__(self, enabled: bool = False):
         super().__init__(timing=enabled)
         self.enabled = enabled
-        # Alias for backward compatibility
         self.timings = self._timings
 
 
 class MemoryProfiler(Profiler):
-    """Memory-only profiler for backward compatibility.
-    
-    This is a thin wrapper around `Profiler` with `memory=True`.
+    """Memory-only profiler.
+
+    Thin wrapper around ``Profiler`` with ``memory=True``.
     """
-    
+
     def __init__(self, enabled: bool = False, top_n: int = 10):
         super().__init__(memory=enabled, top_n=top_n)
         self.enabled = enabled
-        # Alias for backward compatibility
         self.snapshots = self._snapshots
 
 

@@ -270,6 +270,15 @@ class AnnData:
     """Thin wrapper around a backed :class:`anndata.AnnData` handle."""
 
     def __init__(self, path: str | Path, *, mode: str = "r") -> None:
+        """Open a backed AnnData wrapper.
+
+        Parameters
+        ----------
+        path : str or Path
+            Path to an ``.h5ad`` file.
+        mode : str, optional
+            HDF5 file access mode (default ``'r'``).
+        """
         self.path = Path(path)
         self._mode = mode
         self._backed: ad.AnnData | None = None
@@ -316,18 +325,21 @@ class AnnData:
 
     @property
     def obs(self) -> _LazyFrameAccessor:
+        """Lazy accessor for observation (cell) metadata."""
         if self._obs_view is None:
             self._obs_view = _LazyFrameAccessor(self, "obs")
         return self._obs_view
 
     @property
     def var(self) -> _LazyFrameAccessor:
+        """Lazy accessor for variable (gene) metadata."""
         if self._var_view is None:
             self._var_view = _LazyFrameAccessor(self, "var")
         return self._var_view
 
     @property
     def uns(self) -> _LazyUnsMapping:
+        """Lazy accessor for unstructured annotations."""
         if self._uns_view is None:
             self._uns_view = _LazyUnsMapping(self)
         return self._uns_view
@@ -1321,9 +1333,6 @@ def normalize_total_log1p(
     
     return AnnData(output_path)
 
-
-# Alias for backward compatibility
-write_normalized_log1p = normalize_total_log1p
 
 
 def convert_to_csc(

@@ -120,6 +120,18 @@ class DifferentialExpressionResult:
 
     @property
     def result_path(self) -> Path:
+        """Path to the on-disk result file.
+
+        Returns
+        -------
+        Path
+            Absolute path to the ``.h5ad`` file backing the result.
+
+        Raises
+        ------
+        AttributeError
+            If the result AnnData has not been initialised.
+        """
         if self.result is None:
             raise AttributeError("Result AnnData has not been initialised.")
         return self.result.path
@@ -174,20 +186,46 @@ class RankGenesGroupsResult(Mapping[str, DifferentialExpressionResult]):
             )
 
     def __getitem__(self, key: str) -> DifferentialExpressionResult:
+        """Return per-gene DE results for a single perturbation group.
+
+        Parameters
+        ----------
+        key : str
+            Perturbation group name.
+
+        Returns
+        -------
+        DifferentialExpressionResult
+            Results for the requested group.
+        """
         self._ensure_cache()
         return self._group_cache[key]
 
     def __iter__(self):  # type: ignore[override]
+        """Iterate over perturbation group names."""
         return iter(self.groups)
 
     def __len__(self) -> int:
+        """Return the number of perturbation groups."""
         return len(self.groups)
 
     def items(self):  # type: ignore[override]
+        """Return (group_name, DifferentialExpressionResult) pairs."""
         self._ensure_cache()
         return self._group_cache.items()
 
     def to_rank_genes_groups_dict(self) -> dict:
+        """Convert results to Scanpy-compatible ``rank_genes_groups`` dict.
+
+        Returns
+        -------
+        dict
+            Dictionary with keys ``'params'``, ``'names'``, ``'scores'``,
+            ``'logfoldchanges'``, ``'pvals'``, ``'pvals_adj'``, ``'pts'``,
+            ``'pts_rest'``, ``'auc'``, ``'u_stat'``, and ``'full'``.
+            Each value (except ``'params'`` and ``'full'``) is a NumPy
+            record array sorted by descending absolute score.
+        """
         gene_array = self.genes.to_numpy()
         sorted_names = gene_array[self.order]
         sorted_scores = np.take_along_axis(self.statistics, self.order, axis=1)
@@ -225,6 +263,19 @@ class RankGenesGroupsResult(Mapping[str, DifferentialExpressionResult]):
         return rank_genes_groups
 
     def to_full_order_dict(self) -> dict:
+        """Return unsorted matrices keyed by statistic name.
+
+        Unlike :meth:`to_rank_genes_groups_dict`, values are in the
+        original gene order (not sorted by score).
+
+        Returns
+        -------
+        dict
+            Keys: ``'scores'``, ``'pvals'``, ``'pvals_adj'``,
+            ``'logfoldchanges'``, ``'auc'``, ``'u_stat'``, ``'pts'``,
+            ``'pts_rest'``.  Each value is a 2-D ``(n_groups, n_genes)``
+            NumPy array (copy).
+        """
         return {
             "scores": self.statistics.copy(),
             "pvals": self.pvalues.copy(),
@@ -292,6 +343,27 @@ def _resolve_candidates(
     control_label: str,
     perturbations: Iterable[str] | None,
 ) -> list[str]:
+    """Determine which perturbation groups to test.
+
+    Parameters
+    ----------
+    labels : ndarray
+        All perturbation labels from the dataset.
+    control_label : str
+        Control group label to exclude.
+    perturbations : iterable of str or None
+        Explicit subset to test.  ``None`` means test all non-control groups.
+
+    Returns
+    -------
+    list of str
+        Candidate perturbation group names.
+
+    Raises
+    ------
+    ValueError
+        If no candidate groups remain after filtering.
+    """
     if perturbations is None:
         unique = pd.Index(labels).unique().tolist()
     else:
@@ -1058,7 +1130,6 @@ def nb_glm_test(
     memory_limit_gb: float | None = None,
     max_dense_fraction: float = 0.3,
     n_jobs: int | None = None,
-    max_workers: int | None = None,
     use_control_cache: bool = True,
     freeze_control: bool | None = None,
 ) -> RankGenesGroupsResult:
@@ -1255,8 +1326,6 @@ def nb_glm_test(
         Number of parallel workers for fitting GLMs across perturbations.
         If None, uses all available cores. If 1, runs sequentially.
         If -1, uses all available cores.
-    max_workers
-        Alias for n_jobs (for compatibility). If both are specified, n_jobs takes precedence.
     use_control_cache
         If True (default), precompute control cell statistics (intercept, weights,
         XᵀWX contributions) once and reuse them across all perturbation comparisons.
@@ -2307,10 +2376,7 @@ def nb_glm_test(
         # For small n_groups, run sequentially to avoid joblib overhead
         # (profiling shows joblib.sleep takes 24s for 2 perturbations)
         cpu_count = os.cpu_count() or 1
-        if max_workers is not None:
-            # Explicit max_workers takes precedence
-            effective_n_jobs = min(max_workers, cpu_count)
-        elif n_jobs is None or n_jobs == 0:
+        if n_jobs is None or n_jobs == 0:
             effective_n_jobs = cpu_count
         elif n_jobs == -1:
             effective_n_jobs = cpu_count
@@ -2562,8 +2628,8 @@ def nb_glm_test(
         n_to_run = len(candidates_to_run)
         memory_limited_workers = min(max_workers_by_memory, max_workers_by_size, n_to_run)
         
-        if max_workers is None and memory_limited_workers < effective_n_jobs:
-            # Only apply memory limiting if max_workers not explicitly set
+        if memory_limited_workers < effective_n_jobs:
+            # Apply memory limiting
             # Determine limiting factor for logging
             if memory_limited_workers == n_to_run and n_to_run < max_workers_by_memory and n_to_run < max_workers_by_size:
                 limit_reason = "perturbation_count"
@@ -4126,17 +4192,11 @@ def shrink_lfc(
         raw_lfc = adata.layers["logfoldchange_raw_ln"]  # Already ln-scale
         se = adata.layers["standard_error_ln"]
     else:
-        # Backward compatibility: convert from log2 to ln if needed
-        raw_lfc = adata.layers["logfoldchange_raw"]
-        se = adata.layers["standard_error"]
-        if lfc_base == "log2":
-            ln2 = np.log(2)
-            raw_lfc = raw_lfc * ln2  # Convert log2 -> ln
-            se = se * ln2
-            logger.warning(
-                "Input h5ad lacks ln-scale layers; converting from log2. "
-                "For best accuracy, re-run nb_glm_test with crispyx>=0.5.0."
-            )
+        raise ValueError(
+            f"Input file '{path}' lacks ln-scale layers "
+            "('logfoldchange_raw_ln', 'standard_error_ln'). "
+            "Re-run nb_glm_test with the current version of crispyx."
+        )
     dispersion = adata.layers["dispersion"]
     
     # Get fitted intercept from NB-GLM (ln-scale, critical for accurate shrinkage)

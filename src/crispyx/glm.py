@@ -190,7 +190,7 @@ def precompute_control_statistics(
         set control_matrix to None to save memory. This reduces per-worker pickle
         size from ~5GB to ~1MB for large datasets. Workers can use the frozen
         stats with `fit_batch_with_frozen_control()` instead of the raw matrix.
-        Default False for backward compatibility.
+        Default False.
         
     Returns
     -------
@@ -334,7 +334,7 @@ def precompute_control_statistics(
             f"memory saved: {n_control * n_genes * 8 / 1e6:.1f} MB"
         )
     else:
-        Y_to_store = Y  # Store dense matrix for backward compatibility
+        Y_to_store = Y
     
     # Free temporary arrays
     del mu, weights, z_centered, eta
@@ -1132,6 +1132,21 @@ class NBGLMFitter:
         return self._fit_gene_lbfgsb(y)
 
     def fit_matrix(self, matrix: ArrayLike, *, batch_size: int | None = None) -> list[NBGLMResult]:
+        """Fit NB GLM for every gene (column) in a count matrix.
+
+        Parameters
+        ----------
+        matrix : array-like of shape (n_samples, n_genes)
+            Raw count matrix.  Sparse (CSC) and dense formats are accepted.
+        batch_size : int or None, optional
+            Number of genes to densify at once when *matrix* is sparse.
+            ``None`` processes all genes in one batch.
+
+        Returns
+        -------
+        list of NBGLMResult
+            One result per gene, in column order.
+        """
         if sp.issparse(matrix):
             sparse_matrix = sp.csc_matrix(matrix, dtype=np.float64)
             n_genes = sparse_matrix.shape[1]
