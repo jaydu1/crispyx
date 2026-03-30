@@ -1,5 +1,11 @@
 # crispyx
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
+[![PyPI](https://img.shields.io/pypi/v/crispyx?label=pypi&color=orange)](https://pypi.org/project/crispyx)
+[![PyPI Downloads](https://static.pepy.tech/personalized-badge/crispyx?period=total&units=INTERNATIONAL_SYSTEM&left_color=BLACK&right_color=BRIGHTGREEN&left_text=downloads)](https://pepy.tech/projects/crispyx)
+[![Tests](https://github.com/jaydu1/Streamlining-CRISPR-Screen-Analysis/actions/workflows/tests.yml/badge.svg)](https://github.com/jaydu1/Streamlining-CRISPR-Screen-Analysis/actions/workflows/tests.yml)
+
 ## Motivation
 
 Genome-wide CRISPR screens routinely produce datasets with hundreds of thousands of cells and tens of thousands of genes. Standard single-cell analysis toolkits (Scanpy, Pertpy) load the entire count matrix into memory, which can require 30–100+ GB of RAM and makes many screens impractical to analyse on commodity hardware or shared HPC nodes with per-job memory limits.
@@ -73,3 +79,7 @@ pytest
 ```bash
 sphinx-build docs docs/_build
 ```
+
+## Contributing
+
+Suggestions, bug reports, and contributions are welcome! Please open an [issue](https://github.com/jaydu1/Streamlining-CRISPR-Screen-Analysis/issues) or submit a pull request.
