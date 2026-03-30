@@ -16,8 +16,6 @@ Genome-wide CRISPR screens routinely produce datasets with hundreds of thousands
 - **Data preparation utilities** – Edit backed metadata without loading X; standardise gene names; normalise perturbation labels; auto-detect metadata columns
 - **HPC-ready** – Resume/checkpoint for long-running jobs; configurable `memory_limit_gb`; Docker and Singularity support
 
-See [CHANGELOG.md](CHANGELOG.md) for version history.
-
 ## Quick Start
 
 ```python

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "crispyx"
-version = "0.7.6"
+version = "0.0.1"
 description = "Tools for scalable CRISPR screen analysis on on-disk AnnData objects"
 authors = [{name = "Streamlining CRISPR Team"}]
 dependencies = [
@@ -13,26 +13,24 @@ dependencies = [
     "numba>=0.59",
     "pandas>=1.5",
     "scipy>=1.10",
+    "h5py>=3.0",
+    "joblib>=1.0",
+    "scikit-learn>=1.0",
     "scanpy>=1.9.2",
-    "pertpy>=0.4",
     "seaborn>=0.12",
+    "matplotlib>=3.5",
+    "tqdm>=4.50",
 ]
 
 [project.optional-dependencies]
 test = [
-    "anndata>=0.9",
-    "numpy>=1.23",
-    "numba>=0.59",
-    "pandas>=1.5",
-    "scipy>=1.10",
-    "scanpy>=1.9.2",
-    "pertpy>=0.4",
     "filelock",
     "pytest",
     "statsmodels>=0.14",
     "pydeseq2>=0.4",
 ]
 benchmark = [
+    "pertpy>=0.4",
     "pyyaml>=6.0",
     "tqdm>=4.65",
     "psutil>=5.9",

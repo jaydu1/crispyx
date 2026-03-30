@@ -149,4 +149,3 @@ For datasets like Feng (320K-1.16M cells) with large control populations (~110K 
 | "Result transmission failed" | Queue data corruption from crash; rerun with `--force` |
 
 ---
-See [CHANGELOG.md](../CHANGELOG.md) for version history.
