@@ -1145,9 +1145,6 @@ def nb_glm_test(
     
     Parameters
     ----------
-    
-    **Data parameters**
-    
     data
         Path to an h5ad file, or a crispyx/anndata AnnData object containing
         raw count data.
@@ -1161,58 +1158,56 @@ def nb_glm_test(
         Column in `adata.var` with gene symbols. If None, uses `adata.var_names`.
     perturbations
         Specific perturbations to test. If None, tests all non-control groups.
-    
-    **Size factor parameters**
-    
     size_factors
         Optional array of per-cell size factors. If None, computes size factors
-        using the method specified by `size_factor_method`.
+        using the method specified by ``size_factor_method``.
     size_factor_method
-        Method for computing size factors when ``size_factors`` is None:
-        - "sparse": Sparse-aware median-of-ratios (default). Computes geometric
+        Method for computing size factors when ``size_factors`` is None.
+
+        - ``"sparse"``: Sparse-aware median-of-ratios (default). Computes geometric
           means using only non-zero values, suitable for sparse single-cell data.
-        - "deseq2": Classic DESeq2/PyDESeq2 style. Uses only genes expressed in
+        - ``"deseq2"``: Classic DESeq2/PyDESeq2 style. Uses only genes expressed in
           ALL cells (typically ~50-100 genes). Provides better numerical alignment
           with PyDESeq2 results but may be less robust for very sparse data.
     size_factor_scope
-        Scope for size factor computation:
-        - "global" (default): Compute size factors once on the full dataset. 
-          Recommended for CRISPR screens where all cells come from the same 
-          experiment and share a common sequencing depth distribution. Faster 
-          when combined with use_control_cache=True. Note: produces different 
-          results from PyDESeq2 (ρ ≈ 0.7-0.8) which uses per-comparison normalization.
-        - "per_comparison": Compute size factors separately for each control + 
-          perturbation comparison. This matches PyDESeq2's behavior exactly, 
-          leading to near-perfect LFC, statistic, and p-value concordance 
-          (ρ > 0.97 on Tian-crispra, ρ > 0.99 on Adamson_subset). Use this when 
+        Scope for size factor computation.
+
+        - ``"global"`` (default): Compute size factors once on the full dataset.
+          Recommended for CRISPR screens where all cells come from the same
+          experiment and share a common sequencing depth distribution. Faster
+          when combined with use_control_cache=True. Note: produces different
+          results from PyDESeq2 (rho ~ 0.7-0.8) which uses per-comparison normalization.
+        - ``"per_comparison"``: Compute size factors separately for each control +
+          perturbation comparison. This matches PyDESeq2's behavior exactly,
+          leading to near-perfect LFC, statistic, and p-value concordance
+          (rho > 0.97 on Tian-crispra, rho > 0.99 on Adamson_subset). Use this when
           PyDESeq2 compatibility is required or for bulk RNA-seq style analysis.
     scale_size_factors
         If True (default), scale size factors so their geometric mean equals 1.
-        This is the standard DESeq2/crispyx behavior. If False, use raw 
-        median-of-ratios size factors without rescaling, which matches 
+        This is the standard DESeq2/crispyx behavior. If False, use raw
+        median-of-ratios size factors without rescaling, which matches
         PyDESeq2's default behavior and can improve numerical alignment.
-    
-    **Dispersion parameters**
-    
     dispersion
         Fixed dispersion parameter for negative binomial. If None, estimates per gene.
     dispersion_method
-        Method for estimating dispersion when ``dispersion`` is None:
-        - "moments": Method-of-moments (fast but less accurate)
-        - "cox-reid": Cox-Reid adjusted profile likelihood (slower but more
+        Method for estimating dispersion when ``dispersion`` is None.
+
+        - ``"moments"``: Method-of-moments (fast but less accurate).
+        - ``"cox-reid"``: Cox-Reid adjusted profile likelihood (slower but more
           accurate, similar to DESeq2). This is the default.
     dispersion_scope
-        Scope for dispersion estimation:
-        - "global" (default): Precompute dispersion once using all cells (control +
-          all perturbations). This is ~10× faster for multi-perturbation datasets
+        Scope for dispersion estimation.
+
+        - ``"global"`` (default): Precompute dispersion once using all cells (control +
+          all perturbations). This is ~10x faster for multi-perturbation datasets
           since MAP dispersion estimation is done once instead of per-comparison.
           Recommended when perturbation effects are expected to be small relative
           to baseline expression (typical for CRISPR screens).
-        - "per_comparison": Estimate dispersion separately for each control + 
+        - ``"per_comparison"``: Estimate dispersion separately for each control +
           perturbation comparison. More accurate when perturbations cause large
           changes in gene expression variance, but significantly slower.
     share_dispersion
-        If True, estimate dispersion once using all cells, then use the same 
+        If True, estimate dispersion once using all cells, then use the same
         dispersion values for all Wald tests. If False (default), estimate
         dispersion separately for each perturbation comparison.
     use_map_dispersion
@@ -1221,14 +1216,12 @@ def nb_glm_test(
     shrink_dispersion
         If True, fit a mean-dispersion trend and shrink gene-wise dispersions
         toward the trend using an empirical Bayes prior.
-    
-    **Optimization parameters**
-    
     optimization_method
-        Method for coefficient optimization:
-        - "lbfgsb": L-BFGS-B optimization (PyDESeq2 style, default). Directly
+        Method for coefficient optimization.
+
+        - ``"lbfgsb"``: L-BFGS-B optimization (PyDESeq2 style, default). Directly
           optimizes the negative binomial log-likelihood.
-        - "irls": Iteratively Reweighted Least Squares (Fisher scoring). The
+        - ``"irls"``: Iteratively Reweighted Least Squares (Fisher scoring). The
           classic GLM fitting approach.
     max_iter
         Maximum iterations for GLM fitting.
@@ -1248,37 +1241,35 @@ def nb_glm_test(
         Maximum number of genes to densify per IRLS step. Keep this small to
         limit per-iteration memory when working with large sparse matrices. Set
         to ``None`` to process each chunk without additional batching.
-    
-    **Filtering parameters**
-    
     min_cells_expressed
         Minimum total cells (control + perturbation) expressing a gene for testing.
     min_total_count
         Minimum total count across all cells for a gene to be tested.
     cook_filter
         Whether to apply Cook's distance outlier filtering when available.
-    
-    **Output parameters**
-    
     lfc_shrinkage_type
-        Type of log-fold change shrinkage to apply:
-        - "none": No shrinkage (default)
-        - "apeglm": Adaptive shrinkage using Cauchy prior (PyDESeq2-compatible).
+        Type of log-fold change shrinkage to apply.
+
+        - ``"none"``: No shrinkage (default).
+        - ``"apeglm"``: Adaptive shrinkage using Cauchy prior (PyDESeq2-compatible).
           Preserves large effects while shrinking small/uncertain effects toward
           zero. Also updates standard errors to reflect posterior uncertainty.
     lfc_base
-        Log base for fold change output:
-        - "log2" (default): Output log2 fold change, matching PyDESeq2/edgeR.
-        - "ln": Output natural log fold change (raw GLM coefficients).
+        Log base for fold change output.
+
+        - ``"log2"`` (default): Output log2 fold change, matching PyDESeq2/edgeR.
+        - ``"ln"``: Output natural log fold change (raw GLM coefficients).
+
         Standard error is also converted to match the selected log base.
         Wald statistics remain unchanged since both LFC and SE are scaled equally.
     corr_method
-        Method for p-value correction: "benjamini-hochberg" or "bonferroni".
+        Method for p-value correction: ``"benjamini-hochberg"`` or ``"bonferroni"``.
     se_method
-        Method for computing standard errors:
-        - "sandwich" (default): Sandwich estimator SE = sqrt(c' @ H @ M @ H @ c).
+        Method for computing standard errors.
+
+        - ``"sandwich"`` (default): Sandwich estimator SE = sqrt(c' @ H @ M @ H @ c).
           More robust to model misspecification.
-        - "fisher": Standard Fisher information SE = sqrt(diag(inv(X'WX + ridge*I))).
+        - ``"fisher"``: Standard Fisher information SE = sqrt(diag(inv(X'WX + ridge*I))).
           Matches PyDESeq2's approach for better p-value parity.
     output_dir
         Directory for output h5ad file. Defaults to input file's directory.
@@ -1293,15 +1284,10 @@ def nb_glm_test(
         completion at DEBUG level. Requires tqdm to be installed for progress bar.
     profiling
         If True, enable timing and memory profiling. When enabled, stores
-        profiling data in `adata.uns["profiling"]` with fields:
-        - `fit_seconds`: Time for base NB-GLM fitting (excludes lfcShrink)
-        - `fit_peak_memory_mb`: Peak memory during fitting
-        - `profiling_enabled`: True
-        When False (default), `adata.uns["profiling"]` is set to "NA" to
+        profiling data in ``adata.uns["profiling"]`` with fields
+        ``fit_seconds``, ``fit_peak_memory_mb``, and ``profiling_enabled``.
+        When False (default), ``adata.uns["profiling"]`` is set to ``"NA"`` to
         avoid profiling overhead in production.
-    
-    **Resume/Memory parameters**
-    
     resume
         If True, attempt to resume from a previous interrupted run. Reads the
         checkpoint file to determine which perturbations have already been

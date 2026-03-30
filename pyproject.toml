@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "crispyx"
 version = "0.0.1"
 description = "Tools for scalable CRISPR screen analysis on on-disk AnnData objects"
-authors = [{name = "Streamlining CRISPR Team"}]
+authors = [{name = "crispyx Team"}]
 requires-python = ">=3.10"
 dependencies = [
     "anndata>=0.9",
@@ -39,6 +39,10 @@ benchmark = [
 docs = [
     "sphinx>=6.0",
     "sphinx-rtd-theme>=1.2",
+    "sphinx-copybutton>=0.5",
+    "nbsphinx>=0.9",
+    "ipykernel>=6.0",
+    "tomli>=2.0; python_version < '3.11'",
 ]
 
 [tool.setuptools.packages.find]

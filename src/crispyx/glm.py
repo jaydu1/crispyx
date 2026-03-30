@@ -1069,10 +1069,11 @@ class NBGLMFitter:
         Genes with a total count below this threshold are not fitted (the
         resulting ``NBGLMResult`` will report ``converged=False``).
     dispersion_method:
-        Method for estimating dispersion when ``dispersion`` is None:
-        - "moments": Method-of-moments (fast but less accurate)
-        - "cox-reid": Cox-Reid adjusted profile likelihood (slower but more
-          accurate, similar to DESeq2)
+        Method for estimating dispersion when ``dispersion`` is None.
+
+        - ``"moments"``: Method-of-moments (fast but less accurate).
+        - ``"cox-reid"``: Cox-Reid adjusted profile likelihood (slower but more
+          accurate, similar to DESeq2).
     """
 
     def __init__(
@@ -1539,14 +1540,14 @@ def fit_dispersion_trend(
     n_iter: int = 10,
 ) -> np.ndarray:
     """Fit a smooth mean-dispersion trend using DESeq2/PyDESeq2-style Gamma GLM.
-    
-    The parametric trend models dispersion as:
-        dispersion = asymptDisp + extraPois / mean
-    
+
+    The parametric trend models dispersion as
+    ``dispersion = asymptDisp + extraPois / mean``.
+
     This matches PyDESeq2's fitDispersionTrend which uses iteratively reweighted
-    least squares (IRLS) with a Gamma family and log link, fitting:
-        E[disp] = a0 + a1 / mean
-    
+    least squares (IRLS) with a Gamma family and log link, fitting
+    ``E[disp] = a0 + a1 / mean``.
+
     Outliers are iteratively removed based on prediction ratio bounds.
     
     Parameters
@@ -1836,13 +1837,13 @@ def estimate_dispersion_map(
     n_jobs: int = -1,
 ) -> np.ndarray:
     """Estimate MAP dispersion using vectorized grid search + optional refinement.
-    
+
     This implements PyDESeq2-style MAP estimation where the dispersion
-    is estimated by maximizing:
-        log L(Y | mu, alpha) + log prior(alpha | trend, prior_var)
-    
-    The prior is log-normal: log(alpha) ~ N(log(trend), prior_var)
-    
+    is estimated by maximizing
+    ``log L(Y | mu, alpha) + log prior(alpha | trend, prior_var)``.
+
+    The prior is log-normal: ``log(alpha) ~ N(log(trend), prior_var)``.
+
     **Optimization (v5)**: Uses fused Numba kernel that combines grid search
     with Brent's method refinement in a single parallel pass over genes.
     This eliminates joblib process spawning overhead, achieving ~2-3× speedup
@@ -2369,27 +2370,27 @@ def shrink_lfc_apeglm_from_stats(
     hybrid_base_mean_threshold: float = 10.0,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Apply apeGLM-style shrinkage using pre-computed MLE statistics.
-    
+
     This is a memory-efficient, fully vectorized version of apeGLM shrinkage
     that uses pre-computed MLE coefficients and standard errors without
     requiring access to the full count matrix. It applies a Cauchy prior and
     finds the MAP estimate using a damped Newton-Raphson optimization across
     all genes simultaneously.
-    
-    **Accuracy improvements (v2)**:
-    1. Gene-specific prior scales based on expression level (sqrt(base_mean))
-    2. Moment-corrected SE using observed Fisher information approximation
-    3. Hybrid fallback: marks genes with |MLE|/SE > threshold or low expression
-       for full NB-GLM re-fitting to achieve Eff ρ ≥ 0.98
-    
-    The posterior mode is found by solving:
-        beta_MAP = argmin { (beta - mle_lfc)^2 / (2 * se^2) + log(1 + (beta/s)^2) }
-    
+
+    Accuracy improvements (v2):
+
+    1. Gene-specific prior scales based on expression level (sqrt(base_mean)).
+    2. Moment-corrected SE using observed Fisher information approximation.
+    3. Hybrid fallback: marks genes with ``abs(MLE)/SE`` > threshold or low
+       expression for full NB-GLM re-fitting to achieve Eff rho >= 0.98.
+
+    The posterior mode is found by solving
+    ``beta_MAP = argmin { (beta - mle_lfc)^2 / (2 * se^2) + log(1 + (beta/s)^2) }``
     which is the negative log posterior with a Cauchy prior.
-    
+
     This implementation uses a robust damped Newton method with Hessian
     clamping to ensure convergence even when the standard Hessian becomes
-    negative (which can happen when |beta| > prior_scale). This matches
+    negative (which can happen when ``abs(beta)`` > prior_scale). This matches
     PyDESeq2's behavior which uses L-BFGS-B for robustness.
     
     Parameters
@@ -2418,9 +2419,9 @@ def shrink_lfc_apeglm_from_stats(
         be shrunk more aggressively. Default True.
     hybrid_fallback
         If True, return a mask indicating genes that need full NB-GLM re-fitting
-        due to problematic statistics (large |MLE|/SE or low expression).
+        due to problematic statistics (large ``abs(MLE)/SE`` or low expression).
     hybrid_mle_se_threshold
-        Genes with |MLE|/SE > this threshold are marked for full re-fitting.
+        Genes with ``abs(MLE)/SE`` > this threshold are marked for full re-fitting.
     hybrid_base_mean_threshold
         Genes with base_mean < this threshold are marked for full re-fitting.
     
