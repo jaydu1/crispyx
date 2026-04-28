@@ -11,6 +11,59 @@ from typing import Literal
 import numpy as np
 
 
+def _low_expr_in_both_mask(
+    *,
+    pert_expr_counts: np.ndarray,
+    control_expr_counts: np.ndarray,
+    pert_mean: np.ndarray,
+    control_mean: np.ndarray,
+    n_pert_cells: int,
+    n_control_cells: int,
+    min_pct_both: float = 0.01,
+    min_mean_both: float = 0.05,
+) -> np.ndarray:
+    """Return a boolean mask flagging genes that are jointly low-expressed.
+
+    A gene is flagged (True = drop / exclude from DE testing) only when **both**
+    the perturbation group and the control group fail **both** thresholds:
+
+    - fraction of cells with non-zero expression below ``min_pct_both``, AND
+    - mean expression (in the same units as ``pert_mean`` / ``control_mean``,
+      typically log1p-normalised) below ``min_mean_both``.
+
+    If a gene is well-expressed on either side, it is kept so the test can
+    detect the difference. Setting both thresholds to 0 disables the filter.
+
+    Parameters
+    ----------
+    pert_expr_counts, control_expr_counts
+        Number of cells with non-zero expression per gene, shape (n_genes,).
+    pert_mean, control_mean
+        Mean expression per gene, shape (n_genes,).
+    n_pert_cells, n_control_cells
+        Number of cells in each group.
+    min_pct_both
+        Minimum fraction of cells with non-zero expression. Default 0.01.
+    min_mean_both
+        Minimum mean expression. Default 0.05.
+
+    Returns
+    -------
+    ndarray of bool, shape (n_genes,)
+        ``True`` for genes that should be dropped from this comparison.
+    """
+
+    if (min_pct_both <= 0.0 and min_mean_both <= 0.0) or n_pert_cells == 0 or n_control_cells == 0:
+        return np.zeros(pert_expr_counts.shape[0], dtype=bool)
+
+    pct_p = pert_expr_counts.astype(np.float64, copy=False) / float(n_pert_cells)
+    pct_c = control_expr_counts.astype(np.float64, copy=False) / float(n_control_cells)
+
+    low_p = (pct_p < min_pct_both) & (pert_mean < min_mean_both)
+    low_c = (pct_c < min_pct_both) & (control_mean < min_mean_both)
+    return low_p & low_c
+
+
 def _tie_correction(ranks: np.ndarray) -> np.ndarray:
     """Compute tie correction factors for each column of ``ranks``.
 

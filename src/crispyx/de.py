@@ -98,6 +98,7 @@ from ._statistics import (
     _adjust_pvalue_matrix,
     _compute_se_batched,
     _compute_mom_dispersion_batched,
+    _low_expr_in_both_mask,
 )
 from ._memory import (
     _estimate_max_workers,
@@ -627,6 +628,8 @@ def t_test(
     gene_name_column: str | None = None,
     perturbations: Iterable[str] | None = None,
     min_cells_expressed: int = 0,
+    min_pct_both: float = 0.01,
+    min_mean_both: float = 0.05,
     cell_chunk_size: int | None = None,
     output_dir: str | Path | None = None,
     data_name: str | None = None,
@@ -667,6 +670,17 @@ def t_test(
         Specific perturbations to test. If None, tests all non-control groups.
     min_cells_expressed
         Minimum total cells (control + perturbation) expressing a gene for testing.
+    min_pct_both
+        Drop a gene from the comparison when the fraction of cells with non-zero
+        expression is below this threshold in BOTH the perturbation and control
+        groups (and the mean is also below ``min_mean_both``). Default ``0.01``.
+        Set to ``0.0`` together with ``min_mean_both=0.0`` to disable the filter.
+    min_mean_both
+        Drop a gene from the comparison when the mean expression (log1p units)
+        is below this threshold in BOTH groups (and the fraction expressed is
+        also below ``min_pct_both``). Default ``0.05``. Excluded genes are
+        written as NaN in ``score`` / ``pvalue`` / ``logfoldchanges`` /
+        ``effect_size``; ``pts`` and ``pts_rest`` remain populated.
     cell_chunk_size
         Number of cells to process per chunk (memory vs. speed tradeoff). This
         controls streaming along the cell axis and is distinct from any future
@@ -829,6 +843,11 @@ def t_test(
     adata.uns["control_label"] = control_label
     adata.uns["genes"] = gene_symbols.to_numpy()
     adata.uns["pvalue_correction"] = "benjamini-hochberg"
+    adata.uns["de_filter"] = {
+        "min_cells_expressed": int(min_cells_expressed),
+        "min_pct_both": float(min_pct_both),
+        "min_mean_both": float(min_mean_both),
+    }
     adata.write(output_path)
 
     candidate_indices = {label: i for i, label in enumerate(candidates)}
@@ -906,9 +925,22 @@ def t_test(
 
                 total_expr = expr_counts[idx] + expr_counts[control_idx]
                 valid = (se_buffer > 0) & (total_expr >= min_cells_expressed)
+                # Per-condition low-expression filter: drop genes that are
+                # jointly low in BOTH the perturbation and control groups.
+                low_both = _low_expr_in_both_mask(
+                    pert_expr_counts=expr_counts[idx],
+                    control_expr_counts=expr_counts[control_idx],
+                    pert_mean=mean_buffer,
+                    control_mean=control_mean,
+                    n_pert_cells=n_cells,
+                    n_control_cells=control_n,
+                    min_pct_both=min_pct_both,
+                    min_mean_both=min_mean_both,
+                )
+                valid &= ~low_both
 
-                stat_buffer[slot].fill(0)
-                pval_buffer[slot].fill(1)
+                stat_buffer[slot].fill(np.nan)
+                pval_buffer[slot].fill(np.nan)
                 stat_buffer[slot][valid] = effect_f32[valid] / se_buffer[valid]
                 
                 # Welch-Satterthwaite degrees of freedom for Welch's t-test
@@ -948,6 +980,13 @@ def t_test(
                 np.divide(lfc_work_buffer, control_mean_expm1, out=lfc_work_buffer)
                 np.log2(lfc_work_buffer, out=lfc_work_buffer)
                 lfc_buffer[slot] = lfc_work_buffer.astype(np.float32)
+
+                # Mask effect / lfc to NaN for genes excluded by per-condition
+                # low-expression filter so downstream tools see them as untested.
+                if low_both.any():
+                    invalid = low_both
+                    effect_buffer[slot][invalid] = np.nan
+                    lfc_buffer[slot][invalid] = np.nan
 
             # Track completed labels
             newly_completed = list(completed_labels)
@@ -1112,6 +1151,8 @@ def nb_glm_test(
     irls_batch_size: int | None = 128,
     # ---- Filtering parameters ----
     min_cells_expressed: int = 0,
+    min_pct_both: float = 0.01,
+    min_mean_both: float = 0.05,
     min_total_count: float = 1.0,
     cook_filter: bool = False,
     # ---- Output parameters ----
@@ -1245,6 +1286,16 @@ def nb_glm_test(
         Minimum total cells (control + perturbation) expressing a gene for testing.
     min_total_count
         Minimum total count across all cells for a gene to be tested.
+    min_pct_both
+        Drop a gene from a comparison when the fraction of cells with non-zero
+        expression is below this threshold in BOTH groups (combined with
+        ``min_mean_both``). Default ``0.01``. Set to ``0.0`` together with
+        ``min_mean_both=0.0`` to disable.
+    min_mean_both
+        Drop a gene from a comparison when the mean (size-factor-normalised)
+        expression is below this threshold in BOTH groups. Default ``0.05``.
+        Excluded genes appear as NaN in ``pvalue`` / ``effect`` / ``logfc``
+        / ``se``; ``pts`` and ``mean`` remain populated.
     cook_filter
         Whether to apply Cook's distance outlier filtering when available.
     lfc_shrinkage_type
@@ -1498,6 +1549,8 @@ def nb_glm_test(
         offset: np.ndarray,
         n_genes: int,
         min_cells_expressed: int,
+        min_pct_both: float,
+        min_mean_both: float,
         min_total_count: float,
         max_iter: int,
         tol: float,
@@ -1591,9 +1644,38 @@ def nb_glm_test(
             group_expr_counts = np.asarray(group_matrix.getnnz(axis=0)).ravel()
         else:
             group_expr_counts = np.sum(group_matrix > 0, axis=0)
-        
+
+        # Per-group means in size-factor-normalised count units. These feed
+        # both the per-condition low-expression filter and ``result["mean"]``
+        # below; computing them once avoids a duplicate matrix pass.
+        if sp.issparse(group_matrix):
+            group_mean = (
+                np.asarray(group_matrix.sum(axis=0)).ravel() / max(group_n, 1)
+            )
+        else:
+            group_mean = np.asarray(group_matrix.sum(axis=0)).ravel() / max(group_n, 1)
+
+        if sp.issparse(control_matrix):
+            control_mean_raw = (
+                np.asarray(control_matrix.sum(axis=0)).ravel() / max(control_n, 1)
+            )
+        else:
+            control_mean_raw = np.asarray(control_matrix.sum(axis=0)).ravel() / max(control_n, 1)
+
         total_expr_counts = control_expr_counts + group_expr_counts
         valid_mask = total_expr_counts >= min_cells_expressed
+        # Per-condition low-expression filter (jointly low in BOTH groups)
+        low_both = _low_expr_in_both_mask(
+            pert_expr_counts=group_expr_counts,
+            control_expr_counts=control_expr_counts,
+            pert_mean=group_mean,
+            control_mean=control_mean_raw,
+            n_pert_cells=group_n,
+            n_control_cells=control_n,
+            min_pct_both=min_pct_both,
+            min_mean_both=min_mean_both,
+        )
+        valid_mask = valid_mask & ~low_both
         valid_indices = np.where(valid_mask)[0]
 
         # Initialize result arrays
@@ -1809,6 +1891,8 @@ def nb_glm_test(
         size_factors: np.ndarray,
         n_genes: int,
         min_cells_expressed: int,
+        min_pct_both: float,
+        min_mean_both: float,
         min_total_count: float,
         max_iter: int,
         tol: float,
@@ -1899,7 +1983,25 @@ def nb_glm_test(
         
         # Combined mean
         result["mean"] = (control_cache.control_mean_expr * n_control + mean_group) / subset_n
-        
+
+        # Per-condition low-expression filter (jointly low in BOTH groups).
+        # ``mean_group`` is the size-factor-normalised SUM; divide by group_n
+        # for the per-cell mean used by the filter.
+        group_mean_per_cell = (
+            mean_group / group_n if group_n > 0 else np.zeros_like(mean_group)
+        )
+        low_both = _low_expr_in_both_mask(
+            pert_expr_counts=group_expr_counts,
+            control_expr_counts=control_cache.control_expr_counts,
+            pert_mean=group_mean_per_cell,
+            control_mean=control_cache.control_mean_expr,
+            n_pert_cells=group_n,
+            n_control_cells=n_control,
+            min_pct_both=min_pct_both,
+            min_mean_both=min_mean_both,
+        )
+        valid_mask = valid_mask & ~low_both
+
         if not np.any(valid_mask):
             return result
         
@@ -2856,6 +2958,8 @@ def nb_glm_test(
                             size_factors=size_factors,
                             n_genes=n_genes,
                             min_cells_expressed=min_cells_expressed,
+                            min_pct_both=min_pct_both,
+                            min_mean_both=min_mean_both,
                             min_total_count=min_total_count,
                             max_iter=max_iter,
                             tol=tol,
@@ -2891,6 +2995,8 @@ def nb_glm_test(
                             offset=offset,
                             n_genes=n_genes,
                             min_cells_expressed=min_cells_expressed,
+                            min_pct_both=min_pct_both,
+                            min_mean_both=min_mean_both,
                             min_total_count=min_total_count,
                             max_iter=max_iter,
                             tol=tol,
@@ -2941,6 +3047,8 @@ def nb_glm_test(
                                 size_factors=size_factors,
                                 n_genes=n_genes,
                                 min_cells_expressed=min_cells_expressed,
+                                min_pct_both=min_pct_both,
+                                min_mean_both=min_mean_both,
                                 min_total_count=min_total_count,
                                 max_iter=max_iter,
                                 tol=tol,
@@ -2968,6 +3076,8 @@ def nb_glm_test(
                                 offset=offset,
                                 n_genes=n_genes,
                                 min_cells_expressed=min_cells_expressed,
+                                min_pct_both=min_pct_both,
+                                min_mean_both=min_mean_both,
                                 min_total_count=min_total_count,
                                 max_iter=max_iter,
                                 tol=tol,
@@ -3076,6 +3186,11 @@ def nb_glm_test(
     adata.uns["size_factor_method"] = size_factor_method
     adata.uns["size_factor_scope"] = size_factor_scope
     adata.uns["dispersion_scope"] = dispersion_scope
+    adata.uns["de_filter"] = {
+        "min_cells_expressed": int(min_cells_expressed),
+        "min_pct_both": float(min_pct_both),
+        "min_mean_both": float(min_mean_both),
+    }
 
     # Store profiling results or "NA" for production
     if profiling and profiler is not None:
@@ -3142,6 +3257,8 @@ def _wilcoxon_test_streaming(
     n_genes: int,
     chunk_size: int,
     min_cells_expressed: int,
+    min_pct_both: float = 0.01,
+    min_mean_both: float = 0.05,
     tie_correct: bool,
     corr_method: str,
     output_path: Path,
@@ -3335,16 +3452,28 @@ def _wilcoxon_test_streaming(
                         )
                         pert_means.append(gm)
 
-                    # Determine valid genes per perturbation
+                    # Determine valid genes per perturbation using the shared
+                    # per-condition low-expression filter (drop genes that are
+                    # jointly low in BOTH groups by both pct and mean).
                     valid_masks = []
+                    low_both_masks = []
                     for idx in range(bs):
                         ge = pert_expr_counts[idx]
+                        gm = pert_means[idx]
                         total_expr = control_expr + ge
-                        low_expr = (control_expr < min_cells_expressed) & (
-                            ge < min_cells_expressed
+                        valid = total_expr >= min_cells_expressed
+                        low_both = _low_expr_in_both_mask(
+                            pert_expr_counts=ge,
+                            control_expr_counts=control_expr,
+                            pert_mean=gm,
+                            control_mean=control_mean,
+                            n_pert_cells=pert_n_cells[idx],
+                            n_control_cells=control_n,
+                            min_pct_both=min_pct_both,
+                            min_mean_both=min_mean_both,
                         )
-                        valid = (total_expr >= min_cells_expressed) & ~low_expr
-                        valid_masks.append(valid)
+                        low_both_masks.append(low_both)
+                        valid_masks.append(valid & ~low_both)
 
                     any_valid = np.zeros(n_chunk_genes, dtype=bool)
                     for v in valid_masks:
@@ -3427,6 +3556,7 @@ def _wilcoxon_test_streaming(
                         gm = pert_means[idx]
                         np_ = pert_n_cells[idx]
                         valid = valid_masks[idx]
+                        low_both = low_both_masks[idx]
 
                         pts = np.divide(
                             ge, float(np_),
@@ -3437,11 +3567,24 @@ def _wilcoxon_test_streaming(
                         pts_rest = np.where(valid, control_pts_chunk, 0.0)
                         lfc = np.log2((np.expm1(gm) + 1e-9) / control_mean_expm1)
                         lfc = np.where(valid, lfc, 0.0)
+                        # Mark genes excluded by the per-condition filter as
+                        # NaN so downstream tools see them as untested.
+                        if low_both.any():
+                            lfc = np.where(low_both, np.nan, lfc)
 
                         gene_pos = np.arange(slc.start, slc.stop)
                         batch_lfc[idx, gene_pos] = lfc
                         batch_pts[idx, gene_pos] = pts
                         batch_pts_rest[idx, gene_pos] = pts_rest
+
+                        # Mark stat / pvalue / effect / u / z as NaN for genes
+                        # excluded by the low-expression filter.
+                        if low_both.any():
+                            low_pos = slc.start + np.where(low_both)[0]
+                            batch_u[idx, low_pos] = np.nan
+                            batch_z[idx, low_pos] = np.nan
+                            batch_p[idx, low_pos] = np.nan
+                            batch_effect[idx, low_pos] = np.nan
             finally:
                 backed.file.close()
 
@@ -3508,6 +3651,8 @@ def wilcoxon_test(
     gene_name_column: str | None = None,
     perturbations: Iterable[str] | None = None,
     min_cells_expressed: int = 0,
+    min_pct_both: float = 0.01,
+    min_mean_both: float = 0.05,
     chunk_size: int | None = None,
     tie_correct: bool = True,
     corr_method: Literal["benjamini-hochberg", "bonferroni"] = "benjamini-hochberg",
@@ -3544,6 +3689,16 @@ def wilcoxon_test(
     min_cells_expressed
         Minimum total cells (control + perturbation) expressing a gene for testing.
         Genes below this threshold are assigned p-value=1 and effect_size=0.
+    min_pct_both
+        Drop a gene from a comparison when the fraction of cells with non-zero
+        expression is below this threshold in BOTH the perturbation and control
+        groups (combined with ``min_mean_both``). Default ``0.01``. Excluded
+        genes are written as NaN in ``score`` / ``pvalue`` / ``logfoldchanges``
+        / ``effect_size``; ``pts`` / ``pts_rest`` remain populated.
+    min_mean_both
+        Drop a gene from a comparison when the mean log1p expression is below
+        this threshold in BOTH groups. Default ``0.05``. Set together with
+        ``min_pct_both=0.0`` to disable the filter.
     chunk_size
         Number of genes to process per chunk (memory vs. speed tradeoff). Smaller
         values stream more, reducing peak memory at the cost of additional I/O.
@@ -3656,6 +3811,8 @@ def wilcoxon_test(
             n_genes=n_genes,
             chunk_size=chunk_size,
             min_cells_expressed=min_cells_expressed,
+            min_pct_both=min_pct_both,
+            min_mean_both=min_mean_both,
             tie_correct=tie_correct,
             corr_method=corr_method,
             output_path=output_path,
@@ -3811,16 +3968,28 @@ def wilcoxon_test(
                         )
                         pert_means.append(group_mean)
 
-                    # 3. Determine valid genes per perturbation
+                    # 3. Determine valid genes per perturbation using the
+                    # shared per-condition low-expression filter (drop genes
+                    # that are jointly low in BOTH groups by both pct and mean).
                     valid_masks = []
+                    low_both_masks = []
                     for idx, label in enumerate(candidates):
                         group_expr = pert_expr_counts[idx]
+                        group_mean = pert_means[idx]
                         total_expr = control_expr + group_expr
-                        low_expr = (control_expr < min_cells_expressed) & (
-                            group_expr < min_cells_expressed
+                        valid = total_expr >= min_cells_expressed
+                        low_both = _low_expr_in_both_mask(
+                            pert_expr_counts=group_expr,
+                            control_expr_counts=control_expr,
+                            pert_mean=group_mean,
+                            control_mean=control_mean,
+                            n_pert_cells=pert_n_cells[idx],
+                            n_control_cells=control_n,
+                            min_pct_both=min_pct_both,
+                            min_mean_both=min_mean_both,
                         )
-                        valid = (total_expr >= min_cells_expressed) & ~low_expr
-                        valid_masks.append(valid)
+                        low_both_masks.append(low_both)
+                        valid_masks.append(valid & ~low_both)
 
                     # 4. Find union of all valid genes (to minimize dense conversion)
                     any_valid = np.zeros(n_chunk_genes, dtype=bool)
@@ -3915,6 +4084,16 @@ def wilcoxon_test(
                     )
                     chunk_lfc[:] = np.where(valid_arr, raw_lfc, 0.0)
 
+                    # Mark genes excluded by the per-condition low-expression
+                    # filter as NaN so downstream tools see them as untested.
+                    low_both_arr = np.array(low_both_masks)  # (n_groups, n_chunk_genes)
+                    if low_both_arr.any():
+                        chunk_u[low_both_arr] = np.nan
+                        chunk_z[low_both_arr] = np.nan
+                        chunk_p[low_both_arr] = np.nan
+                        chunk_effect[low_both_arr] = np.nan
+                        chunk_lfc[low_both_arr] = np.nan
+
                     # 13. Write results to memmap — vectorized 2-D slice
                     # (7 calls instead of 7 × n_groups; better cache locality)
                     u_matrix[:, slc] = chunk_u
@@ -3929,7 +4108,7 @@ def wilcoxon_test(
                     # (prevents glibc arena fragmentation across many gene chunks)
                     del csr_block, chunk_u, chunk_z, chunk_p, chunk_effect, chunk_lfc
                     del chunk_pts, chunk_pts_rest, pert_expr_counts, pert_means
-                    del pert_n_cells, valid_masks
+                    del pert_n_cells, valid_masks, low_both_masks, low_both_arr
                     if n_valid_genes > 0:
                         del all_valid_dense, control_dense
                         del ctrl_sorted_flat, ctrl_offsets, ctrl_n_nz, ctrl_n_z, ctrl_tie_sums
