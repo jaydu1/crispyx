@@ -849,21 +849,21 @@ def _extract_csr_components_dense(
     # Ensure C-contiguous for numba
     if not block.flags['C_CONTIGUOUS']:
         block = np.ascontiguousarray(block)
-    
+
     # Use numba-accelerated parallel extraction (60x faster than scipy)
-        row_nnz = _numba_count_row_nnz(block)
-        indptr = np.zeros(block.shape[0] + 1, dtype=np.int64)
-        indptr[1:] = np.cumsum(row_nnz)
-        total_nnz = int(indptr[-1])
-        
-        if total_nnz == 0:
-            return np.array([], dtype=dtype), np.array([], dtype=np.int32), row_nnz, 0
-        
-        data = np.empty(total_nnz, dtype=dtype)
-        indices = np.empty(total_nnz, dtype=np.int32)
-        _numba_extract_csr_data(block.astype(dtype, copy=False), indptr, data, indices)
-        
-        return data, indices, row_nnz, total_nnz
+    row_nnz = _numba_count_row_nnz(block)
+    indptr = np.zeros(block.shape[0] + 1, dtype=np.int64)
+    indptr[1:] = np.cumsum(row_nnz)
+    total_nnz = int(indptr[-1])
+
+    if total_nnz == 0:
+        return np.array([], dtype=dtype), np.array([], dtype=np.int32), row_nnz, 0
+
+    data = np.empty(total_nnz, dtype=dtype)
+    indices = np.empty(total_nnz, dtype=np.int32)
+    _numba_extract_csr_data(block.astype(dtype, copy=False), indptr, data, indices)
+
+    return data, indices, row_nnz, total_nnz
 
 
 def write_filtered_subset(
