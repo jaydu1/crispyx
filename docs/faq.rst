@@ -95,3 +95,36 @@ Performance tips
   RAM.
 * **Use adaptive chunk sizes** (the default): let crispyx calculate optimal
   chunk sizes based on your ``memory_limit_gb``.
+
+Comparison questions
+--------------------
+
+When should I use crispyx instead of Scanpy?
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Use crispyx when your dataset does not fit in RAM, when you are running on an
+HPC system with a memory limit, or when you want a streaming on-disk pipeline.
+crispyx produces results identical to Scanpy for t-test and Wilcoxon DE
+(Pearson *r* > 0.9999). For datasets that fit in RAM and where you need
+Scanpy's broader ecosystem, use Scanpy.
+
+Can I use crispyx instead of Pertpy or PyDESeq2 for NB-GLM?
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Yes. crispyx implements a negative binomial GLM that is approximately 2× faster
+than Pertpy/PyDESeq2 and uses far less memory on genome-wide datasets. Results
+agree with PyDESeq2 (Pearson *r* > 0.97 for LFC estimates). crispyx does not
+implement the full PyDESeq2 feature set (custom design matrices, Cook's
+outlier filtering, etc.). For large genome-wide screens where PyDESeq2 runs
+out of memory, crispyx is currently the only practical Python option.
+
+Does crispyx replace the full Pertpy workflow?
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+No. crispyx focuses on QC, normalization, pseudobulk, and differential
+expression for CRISPR screens. Pertpy provides many additional perturbation
+analysis methods (Augur, Mixscape, CINEMA-OT, etc.) that are outside the scope
+of crispyx. For large screens, you can use crispyx for the memory-intensive
+DE steps and Pertpy for downstream perturbation-specific analyses.
+
+See :doc:`comparison` for a full side-by-side comparison.

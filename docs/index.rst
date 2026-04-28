@@ -53,6 +53,7 @@ Key features
 
    api
    benchmarking
+   comparison
    faq
 
 .. toctree::

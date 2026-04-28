@@ -59,3 +59,13 @@ The benchmark suite includes the following NB-GLM variants:
 The shrinkage variant applies adaptive Cauchy prior shrinkage to log-fold changes,
 which improves accuracy by preserving large effects while shrinking uncertain
 estimates toward zero.
+
+Results summary
+---------------
+
+See `benchmarking/benchmark_summary.md <https://github.com/jaydu1/crispyx/blob/main/benchmarking/benchmark_summary.md>`_
+for a human-readable summary of performance and accuracy results across all 12
+benchmark datasets, including runtime tables, memory tables, and accuracy metrics.
+
+For comparison of crispyx against Scanpy, Pertpy/PyDESeq2, and edgeR, see
+:doc:`comparison`.

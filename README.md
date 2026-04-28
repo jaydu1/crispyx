@@ -75,7 +75,15 @@ See [benchmarking/](benchmarking/) for full results and reproduction scripts.
 ## Installation
 
 ```bash
-pip install -e .
+pip install crispyx
+```
+
+For development (editable install with all extras):
+
+```bash
+git clone https://github.com/jaydu1/crispyx.git
+cd crispyx
+pip install -e ".[test,benchmark,docs]"
 ```
 
 ## Benchmarking
