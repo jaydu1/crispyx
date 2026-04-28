@@ -1,6 +1,20 @@
 Changelog
 =========
 
+Version 0.0.2
+-------------
+
+*Released 2026-04-28.*
+
+* **Per-condition low-expression filter for DE tests** – t-test, Wilcoxon, and
+  NB-GLM now accept ``min_pct_both`` (default ``0.01``) and ``min_mean_both``
+  (default ``0.05``) parameters. A gene is excluded from a perturbation
+  comparison (reported as NaN in ``pvalue`` / ``effect`` / ``logfoldchanges``)
+  when the fraction of expressing cells *and* the mean expression are both
+  below the respective thresholds in *both* the perturbation and control
+  groups. Setting both thresholds to ``0.0`` recovers the 0.0.1 behaviour
+  exactly. ``pts`` and mean expression values are always retained.
+
 Version 0.0.1
 -------------
 

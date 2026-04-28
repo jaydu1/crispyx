@@ -1,5 +1,13 @@
 # Benchmarking
 
+> **Reproducibility note:** The benchmarks and all results in this directory
+> were produced with **crispyx v0.0.1**. To reproduce them exactly, install
+> that version (`pip install crispyx==0.0.1`) or use the pinned Docker /
+> Singularity images described below. The default low-expression filter
+> introduced in v0.0.2 was not active during benchmarking; its effect on
+> benchmark datasets is negligible (< 0.3% of genes excluded) and does not
+> change relative performance rankings.
+
 Benchmark crispyx streaming methods against Scanpy, Pertpy, edgeR, and PyDESeq2.
 
 ## Quick Start
