@@ -2,6 +2,19 @@
 
 from __future__ import annotations
 
+import os
+
+# ---------------------------------------------------------------------------
+# OpenMP conflict guard — must precede any Numba import
+# ---------------------------------------------------------------------------
+# anndata 0.11.x eagerly imports torch when it is installed, loading PyTorch's
+# libiomp5 (Intel OMP) into the same process as Numba's libomp (LLVM OMP).
+# The dual OMP runtimes crash Numba prange on macOS (Segfault 11).  Using
+# Numba's "workqueue" backend avoids OMP entirely while preserving parallelism.
+# anndata 0.12+ fixes this but requires Python >=3.11 (crispyx supports 3.10).
+# Override with NUMBA_THREADING_LAYER=omp if you manage the OMP conflict yourself.
+os.environ.setdefault("NUMBA_THREADING_LAYER", "workqueue")
+
 from importlib.metadata import PackageNotFoundError, version
 
 try:
