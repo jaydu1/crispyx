@@ -3193,12 +3193,14 @@ def get_perturbation_slice(
 
 def _read_dataframe_from_h5(grp: "h5py.Group") -> pd.DataFrame:
     """Read an AnnData-encoded HDF5 group as a pandas DataFrame."""
-    index_key = str(grp.attrs.get("_index", "_index"))
-    column_order = list(grp.attrs.get("column-order", []))
+    _idx_raw = grp.attrs.get("_index", "_index")
+    index_key = _idx_raw.decode("utf-8") if isinstance(_idx_raw, bytes) else str(_idx_raw)
+    _col_raw = grp.attrs.get("column-order", [])
+    column_order = [x.decode("utf-8") if isinstance(x, bytes) else str(x) for x in _col_raw]
 
     raw_index = grp[index_key][()]
     if raw_index.dtype.kind in ("S", "O"):
-        raw_index = raw_index.astype(str)
+        raw_index = np.array([x.decode("utf-8") if isinstance(x, bytes) else x for x in raw_index])
     index = pd.Index(raw_index)
 
     all_keys = [k for k in grp.keys() if k != index_key]
@@ -3214,7 +3216,7 @@ def _read_dataframe_from_h5(grp: "h5py.Group") -> pd.DataFrame:
             if enc == "categorical":
                 cats_raw = item["categories"][()]
                 if cats_raw.dtype.kind in ("S", "O"):
-                    cats_raw = cats_raw.astype(str)
+                    cats_raw = np.array([x.decode("utf-8") if isinstance(x, bytes) else x for x in cats_raw])
                 cats = pd.Index(cats_raw)
                 codes = item["codes"][()].astype(np.intp)
                 ordered = bool(item.attrs.get("ordered", False))
@@ -3224,7 +3226,7 @@ def _read_dataframe_from_h5(grp: "h5py.Group") -> pd.DataFrame:
         else:
             val = item[()]
             if val.dtype.kind in ("S", "O"):
-                val = val.astype(str)
+                val = np.array([x.decode("utf-8") if isinstance(x, bytes) else x for x in val])
             columns[key] = val
 
     return pd.DataFrame(columns, index=index)

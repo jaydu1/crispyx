@@ -292,6 +292,89 @@ class TestBackedMetadataEditing:
         with _pytest.raises(ValueError, match="rows"):
             write_var(path, df)
 
+    # ------------------------------------------------------------------
+    # Tests for bytes-encoded HDF5 attrs (anndata <=0.8 / S-dtype style)
+    # ------------------------------------------------------------------
+
+    def _write_h5ad_with_bytes_attrs(self, path: Path) -> None:
+        """Write a minimal h5ad with S-dtype (bytes) column-order attribute.
+
+        This reproduces the on-disk format produced by anndata <= 0.8 and by
+        any writer that calls ``np.array([...], dtype='S...')`` for the
+        'column-order' attribute.  h5py reads S-dtype arrays back as
+        ``np.bytes_`` objects rather than Python strings.
+        """
+        import h5py as _h5py
+        import scipy.sparse as sp
+
+        str_dt = _h5py.string_dtype(encoding="utf-8")
+
+        # Write a skeleton obs/var/X so anndata can read the file back.
+        x = np.ones((3, 2), dtype=np.float32)
+        obs = pd.DataFrame(
+            {"perturbation": ["ctrl", "KO1", "KO2"]},
+            index=["c0", "c1", "c2"],
+        )
+        var = pd.DataFrame({"gene_symbol": ["BRCA1", "TP53"]}, index=["BRCA1", "TP53"])
+        adata = ad.AnnData(sp.csr_matrix(x), obs=obs, var=var)
+        adata.write(path)
+
+        # Now overwrite the obs 'column-order' attr with S-dtype bytes.
+        with _h5py.File(path, "r+") as f:
+            f["obs"].attrs["column-order"] = np.array(
+                list(obs.columns), dtype="S40"
+            )
+            f["var"].attrs["column-order"] = np.array(
+                list(var.columns), dtype="S40"
+            )
+
+    def test_load_obs_bytes_column_order_no_duplicates(self, tmp_path):
+        """load_obs must not duplicate columns when column-order is S-dtype bytes."""
+        path = tmp_path / "bytes_attrs.h5ad"
+        self._write_h5ad_with_bytes_attrs(path)
+        df = load_obs(path)
+        assert list(df.columns) == ["perturbation"], (
+            f"Expected ['perturbation'], got {list(df.columns)}"
+        )
+
+    def test_load_obs_bytes_column_order_correct_values(self, tmp_path):
+        """Column values must be read correctly when column-order uses S-dtype."""
+        path = tmp_path / "bytes_attrs.h5ad"
+        self._write_h5ad_with_bytes_attrs(path)
+        df = load_obs(path)
+        assert list(df["perturbation"]) == ["ctrl", "KO1", "KO2"]
+
+    def test_load_var_bytes_column_order_no_duplicates(self, tmp_path):
+        """load_var must not duplicate columns when column-order is S-dtype bytes."""
+        path = tmp_path / "bytes_attrs_var.h5ad"
+        self._write_h5ad_with_bytes_attrs(path)
+        df = load_var(path)
+        assert list(df.columns) == ["gene_symbol"], (
+            f"Expected ['gene_symbol'], got {list(df.columns)}"
+        )
+
+    def test_load_obs_bytes_index_key_attr(self, tmp_path):
+        """load_obs works when the _index attr is stored as bytes (np.bytes_)."""
+        import h5py as _h5py
+        import scipy.sparse as sp
+
+        # Write a normal file, then monkey-patch _index to bytes.
+        x = np.ones((2, 1), dtype=np.float32)
+        obs = pd.DataFrame({"pert": ["ctrl", "KO1"]}, index=["c0", "c1"])
+        var = pd.DataFrame(index=["g0"])
+        adata = ad.AnnData(sp.csr_matrix(x), obs=obs, var=var)
+        path = tmp_path / "bytes_index.h5ad"
+        adata.write(path)
+
+        with _h5py.File(path, "r+") as f:
+            # Replace string attr with bytes scalar (np.bytes_ round-trips via h5py)
+            del f["obs"].attrs["_index"]
+            f["obs"].attrs["_index"] = np.bytes_(b"_index")
+
+        df = load_obs(path)
+        assert list(df.index) == ["c0", "c1"]
+        assert "pert" in df.columns
+
 
 # ============================================================================
 # Feature 2: standardise_gene_names
