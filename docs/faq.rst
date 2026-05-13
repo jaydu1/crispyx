@@ -84,6 +84,47 @@ HPC / SLURM tips
   pages from counting toward memory limits.
 * See ``benchmarking/singularity/`` for SLURM submission scripts.
 
+My DE result is loaded instantly on the second call — is that expected?
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Yes.  Since v0.0.3 all three DE functions auto-reload an existing result file
+instead of rerunning the analysis.  When ``verbose=True`` a notice is printed:
+
+.. code-block:: text
+
+   [crispyx] Loading existing result: data/crispyx_wilcoxon.h5ad
+   [crispyx] Pass force=True to rerun the analysis.
+
+If you changed a parameter (e.g. ``min_pct_both``, a covariate list, or
+``dispersion_scope``) and want the result to reflect the new settings, pass
+``force=True`` to the DE function.  The existing output file will be
+overwritten.
+
+Can I pickle / serialise a ``RankGenesGroupsResult``?
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Yes, since v0.0.3.  The ``RecursionError`` that occurred when calling
+``pickle.dumps`` on a result object is fixed.  The on-disk HDF5 handle is
+excluded from the pickle payload and reopened lazily after unpickling:
+
+.. code-block:: python
+
+   import pickle
+   result = cx.wilcoxon_test("data.h5ad", perturbation_column="perturbation")
+
+   data = pickle.dumps(result)        # no RecursionError
+   restored = pickle.loads(data)      # works
+   # restored.result is None — no open file handle after unpickling.
+   # Access restored["KO1"].pvalue etc. normally.
+
+Note that ``restored.result`` is ``None`` after unpickling.  If you need the
+backed AnnData reference (e.g. to call ``result.result_path``), re-open it:
+
+.. code-block:: python
+
+   from crispyx.data import AnnData
+   restored.result = AnnData(original_output_path)
+
 Performance tips
 ----------------
 

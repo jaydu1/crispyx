@@ -351,8 +351,26 @@ class AnnData:
     def __exit__(self, exc_type, exc, tb) -> None:
         self.close()
 
-    def __getattr__(self, name: str):  # pragma: no cover - delegation helper
+    def __getattr__(self, name: str):
+        # Guard: during unpickling __init__ has not run yet so _backed doesn't
+        # exist.  Without this guard, accessing self.backed calls self._backed
+        # which triggers __getattr__("_backed") → infinite recursion.
+        if "_backed" not in self.__dict__:
+            raise AttributeError(name)
         return getattr(self.backed, name)
+
+    def __getstate__(self) -> dict:
+        """Return picklable state (path + mode only; file handle is not serialised)."""
+        return {"path": self.path, "_mode": self._mode}
+
+    def __setstate__(self, state: dict) -> None:
+        """Restore from pickle; file handle will be reopened lazily on next access."""
+        self.path = state["path"]
+        self._mode = state["_mode"]
+        self._backed = None
+        self._obs_view = None
+        self._var_view = None
+        self._uns_view = None
 
     def __repr__(self) -> str:  # pragma: no cover - debugging helper
         return f"AnnData(path={self.path!s}, mode='{self._mode}')"

@@ -77,6 +77,11 @@ Pseudo-bulk aggregation
 Differential expression
 ~~~~~~~~~~~~~~~~~~~~~~~
 
+All three DE functions accept a ``force: bool = False`` parameter (v0.0.3+).
+When the expected output ``.h5ad`` file already exists on disk, the function
+reloads and returns the saved result instead of rerunning.  Pass ``force=True``
+to overwrite.  See :ref:`auto-reload` in the usage guide.
+
 .. automodule:: crispyx.de
    :members:
    :undoc-members:

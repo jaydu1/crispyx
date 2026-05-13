@@ -20,19 +20,25 @@ def _low_expr_in_both_mask(
     n_pert_cells: int,
     n_control_cells: int,
     min_pct_both: float = 0.01,
-    min_mean_both: float = 0.05,
+    min_mean_ctrl: float = 0.05,
+    min_mean_pert: float = 0.0,
 ) -> np.ndarray:
     """Return a boolean mask flagging genes that are jointly low-expressed.
 
     A gene is flagged (True = drop / exclude from DE testing) only when **both**
-    the perturbation group and the control group fail **both** thresholds:
+    the perturbation group and the control group satisfy their respective
+    low-expression criteria.
 
-    - fraction of cells with non-zero expression below ``min_pct_both``, AND
-    - mean expression (in the same units as ``pert_mean`` / ``control_mean``,
-      typically log1p-normalised) below ``min_mean_both``.
+    **Control side**: flagged when *both* the fraction of expressing cells is
+    below ``min_pct_both`` *and* the mean expression is below ``min_mean_ctrl``.
 
-    If a gene is well-expressed on either side, it is kept so the test can
-    detect the difference. Setting both thresholds to 0 disables the filter.
+    **Perturbed side** (asymmetric by default): flagged when the fraction of
+    expressing cells is below ``min_pct_both``.  If ``min_mean_pert > 0.0``, the
+    mean expression must also be below ``min_mean_pert``.
+
+    The asymmetric default (``min_mean_pert=0.0``) prevents over-filtering of
+    genes that are induced from near-zero baseline expression in unbalanced
+    CRISPR-screen comparisons.
 
     Parameters
     ----------
@@ -43,9 +49,14 @@ def _low_expr_in_both_mask(
     n_pert_cells, n_control_cells
         Number of cells in each group.
     min_pct_both
-        Minimum fraction of cells with non-zero expression. Default 0.01.
-    min_mean_both
-        Minimum mean expression. Default 0.05.
+        Minimum fraction of expressing cells applied to *both* sides. Default 0.01.
+    min_mean_ctrl
+        Minimum mean expression applied to the *control* side. Default 0.05.
+    min_mean_pert
+        Minimum mean expression applied to the *perturbed* side. Default ``0.0``
+        (disabled — only the pct check is used for the perturbed group).
+        Set to the same value as ``min_mean_ctrl`` to apply symmetric mean
+        filtering to both groups.
 
     Returns
     -------
@@ -53,14 +64,25 @@ def _low_expr_in_both_mask(
         ``True`` for genes that should be dropped from this comparison.
     """
 
-    if (min_pct_both <= 0.0 and min_mean_both <= 0.0) or n_pert_cells == 0 or n_control_cells == 0:
+    if (
+        (min_pct_both <= 0.0 and min_mean_ctrl <= 0.0 and min_mean_pert <= 0.0)
+        or n_pert_cells == 0
+        or n_control_cells == 0
+    ):
         return np.zeros(pert_expr_counts.shape[0], dtype=bool)
 
     pct_p = pert_expr_counts.astype(np.float64, copy=False) / float(n_pert_cells)
     pct_c = control_expr_counts.astype(np.float64, copy=False) / float(n_control_cells)
 
-    low_p = (pct_p < min_pct_both) & (pert_mean < min_mean_both)
-    low_c = (pct_c < min_pct_both) & (control_mean < min_mean_both)
+    # Control side: pct AND mean check
+    low_c = (pct_c < min_pct_both) & (control_mean < min_mean_ctrl)
+
+    # Perturbed side: pct-only by default; add mean check only when min_mean_pert > 0
+    if min_mean_pert > 0.0:
+        low_p = (pct_p < min_pct_both) & (pert_mean < min_mean_pert)
+    else:
+        low_p = pct_p < min_pct_both
+
     return low_p & low_c
 
 

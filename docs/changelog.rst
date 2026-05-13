@@ -1,6 +1,38 @@
 Changelog
 =========
 
+Version 0.0.3
+-------------
+
+*Released 2026-05-13.*
+
+* **Auto-reload for DE results** – ``wilcoxon_test``, ``t_test``, and
+  ``nb_glm_test`` now accept a ``force: bool = False`` parameter.  When
+  ``False`` (default) and the expected output ``.h5ad`` file already exists on
+  disk, the functions load and return the saved result instead of rerunning the
+  analysis.  Set ``force=True`` to rerun unconditionally and overwrite the
+  existing file.  Combined with ``verbose=True``, a notice is printed to
+  stdout identifying the reloaded file path.
+
+* **Fixed ``RecursionError`` when pickling DE results** – ``AnnData.__getattr__``
+  now guards against access before ``__init__`` has run (e.g. during
+  ``pickle.load``), eliminating infinite recursion.  ``AnnData`` gains
+  ``__getstate__`` / ``__setstate__`` so only the file path and access mode are
+  serialised; the HDF5 handle is reopened lazily after unpickling.
+  ``RankGenesGroupsResult`` and ``DifferentialExpressionResult`` likewise gain
+  ``__getstate__`` / ``__setstate__`` that exclude the ``AnnData`` handle and
+  group cache from the pickle payload, allowing round-trip serialisation with
+  ``pickle.dumps`` / ``pickle.loads``.
+
+* **Asymmetric low-expression filter** – DE tests (t-test, Wilcoxon, NB-GLM)
+  now accept a ``min_mean_pert`` parameter (default ``0.0``). With the
+  default, the mean-expression check is applied only to the *control* group;
+  the perturbed group is filtered on fraction-of-expressing-cells
+  (``min_pct_both``) alone. This prevents the filter from discarding genes
+  that are induced from near-zero baseline expression, which is common in
+  unbalanced CRISPR-screen comparisons. To reproduce the v0.0.2 behaviour
+  pass ``min_mean_pert=min_mean_ctrl`` (e.g. ``min_mean_pert=0.05``).
+
 Version 0.0.2
 -------------
 

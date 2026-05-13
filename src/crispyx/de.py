@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import gc
+import dataclasses
 import logging
 import os
 import tempfile
@@ -137,6 +138,20 @@ class DifferentialExpressionResult:
             raise AttributeError("Result AnnData has not been initialised.")
         return self.result.path
 
+    def __getstate__(self) -> dict:
+        """Exclude the AnnData file handle from the pickle payload."""
+        return {
+            f.name: getattr(self, f.name)
+            for f in dataclasses.fields(self)
+            if f.name != "result"
+        }
+
+    def __setstate__(self, state: dict) -> None:
+        """Restore from pickle; ``result`` is set to ``None`` (no open file handle)."""
+        for key, value in state.items():
+            object.__setattr__(self, key, value)
+        object.__setattr__(self, "result", None)
+
 
 @dataclass
 class RankGenesGroupsResult(Mapping[str, DifferentialExpressionResult]):
@@ -170,6 +185,21 @@ class RankGenesGroupsResult(Mapping[str, DifferentialExpressionResult]):
         if self.result is None:
             raise AttributeError("Result AnnData has not been initialised.")
         return self.result.path
+
+    def __getstate__(self) -> dict:
+        """Exclude the AnnData file handle and group cache from the pickle payload."""
+        return {
+            f.name: getattr(self, f.name)
+            for f in dataclasses.fields(self)
+            if f.name not in ("result", "_group_cache")
+        }
+
+    def __setstate__(self, state: dict) -> None:
+        """Restore from pickle; ``result`` is ``None`` and cache is empty."""
+        for key, value in state.items():
+            object.__setattr__(self, key, value)
+        object.__setattr__(self, "result", None)
+        object.__setattr__(self, "_group_cache", {})
 
     def _ensure_cache(self) -> None:
         if self._group_cache:
@@ -620,6 +650,88 @@ def _write_rank_genes_groups_hdf5(
         params.attrs["corr_method"] = result.pvalue_correction
 
 
+def _load_completed_de_result(
+    output_path: Path,
+    *,
+    memory_limit_gb: float | None = None,
+) -> "RankGenesGroupsResult":
+    """Load a completed DE result directly from an existing h5ad file.
+
+    Reads all necessary metadata (method, control_label, perturbation_column,
+    etc.) from the result file itself so the original input data is not required.
+    Dispatches to :func:`_build_result_from_h5ad` for wilcoxon results and
+    :func:`_load_existing_nb_glm_result` for nb_glm / t_test results.
+    """
+
+    def _decode(v) -> str:
+        if isinstance(v, (bytes, np.bytes_)):
+            return v.decode()
+        if hasattr(v, "item"):
+            v = v.item()
+        if isinstance(v, (bytes, np.bytes_)):
+            return v.decode()
+        return str(v)
+
+    with h5py.File(output_path, "r") as hf:
+        # obs index → candidate perturbation labels
+        obs_grp = hf["obs"]
+        idx_key = obs_grp.attrs.get("_index", "_index")
+        if isinstance(idx_key, (bytes, np.bytes_)):
+            idx_key = idx_key.decode()
+        candidates: list[str] = [_decode(s) for s in hf[f"obs/{idx_key}"][:]]
+
+        # var index → gene symbols
+        var_grp = hf["var"]
+        var_idx_key = var_grp.attrs.get("_index", "_index")
+        if isinstance(var_idx_key, (bytes, np.bytes_)):
+            var_idx_key = var_idx_key.decode()
+        gene_symbols = pd.Index([_decode(s) for s in hf[f"var/{var_idx_key}"][:]])
+
+        # uns metadata — wilcoxon writes to group attrs; anndata (nb_glm, t_test)
+        # writes scalar datasets inside the uns group.
+        uns = hf["uns"]
+
+        def _read_uns(key: str, default=None):
+            if key in uns.attrs:
+                return _decode(uns.attrs[key])
+            if key in uns:
+                return _decode(uns[key][()])
+            return default
+
+        method = _read_uns("method", "wilcoxon")
+        control_label = _read_uns("control_label")
+        perturbation_column = _read_uns("perturbation_column")
+        corr_method = _read_uns("pvalue_correction", "benjamini-hochberg")
+
+        # tie_correct is wilcoxon-specific (stored as a bool)
+        tie_correct: bool = True
+        if "tie_correct" in uns.attrs:
+            tie_correct = bool(uns.attrs["tie_correct"])
+        elif "tie_correct" in uns:
+            tie_correct = bool(uns["tie_correct"][()])
+
+    if method == "wilcoxon":
+        return _build_result_from_h5ad(
+            output_path,
+            candidates=candidates,
+            gene_symbols=gene_symbols,
+            perturbation_column=perturbation_column,
+            control_label=control_label,
+            tie_correct=tie_correct,
+            corr_method=corr_method,
+            memory_limit_gb=memory_limit_gb,
+        )
+    # nb_glm and t_test share the same layer layout
+    return _load_existing_nb_glm_result(
+        output_path=output_path,
+        candidates=candidates,
+        gene_symbols=gene_symbols.tolist(),
+        perturbation_column=perturbation_column,
+        control_label=control_label,
+        corr_method=corr_method,
+    )
+
+
 def t_test(
     data: str | Path | AnnData | ad.AnnData,
     *,
@@ -629,7 +741,8 @@ def t_test(
     perturbations: Iterable[str] | None = None,
     min_cells_expressed: int = 0,
     min_pct_both: float = 0.01,
-    min_mean_both: float = 0.05,
+    min_mean_ctrl: float = 0.05,
+    min_mean_pert: float = 0.0,
     cell_chunk_size: int | None = None,
     output_dir: str | Path | None = None,
     data_name: str | None = None,
@@ -639,6 +752,7 @@ def t_test(
     checkpoint_interval: int | None = None,
     scanpy_format: bool = False,
     memory_limit_gb: float | None = None,
+    force: bool = False,
 ) -> RankGenesGroupsResult:
     """Perform a t-test comparing log-expression means for each perturbation.
     
@@ -673,14 +787,19 @@ def t_test(
     min_pct_both
         Drop a gene from the comparison when the fraction of cells with non-zero
         expression is below this threshold in BOTH the perturbation and control
-        groups (and the mean is also below ``min_mean_both``). Default ``0.01``.
-        Set to ``0.0`` together with ``min_mean_both=0.0`` to disable the filter.
-    min_mean_both
+        groups (and the mean is also below ``min_mean_ctrl``). Default ``0.01``.
+        Set to ``0.0`` together with ``min_mean_ctrl=0.0`` to disable the filter.
+    min_mean_ctrl
         Drop a gene from the comparison when the mean expression (log1p units)
         is below this threshold in BOTH groups (and the fraction expressed is
         also below ``min_pct_both``). Default ``0.05``. Excluded genes are
         written as NaN in ``score`` / ``pvalue`` / ``logfoldchanges`` /
         ``effect_size``; ``pts`` and ``pts_rest`` remain populated.
+    min_mean_pert
+        Mean expression threshold applied to the *perturbed* group only.
+        Default ``0.0`` (disabled — only the pct check is applied to the
+        perturbed side).  Set to the same value as ``min_mean_ctrl`` to apply
+        symmetric mean filtering to both groups.
     cell_chunk_size
         Number of cells to process per chunk (memory vs. speed tradeoff). This
         controls streaming along the cell axis and is distinct from any future
@@ -709,6 +828,10 @@ def t_test(
         When ``None`` (default), detects available system memory via ``psutil``.
         For HPC environments, set this to your SLURM ``--mem`` value
         (e.g., ``memory_limit_gb=128``).
+    force
+        If True, rerun the analysis even when the output h5ad file already
+        exists. If False (default), load and return the existing result
+        instead of rerunning.
     
     Returns
     -------
@@ -719,6 +842,15 @@ def t_test(
     """
 
     path = resolve_data_path(data)
+    output_path = resolve_output_path(path, suffix="t_test", output_dir=output_dir, data_name=data_name)
+
+    if output_path.exists() and not force:
+        logger.info("Found existing t_test result at %s. Loading instead of rerunning.", output_path)
+        if verbose:
+            print(f"[crispyx] Loading existing result: {output_path}")
+            print("[crispyx] Pass force=True to rerun the analysis.")
+        return _load_completed_de_result(output_path, memory_limit_gb=memory_limit_gb)
+
     backed = read_backed(path)
     try:
         # Calculate adaptive chunk_size if not provided
@@ -817,7 +949,6 @@ def t_test(
 
     # Prepare on-disk buffers for results
     shape = (n_groups, n_genes)
-    output_path = resolve_output_path(path, suffix="t_test", output_dir=output_dir, data_name=data_name)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     checkpoint_path = output_path.with_suffix(".progress.json")
     
@@ -846,7 +977,8 @@ def t_test(
     adata.uns["de_filter"] = {
         "min_cells_expressed": int(min_cells_expressed),
         "min_pct_both": float(min_pct_both),
-        "min_mean_both": float(min_mean_both),
+        "min_mean_ctrl": float(min_mean_ctrl),
+        "min_mean_pert": float(min_mean_pert),
     }
     adata.write(output_path)
 
@@ -935,7 +1067,8 @@ def t_test(
                     n_pert_cells=n_cells,
                     n_control_cells=control_n,
                     min_pct_both=min_pct_both,
-                    min_mean_both=min_mean_both,
+                    min_mean_ctrl=min_mean_ctrl,
+                    min_mean_pert=min_mean_pert,
                 )
                 valid &= ~low_both
 
@@ -1152,7 +1285,8 @@ def nb_glm_test(
     # ---- Filtering parameters ----
     min_cells_expressed: int = 0,
     min_pct_both: float = 0.01,
-    min_mean_both: float = 0.05,
+    min_mean_ctrl: float = 0.05,
+    min_mean_pert: float = 0.0,
     min_total_count: float = 1.0,
     cook_filter: bool = False,
     # ---- Output parameters ----
@@ -1173,6 +1307,7 @@ def nb_glm_test(
     n_jobs: int | None = None,
     use_control_cache: bool = True,
     freeze_control: bool | None = None,
+    force: bool = False,
 ) -> RankGenesGroupsResult:
     """Perform negative binomial GLM differential expression test.
     
@@ -1289,13 +1424,18 @@ def nb_glm_test(
     min_pct_both
         Drop a gene from a comparison when the fraction of cells with non-zero
         expression is below this threshold in BOTH groups (combined with
-        ``min_mean_both``). Default ``0.01``. Set to ``0.0`` together with
-        ``min_mean_both=0.0`` to disable.
-    min_mean_both
+        ``min_mean_ctrl``). Default ``0.01``. Set to ``0.0`` together with
+        ``min_mean_ctrl=0.0`` to disable.
+    min_mean_ctrl
         Drop a gene from a comparison when the mean (size-factor-normalised)
         expression is below this threshold in BOTH groups. Default ``0.05``.
         Excluded genes appear as NaN in ``pvalue`` / ``effect`` / ``logfc``
         / ``se``; ``pts`` and ``mean`` remain populated.
+    min_mean_pert
+        Mean expression threshold applied to the *perturbed* group only.
+        Default ``0.0`` (disabled — only the pct check is applied to the
+        perturbed side).  Set to the same value as ``min_mean_ctrl`` to apply
+        symmetric mean filtering to both groups.
     cook_filter
         Whether to apply Cook's distance outlier filtering when available.
     lfc_shrinkage_type
@@ -1397,6 +1537,10 @@ def nb_glm_test(
         Technical note: The intercept (β₀) is frozen to the control-only estimate.
         This is valid because control cells have perturbation indicator = 0, so
         μ_control = exp(β₀ + offset) is independent of the perturbation effect.
+    force
+        If True, rerun the analysis even when the output h5ad file already
+        exists. If False (default), load and return the existing result
+        instead of rerunning.
     
     Returns
     -------
@@ -1423,6 +1567,22 @@ def nb_glm_test(
     # Large datasets with many perturbations benefit from having cells sorted
     # by perturbation label, enabling contiguous reads instead of random access
     path = resolve_data_path(data)
+
+    # Early-exit: if output already exists and force=False, reload without rerunning.
+    # Use the original (pre-sort) path for output_path resolution so the location
+    # is predictable for the caller regardless of internal sorting.
+    _candidate_output_path = resolve_output_path(
+        path, suffix="nb_glm", output_dir=output_dir, data_name=data_name
+    )
+    if _candidate_output_path.exists() and not force:
+        logger.info(
+            "Found existing nb_glm result at %s. Loading instead of rerunning.",
+            _candidate_output_path,
+        )
+        if verbose:
+            print(f"[crispyx] Loading existing result: {_candidate_output_path}")
+            print("[crispyx] Pass force=True to rerun the analysis.")
+        return _load_completed_de_result(_candidate_output_path, memory_limit_gb=memory_limit_gb)
 
     # Warn if the on-disk matrix is stored in CSC format – row-slicing
     # (used by size-factor computation and control-matrix loading) is
@@ -1550,7 +1710,8 @@ def nb_glm_test(
         n_genes: int,
         min_cells_expressed: int,
         min_pct_both: float,
-        min_mean_both: float,
+        min_mean_ctrl: float,
+        min_mean_pert: float,
         min_total_count: float,
         max_iter: int,
         tol: float,
@@ -1673,7 +1834,8 @@ def nb_glm_test(
             n_pert_cells=group_n,
             n_control_cells=control_n,
             min_pct_both=min_pct_both,
-            min_mean_both=min_mean_both,
+            min_mean_ctrl=min_mean_ctrl,
+            min_mean_pert=min_mean_pert,
         )
         valid_mask = valid_mask & ~low_both
         valid_indices = np.where(valid_mask)[0]
@@ -1892,7 +2054,8 @@ def nb_glm_test(
         n_genes: int,
         min_cells_expressed: int,
         min_pct_both: float,
-        min_mean_both: float,
+        min_mean_ctrl: float,
+        min_mean_pert: float,
         min_total_count: float,
         max_iter: int,
         tol: float,
@@ -1998,7 +2161,8 @@ def nb_glm_test(
             n_pert_cells=group_n,
             n_control_cells=n_control,
             min_pct_both=min_pct_both,
-            min_mean_both=min_mean_both,
+            min_mean_ctrl=min_mean_ctrl,
+            min_mean_pert=min_mean_pert,
         )
         valid_mask = valid_mask & ~low_both
 
@@ -2959,7 +3123,8 @@ def nb_glm_test(
                             n_genes=n_genes,
                             min_cells_expressed=min_cells_expressed,
                             min_pct_both=min_pct_both,
-                            min_mean_both=min_mean_both,
+                            min_mean_ctrl=min_mean_ctrl,
+                            min_mean_pert=min_mean_pert,
                             min_total_count=min_total_count,
                             max_iter=max_iter,
                             tol=tol,
@@ -2996,7 +3161,8 @@ def nb_glm_test(
                             n_genes=n_genes,
                             min_cells_expressed=min_cells_expressed,
                             min_pct_both=min_pct_both,
-                            min_mean_both=min_mean_both,
+                            min_mean_ctrl=min_mean_ctrl,
+                            min_mean_pert=min_mean_pert,
                             min_total_count=min_total_count,
                             max_iter=max_iter,
                             tol=tol,
@@ -3048,7 +3214,8 @@ def nb_glm_test(
                                 n_genes=n_genes,
                                 min_cells_expressed=min_cells_expressed,
                                 min_pct_both=min_pct_both,
-                                min_mean_both=min_mean_both,
+                                min_mean_ctrl=min_mean_ctrl,
+                                min_mean_pert=min_mean_pert,
                                 min_total_count=min_total_count,
                                 max_iter=max_iter,
                                 tol=tol,
@@ -3077,7 +3244,8 @@ def nb_glm_test(
                                 n_genes=n_genes,
                                 min_cells_expressed=min_cells_expressed,
                                 min_pct_both=min_pct_both,
-                                min_mean_both=min_mean_both,
+                                min_mean_ctrl=min_mean_ctrl,
+                                min_mean_pert=min_mean_pert,
                                 min_total_count=min_total_count,
                                 max_iter=max_iter,
                                 tol=tol,
@@ -3189,7 +3357,8 @@ def nb_glm_test(
     adata.uns["de_filter"] = {
         "min_cells_expressed": int(min_cells_expressed),
         "min_pct_both": float(min_pct_both),
-        "min_mean_both": float(min_mean_both),
+        "min_mean_ctrl": float(min_mean_ctrl),
+        "min_mean_pert": float(min_mean_pert),
     }
 
     # Store profiling results or "NA" for production
@@ -3258,7 +3427,8 @@ def _wilcoxon_test_streaming(
     chunk_size: int,
     min_cells_expressed: int,
     min_pct_both: float = 0.01,
-    min_mean_both: float = 0.05,
+    min_mean_ctrl: float = 0.05,
+    min_mean_pert: float = 0.0,
     tie_correct: bool,
     corr_method: str,
     output_path: Path,
@@ -3470,7 +3640,8 @@ def _wilcoxon_test_streaming(
                             n_pert_cells=pert_n_cells[idx],
                             n_control_cells=control_n,
                             min_pct_both=min_pct_both,
-                            min_mean_both=min_mean_both,
+                            min_mean_ctrl=min_mean_ctrl,
+                            min_mean_pert=min_mean_pert,
                         )
                         low_both_masks.append(low_both)
                         valid_masks.append(valid & ~low_both)
@@ -3652,7 +3823,8 @@ def wilcoxon_test(
     perturbations: Iterable[str] | None = None,
     min_cells_expressed: int = 0,
     min_pct_both: float = 0.01,
-    min_mean_both: float = 0.05,
+    min_mean_ctrl: float = 0.05,
+    min_mean_pert: float = 0.0,
     chunk_size: int | None = None,
     tie_correct: bool = True,
     corr_method: Literal["benjamini-hochberg", "bonferroni"] = "benjamini-hochberg",
@@ -3664,6 +3836,7 @@ def wilcoxon_test(
     checkpoint_interval: int | None = None,
     scanpy_format: bool = False,
     memory_limit_gb: float | None = None,
+    force: bool = False,
 ) -> RankGenesGroupsResult:
     """Perform a Wilcoxon rank-sum (Mann-Whitney U) test for each gene.
 
@@ -3692,13 +3865,18 @@ def wilcoxon_test(
     min_pct_both
         Drop a gene from a comparison when the fraction of cells with non-zero
         expression is below this threshold in BOTH the perturbation and control
-        groups (combined with ``min_mean_both``). Default ``0.01``. Excluded
+        groups (combined with ``min_mean_ctrl``). Default ``0.01``. Excluded
         genes are written as NaN in ``score`` / ``pvalue`` / ``logfoldchanges``
         / ``effect_size``; ``pts`` / ``pts_rest`` remain populated.
-    min_mean_both
+    min_mean_ctrl
         Drop a gene from a comparison when the mean log1p expression is below
         this threshold in BOTH groups. Default ``0.05``. Set together with
         ``min_pct_both=0.0`` to disable the filter.
+    min_mean_pert
+        Mean expression threshold applied to the *perturbed* group only.
+        Default ``0.0`` (disabled — only the pct check is applied to the
+        perturbed side).  Set to the same value as ``min_mean_ctrl`` to apply
+        symmetric mean filtering to both groups.
     chunk_size
         Number of genes to process per chunk (memory vs. speed tradeoff). Smaller
         values stream more, reducing peak memory at the cost of additional I/O.
@@ -3734,6 +3912,10 @@ def wilcoxon_test(
         available system memory via ``psutil``. For HPC environments with
         fixed allocations, set this to your SLURM ``--mem`` value
         (e.g., ``memory_limit_gb=128``).
+    force
+        If True, rerun the analysis even when the output h5ad file already
+        exists. If False (default), load and return the existing result
+        instead of rerunning.
 
     Returns
     -------
@@ -3744,6 +3926,15 @@ def wilcoxon_test(
     """
 
     path = resolve_data_path(data)
+    output_path = resolve_output_path(path, suffix="wilcoxon", output_dir=output_dir, data_name=data_name)
+
+    if output_path.exists() and not force:
+        logger.info("Found existing wilcoxon result at %s. Loading instead of rerunning.", output_path)
+        if verbose:
+            print(f"[crispyx] Loading existing result: {output_path}")
+            print("[crispyx] Pass force=True to rerun the analysis.")
+        return _load_completed_de_result(output_path, memory_limit_gb=memory_limit_gb)
+
     backed = read_backed(path)
     try:
         gene_symbols = ensure_gene_symbol_column(backed, gene_name_column)
@@ -3784,7 +3975,6 @@ def wilcoxon_test(
     n_groups = len(candidates)
     
     # Determine output path and checkpoint path
-    output_path = resolve_output_path(path, suffix="wilcoxon", output_dir=output_dir, data_name=data_name)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     checkpoint_path = output_path.with_suffix(".progress.json")
 
@@ -3812,7 +4002,8 @@ def wilcoxon_test(
             chunk_size=chunk_size,
             min_cells_expressed=min_cells_expressed,
             min_pct_both=min_pct_both,
-            min_mean_both=min_mean_both,
+            min_mean_ctrl=min_mean_ctrl,
+            min_mean_pert=min_mean_pert,
             tie_correct=tie_correct,
             corr_method=corr_method,
             output_path=output_path,
@@ -3986,7 +4177,8 @@ def wilcoxon_test(
                             n_pert_cells=pert_n_cells[idx],
                             n_control_cells=control_n,
                             min_pct_both=min_pct_both,
-                            min_mean_both=min_mean_both,
+                            min_mean_ctrl=min_mean_ctrl,
+                            min_mean_pert=min_mean_pert,
                         )
                         low_both_masks.append(low_both)
                         valid_masks.append(valid & ~low_both)

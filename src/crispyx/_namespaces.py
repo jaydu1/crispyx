@@ -655,7 +655,7 @@ class _ToolsNamespace:
         )
 
         if normalised == "wilcoxon":
-            allowed = {"min_cells_expressed", "chunk_size", "tie_correct", "n_jobs", "memory_limit_gb"}
+            allowed = {"min_cells_expressed", "min_pct_both", "min_mean_ctrl", "min_mean_pert", "chunk_size", "tie_correct", "n_jobs", "memory_limit_gb"}
             unexpected = set(kwargs) - allowed
             if unexpected:
                 raise TypeError(
@@ -683,6 +683,9 @@ class _ToolsNamespace:
                 "tol",
                 "poisson_init_iter",
                 "min_cells_expressed",
+                "min_pct_both",
+                "min_mean_ctrl",
+                "min_mean_pert",
                 "min_total_count",
                 "chunk_size",
                 "n_jobs",
@@ -705,7 +708,7 @@ class _ToolsNamespace:
             return result.result
 
         if normalised == "t_test":
-            allowed = {"min_cells_expressed", "cell_chunk_size", "n_jobs", "memory_limit_gb"}
+            allowed = {"min_cells_expressed", "min_pct_both", "min_mean_ctrl", "min_mean_pert", "cell_chunk_size", "n_jobs", "memory_limit_gb"}
             unexpected = set(kwargs) - allowed
             if unexpected:
                 raise TypeError(

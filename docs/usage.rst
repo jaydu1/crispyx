@@ -400,6 +400,53 @@ You can also use ``cx.tl.shrink_lfc()`` for API consistency with other tools:
        prior_scale_mode="global",
    )
 
+.. _auto-reload:
+
+Auto-reload and re-run control
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+All three DE functions (``wilcoxon_test``, ``t_test``, ``nb_glm_test``) write
+their results to an ``.h5ad`` file and remember the output path.  On a
+subsequent call with the same parameters, if the output file already exists
+the function **loads and returns the saved result instead of rerunning the
+analysis** — making notebook and script reruns instant:
+
+.. code-block:: python
+
+   # First call — runs the full analysis and writes crispyx_wilcoxon.h5ad
+   result = cx.wilcoxon_test(
+       "data.h5ad",
+       perturbation_column="perturbation",
+       verbose=True,
+   )
+
+   # Second call — reloads from disk in milliseconds
+   result = cx.wilcoxon_test(
+       "data.h5ad",
+       perturbation_column="perturbation",
+       verbose=True,
+   )
+   # [crispyx] Loading existing result: data/crispyx_wilcoxon.h5ad
+   # [crispyx] Pass force=True to rerun the analysis.
+
+To rerun unconditionally (e.g. after changing ``min_pct_both``,
+``memory_limit_gb``, or any other parameter), pass ``force=True``:
+
+.. code-block:: python
+
+   result = cx.wilcoxon_test(
+       "data.h5ad",
+       perturbation_column="perturbation",
+       min_pct_both=0.05,
+       force=True,   # overwrite the existing file
+   )
+
+.. note::
+
+   The auto-reload check is based purely on file existence, not on a
+   comparison of the parameters used to produce it.  Always pass ``force=True``
+   when you intentionally run with different settings.
+
 Resume and checkpointing
 ~~~~~~~~~~~~~~~~~~~~~~~~
 
