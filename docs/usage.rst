@@ -429,7 +429,7 @@ analysis** — making notebook and script reruns instant:
    # [crispyx] Loading existing result: data/crispyx_wilcoxon.h5ad
    # [crispyx] Pass force=True to rerun the analysis.
 
-To rerun unconditionally (e.g. after changing ``min_pct_both``,
+To rerun unconditionally (e.g. after changing ``min_pct_ctrl``,
 ``memory_limit_gb``, or any other parameter), pass ``force=True``:
 
 .. code-block:: python
@@ -437,7 +437,8 @@ To rerun unconditionally (e.g. after changing ``min_pct_both``,
    result = cx.wilcoxon_test(
        "data.h5ad",
        perturbation_column="perturbation",
-       min_pct_both=0.05,
+       min_pct_ctrl=0.05,
+       min_pct_pert=0.05,
        force=True,   # overwrite the existing file
    )
 

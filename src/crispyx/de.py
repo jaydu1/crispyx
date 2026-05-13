@@ -7,6 +7,7 @@ import dataclasses
 import logging
 import os
 import tempfile
+import warnings
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
@@ -740,9 +741,11 @@ def t_test(
     gene_name_column: str | None = None,
     perturbations: Iterable[str] | None = None,
     min_cells_expressed: int = 0,
-    min_pct_both: float = 0.01,
+    min_pct_ctrl: float = 0.01,
+    min_pct_pert: float = 0.002,
+    min_pct_both: float | None = None,
     min_mean_ctrl: float = 0.05,
-    min_mean_pert: float = 0.0,
+    min_mean_pert: float = 0.005,
     cell_chunk_size: int | None = None,
     output_dir: str | Path | None = None,
     data_name: str | None = None,
@@ -784,22 +787,26 @@ def t_test(
         Specific perturbations to test. If None, tests all non-control groups.
     min_cells_expressed
         Minimum total cells (control + perturbation) expressing a gene for testing.
+    min_pct_ctrl
+        Minimum fraction of expressing cells for the *control* side. A gene is
+        excluded only when *both* the control side *and* the perturbed side are
+        jointly low. Default ``0.01``.
+    min_pct_pert
+        Minimum fraction of expressing cells for the *perturbed* side.
+        Default ``0.002`` (lower than ctrl; induction from near-zero baseline is
+        biologically valid). Set to ``0.0`` to disable the pct check on pert.
     min_pct_both
-        Drop a gene from the comparison when the fraction of cells with non-zero
-        expression is below this threshold in BOTH the perturbation and control
-        groups (and the mean is also below ``min_mean_ctrl``). Default ``0.01``.
-        Set to ``0.0`` together with ``min_mean_ctrl=0.0`` to disable the filter.
+        Deprecated. If not ``None``, overrides both ``min_pct_ctrl`` and
+        ``min_pct_pert`` and emits a ``DeprecationWarning``.
     min_mean_ctrl
-        Drop a gene from the comparison when the mean expression (log1p units)
-        is below this threshold in BOTH groups (and the fraction expressed is
-        also below ``min_pct_both``). Default ``0.05``. Excluded genes are
-        written as NaN in ``score`` / ``pvalue`` / ``logfoldchanges`` /
-        ``effect_size``; ``pts`` and ``pts_rest`` remain populated.
+        Minimum mean expression (log1p units) for the *control* side.
+        Default ``0.05``. Excluded genes are written as NaN in
+        ``score`` / ``pvalue`` / ``logfoldchanges`` / ``effect_size``;
+        ``pts`` and ``pts_rest`` remain populated.
     min_mean_pert
-        Mean expression threshold applied to the *perturbed* group only.
-        Default ``0.0`` (disabled — only the pct check is applied to the
-        perturbed side).  Set to the same value as ``min_mean_ctrl`` to apply
-        symmetric mean filtering to both groups.
+        Minimum mean expression for the *perturbed* side. Default ``0.005``.
+        Together with ``min_pct_pert`` this forms a dual condition that is more
+        robust to doublet / ambient-RNA artefacts than pct alone.
     cell_chunk_size
         Number of cells to process per chunk (memory vs. speed tradeoff). This
         controls streaming along the cell axis and is distinct from any future
@@ -840,6 +847,15 @@ def t_test(
         `result[label].effect_size`, `result[label].pvalue`, etc. The h5ad file
         path is available at `result.result_path`.
     """
+
+    if min_pct_both is not None:
+        warnings.warn(
+            "min_pct_both is deprecated; use min_pct_ctrl and min_pct_pert instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        min_pct_ctrl = float(min_pct_both)
+        min_pct_pert = float(min_pct_both)
 
     path = resolve_data_path(data)
     output_path = resolve_output_path(path, suffix="t_test", output_dir=output_dir, data_name=data_name)
@@ -976,7 +992,8 @@ def t_test(
     adata.uns["pvalue_correction"] = "benjamini-hochberg"
     adata.uns["de_filter"] = {
         "min_cells_expressed": int(min_cells_expressed),
-        "min_pct_both": float(min_pct_both),
+        "min_pct_ctrl": float(min_pct_ctrl),
+        "min_pct_pert": float(min_pct_pert),
         "min_mean_ctrl": float(min_mean_ctrl),
         "min_mean_pert": float(min_mean_pert),
     }
@@ -1066,7 +1083,8 @@ def t_test(
                     control_mean=control_mean,
                     n_pert_cells=n_cells,
                     n_control_cells=control_n,
-                    min_pct_both=min_pct_both,
+                    min_pct_ctrl=min_pct_ctrl,
+                    min_pct_pert=min_pct_pert,
                     min_mean_ctrl=min_mean_ctrl,
                     min_mean_pert=min_mean_pert,
                 )
@@ -1284,9 +1302,11 @@ def nb_glm_test(
     irls_batch_size: int | None = 128,
     # ---- Filtering parameters ----
     min_cells_expressed: int = 0,
-    min_pct_both: float = 0.01,
+    min_pct_ctrl: float = 0.01,
+    min_pct_pert: float = 0.002,
+    min_pct_both: float | None = None,
     min_mean_ctrl: float = 0.05,
-    min_mean_pert: float = 0.0,
+    min_mean_pert: float = 0.005,
     min_total_count: float = 1.0,
     cook_filter: bool = False,
     # ---- Output parameters ----
@@ -1421,21 +1441,22 @@ def nb_glm_test(
         Minimum total cells (control + perturbation) expressing a gene for testing.
     min_total_count
         Minimum total count across all cells for a gene to be tested.
+    min_pct_ctrl
+        Minimum fraction of expressing cells for the *control* side. A gene is
+        excluded only when *both* sides are jointly low. Default ``0.01``.
+    min_pct_pert
+        Minimum fraction of expressing cells for the *perturbed* side.
+        Default ``0.002``. Combined with ``min_mean_pert`` this forms a dual
+        condition that is more robust to doublet / ambient-RNA artefacts.
     min_pct_both
-        Drop a gene from a comparison when the fraction of cells with non-zero
-        expression is below this threshold in BOTH groups (combined with
-        ``min_mean_ctrl``). Default ``0.01``. Set to ``0.0`` together with
-        ``min_mean_ctrl=0.0`` to disable.
+        Deprecated. If not ``None``, overrides both ``min_pct_ctrl`` and
+        ``min_pct_pert`` and emits a ``DeprecationWarning``.
     min_mean_ctrl
-        Drop a gene from a comparison when the mean (size-factor-normalised)
-        expression is below this threshold in BOTH groups. Default ``0.05``.
-        Excluded genes appear as NaN in ``pvalue`` / ``effect`` / ``logfc``
-        / ``se``; ``pts`` and ``mean`` remain populated.
+        Minimum mean (size-factor-normalised) expression for the *control* side.
+        Default ``0.05``. Excluded genes appear as NaN in ``pvalue`` /
+        ``effect`` / ``logfc`` / ``se``; ``pts`` and ``mean`` remain populated.
     min_mean_pert
-        Mean expression threshold applied to the *perturbed* group only.
-        Default ``0.0`` (disabled — only the pct check is applied to the
-        perturbed side).  Set to the same value as ``min_mean_ctrl`` to apply
-        symmetric mean filtering to both groups.
+        Minimum mean expression for the *perturbed* side. Default ``0.005``.
     cook_filter
         Whether to apply Cook's distance outlier filtering when available.
     lfc_shrinkage_type
@@ -1549,6 +1570,15 @@ def nb_glm_test(
         `result[label].effect_size`, `result[label].pvalue`, etc. The h5ad file
         path is available at `result.result_path`.
     """
+    if min_pct_both is not None:
+        warnings.warn(
+            "min_pct_both is deprecated; use min_pct_ctrl and min_pct_pert instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        min_pct_ctrl = float(min_pct_both)
+        min_pct_pert = float(min_pct_both)
+
     # Validate min_mu parameter
     if min_mu < 0:
         raise ValueError(f"min_mu must be >= 0, got {min_mu}")
@@ -1709,7 +1739,8 @@ def nb_glm_test(
         offset: np.ndarray,
         n_genes: int,
         min_cells_expressed: int,
-        min_pct_both: float,
+        min_pct_ctrl: float,
+        min_pct_pert: float,
         min_mean_ctrl: float,
         min_mean_pert: float,
         min_total_count: float,
@@ -1833,7 +1864,8 @@ def nb_glm_test(
             control_mean=control_mean_raw,
             n_pert_cells=group_n,
             n_control_cells=control_n,
-            min_pct_both=min_pct_both,
+            min_pct_ctrl=min_pct_ctrl,
+            min_pct_pert=min_pct_pert,
             min_mean_ctrl=min_mean_ctrl,
             min_mean_pert=min_mean_pert,
         )
@@ -2053,7 +2085,8 @@ def nb_glm_test(
         size_factors: np.ndarray,
         n_genes: int,
         min_cells_expressed: int,
-        min_pct_both: float,
+        min_pct_ctrl: float,
+        min_pct_pert: float,
         min_mean_ctrl: float,
         min_mean_pert: float,
         min_total_count: float,
@@ -2160,7 +2193,8 @@ def nb_glm_test(
             control_mean=control_cache.control_mean_expr,
             n_pert_cells=group_n,
             n_control_cells=n_control,
-            min_pct_both=min_pct_both,
+            min_pct_ctrl=min_pct_ctrl,
+            min_pct_pert=min_pct_pert,
             min_mean_ctrl=min_mean_ctrl,
             min_mean_pert=min_mean_pert,
         )
@@ -3122,7 +3156,8 @@ def nb_glm_test(
                             size_factors=size_factors,
                             n_genes=n_genes,
                             min_cells_expressed=min_cells_expressed,
-                            min_pct_both=min_pct_both,
+                            min_pct_ctrl=min_pct_ctrl,
+                            min_pct_pert=min_pct_pert,
                             min_mean_ctrl=min_mean_ctrl,
                             min_mean_pert=min_mean_pert,
                             min_total_count=min_total_count,
@@ -3160,7 +3195,8 @@ def nb_glm_test(
                             offset=offset,
                             n_genes=n_genes,
                             min_cells_expressed=min_cells_expressed,
-                            min_pct_both=min_pct_both,
+                            min_pct_ctrl=min_pct_ctrl,
+                            min_pct_pert=min_pct_pert,
                             min_mean_ctrl=min_mean_ctrl,
                             min_mean_pert=min_mean_pert,
                             min_total_count=min_total_count,
@@ -3213,7 +3249,8 @@ def nb_glm_test(
                                 size_factors=size_factors,
                                 n_genes=n_genes,
                                 min_cells_expressed=min_cells_expressed,
-                                min_pct_both=min_pct_both,
+                                min_pct_ctrl=min_pct_ctrl,
+                                min_pct_pert=min_pct_pert,
                                 min_mean_ctrl=min_mean_ctrl,
                                 min_mean_pert=min_mean_pert,
                                 min_total_count=min_total_count,
@@ -3243,7 +3280,8 @@ def nb_glm_test(
                                 offset=offset,
                                 n_genes=n_genes,
                                 min_cells_expressed=min_cells_expressed,
-                                min_pct_both=min_pct_both,
+                                min_pct_ctrl=min_pct_ctrl,
+                                min_pct_pert=min_pct_pert,
                                 min_mean_ctrl=min_mean_ctrl,
                                 min_mean_pert=min_mean_pert,
                                 min_total_count=min_total_count,
@@ -3356,7 +3394,8 @@ def nb_glm_test(
     adata.uns["dispersion_scope"] = dispersion_scope
     adata.uns["de_filter"] = {
         "min_cells_expressed": int(min_cells_expressed),
-        "min_pct_both": float(min_pct_both),
+        "min_pct_ctrl": float(min_pct_ctrl),
+        "min_pct_pert": float(min_pct_pert),
         "min_mean_ctrl": float(min_mean_ctrl),
         "min_mean_pert": float(min_mean_pert),
     }
@@ -3426,9 +3465,10 @@ def _wilcoxon_test_streaming(
     n_genes: int,
     chunk_size: int,
     min_cells_expressed: int,
-    min_pct_both: float = 0.01,
+    min_pct_ctrl: float = 0.01,
+    min_pct_pert: float = 0.002,
     min_mean_ctrl: float = 0.05,
-    min_mean_pert: float = 0.0,
+    min_mean_pert: float = 0.005,
     tie_correct: bool,
     corr_method: str,
     output_path: Path,
@@ -3639,7 +3679,8 @@ def _wilcoxon_test_streaming(
                             control_mean=control_mean,
                             n_pert_cells=pert_n_cells[idx],
                             n_control_cells=control_n,
-                            min_pct_both=min_pct_both,
+                            min_pct_ctrl=min_pct_ctrl,
+                            min_pct_pert=min_pct_pert,
                             min_mean_ctrl=min_mean_ctrl,
                             min_mean_pert=min_mean_pert,
                         )
@@ -3822,9 +3863,11 @@ def wilcoxon_test(
     gene_name_column: str | None = None,
     perturbations: Iterable[str] | None = None,
     min_cells_expressed: int = 0,
-    min_pct_both: float = 0.01,
+    min_pct_ctrl: float = 0.01,
+    min_pct_pert: float = 0.002,
+    min_pct_both: float | None = None,
     min_mean_ctrl: float = 0.05,
-    min_mean_pert: float = 0.0,
+    min_mean_pert: float = 0.005,
     chunk_size: int | None = None,
     tie_correct: bool = True,
     corr_method: Literal["benjamini-hochberg", "bonferroni"] = "benjamini-hochberg",
@@ -3862,21 +3905,24 @@ def wilcoxon_test(
     min_cells_expressed
         Minimum total cells (control + perturbation) expressing a gene for testing.
         Genes below this threshold are assigned p-value=1 and effect_size=0.
+    min_pct_ctrl
+        Minimum fraction of expressing cells for the *control* side. A gene is
+        excluded only when *both* sides are jointly low. Default ``0.01``.
+    min_pct_pert
+        Minimum fraction of expressing cells for the *perturbed* side.
+        Default ``0.002`` (lower than ctrl; induction from near-zero baseline is
+        biologically valid). Combined with ``min_mean_pert`` this forms a dual
+        condition more robust than pct alone.
     min_pct_both
-        Drop a gene from a comparison when the fraction of cells with non-zero
-        expression is below this threshold in BOTH the perturbation and control
-        groups (combined with ``min_mean_ctrl``). Default ``0.01``. Excluded
-        genes are written as NaN in ``score`` / ``pvalue`` / ``logfoldchanges``
-        / ``effect_size``; ``pts`` / ``pts_rest`` remain populated.
+        Deprecated. If not ``None``, overrides both ``min_pct_ctrl`` and
+        ``min_pct_pert`` and emits a ``DeprecationWarning``.
     min_mean_ctrl
-        Drop a gene from a comparison when the mean log1p expression is below
-        this threshold in BOTH groups. Default ``0.05``. Set together with
-        ``min_pct_both=0.0`` to disable the filter.
+        Minimum mean log1p expression for the *control* side. Default ``0.05``.
+        Excluded genes are written as NaN in ``score`` / ``pvalue`` /
+        ``logfoldchanges`` / ``effect_size``; ``pts`` / ``pts_rest`` remain
+        populated. Set to ``0.0`` together with pct thresholds to disable.
     min_mean_pert
-        Mean expression threshold applied to the *perturbed* group only.
-        Default ``0.0`` (disabled — only the pct check is applied to the
-        perturbed side).  Set to the same value as ``min_mean_ctrl`` to apply
-        symmetric mean filtering to both groups.
+        Minimum mean expression for the *perturbed* side. Default ``0.005``.
     chunk_size
         Number of genes to process per chunk (memory vs. speed tradeoff). Smaller
         values stream more, reducing peak memory at the cost of additional I/O.
@@ -3924,6 +3970,15 @@ def wilcoxon_test(
         `result[label].effect_size`, `result[label].pvalue`, etc. The h5ad file
         path is available at `result.result_path`.
     """
+
+    if min_pct_both is not None:
+        warnings.warn(
+            "min_pct_both is deprecated; use min_pct_ctrl and min_pct_pert instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        min_pct_ctrl = float(min_pct_both)
+        min_pct_pert = float(min_pct_both)
 
     path = resolve_data_path(data)
     output_path = resolve_output_path(path, suffix="wilcoxon", output_dir=output_dir, data_name=data_name)
@@ -4001,7 +4056,8 @@ def wilcoxon_test(
             n_genes=n_genes,
             chunk_size=chunk_size,
             min_cells_expressed=min_cells_expressed,
-            min_pct_both=min_pct_both,
+            min_pct_ctrl=min_pct_ctrl,
+            min_pct_pert=min_pct_pert,
             min_mean_ctrl=min_mean_ctrl,
             min_mean_pert=min_mean_pert,
             tie_correct=tie_correct,
@@ -4176,7 +4232,8 @@ def wilcoxon_test(
                             control_mean=control_mean,
                             n_pert_cells=pert_n_cells[idx],
                             n_control_cells=control_n,
-                            min_pct_both=min_pct_both,
+                            min_pct_ctrl=min_pct_ctrl,
+                            min_pct_pert=min_pct_pert,
                             min_mean_ctrl=min_mean_ctrl,
                             min_mean_pert=min_mean_pert,
                         )
@@ -4193,7 +4250,7 @@ def wilcoxon_test(
                     # 5. Initialize output arrays for this chunk
                     chunk_u = np.zeros((n_groups, n_chunk_genes), dtype=np.float64)
                     chunk_z = np.zeros((n_groups, n_chunk_genes), dtype=np.float64)
-                    chunk_p = np.ones((n_groups, n_chunk_genes), dtype=np.float64)
+                    chunk_p = np.full((n_groups, n_chunk_genes), np.nan, dtype=np.float64)
                     chunk_effect = np.zeros((n_groups, n_chunk_genes), dtype=np.float64)
                     chunk_lfc = np.zeros((n_groups, n_chunk_genes), dtype=np.float64)
                     chunk_pts = np.zeros((n_groups, n_chunk_genes), dtype=np.float32)

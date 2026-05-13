@@ -95,7 +95,7 @@ instead of rerunning the analysis.  When ``verbose=True`` a notice is printed:
    [crispyx] Loading existing result: data/crispyx_wilcoxon.h5ad
    [crispyx] Pass force=True to rerun the analysis.
 
-If you changed a parameter (e.g. ``min_pct_both``, a covariate list, or
+If you changed a parameter (e.g. ``min_pct_ctrl``, ``min_pct_pert``, a covariate list, or
 ``dispersion_scope``) and want the result to reflect the new settings, pass
 ``force=True`` to the DE function.  The existing output file will be
 overwritten.

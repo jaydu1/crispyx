@@ -40,8 +40,10 @@ def test_low_expr_mask_disabled_by_zero_thresholds():
         control_mean=mean_c,
         n_pert_cells=10,
         n_control_cells=10,
-        min_pct_both=0.0,
+        min_pct_ctrl=0.0,
+        min_pct_pert=0.0,
         min_mean_ctrl=0.0,
+        min_mean_pert=0.0,
     )
     assert mask.dtype == bool
     assert not mask.any(), "Filter must be a no-op when both thresholds are 0"
@@ -60,8 +62,10 @@ def test_low_expr_mask_drops_only_jointly_low_genes():
         control_mean=mean_c,
         n_pert_cells=100,
         n_control_cells=100,
-        min_pct_both=0.01,
+        min_pct_ctrl=0.01,
+        min_pct_pert=0.01,
         min_mean_ctrl=0.05,
+        min_mean_pert=0.05,
     )
     # Gene 0: zero everywhere -> drop.
     # Gene 1: expressed in control -> keep.
@@ -84,8 +88,10 @@ def test_low_expr_mask_requires_both_metrics_to_drop():
         control_mean=mean_c,
         n_pert_cells=100,
         n_control_cells=100,
-        min_pct_both=0.01,
+        min_pct_ctrl=0.01,
+        min_pct_pert=0.01,
         min_mean_ctrl=0.05,
+        min_mean_pert=0.05,
     )
     # Gene 0: pct = 0.2 (passes), mean below -> low_p/low_c is False (pct passes)
     #   -> NOT dropped.
@@ -160,8 +166,10 @@ def test_t_test_excludes_jointly_silent_gene(tmp_path):
         path,
         perturbation_column="perturbation",
         control_label="ctrl",
-        min_pct_both=0.01,
+        min_pct_ctrl=0.01,
+        min_pct_pert=0.01,
         min_mean_ctrl=0.05,
+        min_mean_pert=0.05,
     )
     pert_idx = res.groups.index("KO1")
     pvals = np.asarray(res.pvalues[pert_idx])
@@ -180,8 +188,10 @@ def test_wilcoxon_excludes_jointly_silent_gene(tmp_path):
         path,
         perturbation_column="perturbation",
         control_label="ctrl",
-        min_pct_both=0.01,
+        min_pct_ctrl=0.01,
+        min_pct_pert=0.01,
         min_mean_ctrl=0.05,
+        min_mean_pert=0.05,
     )
     pert_idx = res.groups.index("KO1")
     pvals = np.asarray(res.pvalues[pert_idx])
@@ -197,8 +207,10 @@ def test_t_test_disabled_filter_recovers_legacy_behaviour(tmp_path):
         path,
         perturbation_column="perturbation",
         control_label="ctrl",
-        min_pct_both=0.0,
+        min_pct_ctrl=0.0,
+        min_pct_pert=0.0,
         min_mean_ctrl=0.0,
+        min_mean_pert=0.0,
     )
     pert_idx = res.groups.index("KO1")
     pvals = np.asarray(res.pvalues[pert_idx])
@@ -214,8 +226,10 @@ def test_nb_glm_excludes_jointly_silent_gene(tmp_path):
         path,
         perturbation_column="perturbation",
         control_label="ctrl",
-        min_pct_both=0.01,
+        min_pct_ctrl=0.01,
+        min_pct_pert=0.01,
         min_mean_ctrl=0.05,
+        min_mean_pert=0.05,
         n_jobs=1,
         verbose=False,
     )
@@ -231,8 +245,10 @@ def test_filter_thresholds_change_filtering(tmp_path):
         path,
         perturbation_column="perturbation",
         control_label="ctrl",
-        min_pct_both=0.0,
+        min_pct_ctrl=0.0,
+        min_pct_pert=0.0,
         min_mean_ctrl=0.0,
+        min_mean_pert=0.0,
     )
     # Strict: pct<0.99 AND mean<1e6 in both groups effectively drops every
     # gene whose pct is below 99% in both groups.
@@ -241,8 +257,10 @@ def test_filter_thresholds_change_filtering(tmp_path):
         path,
         perturbation_column="perturbation",
         control_label="ctrl",
-        min_pct_both=0.99,
+        min_pct_ctrl=0.99,
+        min_pct_pert=0.99,
         min_mean_ctrl=1e6,
+        min_mean_pert=1e6,
         force=True,
     )
     pert_idx = strict.groups.index("KO1")
@@ -258,16 +276,16 @@ def test_filter_thresholds_change_filtering(tmp_path):
 # ---------------------------------------------------------------------------
 
 def test_low_expr_mask_asymmetric_default_retains_pert_expressed_gene():
-    """With default min_mean_pert=0.0, a gene expressed in perturbed (pct>=threshold)
-    is retained even when its perturbed mean is below the old mean threshold."""
+    """With v0.0.4 defaults (min_pct_pert=0.002, min_mean_pert=0.005), a gene
+    expressed in perturbed (pct >= min_pct_pert) is retained even when ctrl is low."""
     # 4 genes, 100 control / 100 perturbed cells.
     # Gene 0: zero everywhere -> drop
-    # Gene 1: ctrl sparse+low mean, pert pct passes threshold -> KEEP (new behaviour)
-    # Gene 2: ctrl sparse+low mean, pert pct also below threshold -> DROP
+    # Gene 1: ctrl sparse+low mean, pert pct=0.03 >= min_pct_pert=0.002 -> KEEP
+    # Gene 2: ctrl sparse+low mean, pert pct=0.0 < min_pct_pert and mean=0 < min_mean_pert -> DROP
     # Gene 3: both sides well-expressed -> KEEP
     expr_p = np.array([0,  3,  0, 80])
     expr_c = np.array([0,  0,  0, 80])
-    mean_p = np.array([0.0, 0.04, 0.0, 1.5])  # gene1 pert mean below 0.05
+    mean_p = np.array([0.0, 0.04, 0.0, 1.5])
     mean_c = np.array([0.0, 0.0,  0.0, 1.5])
     mask = _low_expr_in_both_mask(
         pert_expr_counts=expr_p,
@@ -276,50 +294,41 @@ def test_low_expr_mask_asymmetric_default_retains_pert_expressed_gene():
         control_mean=mean_c,
         n_pert_cells=100,
         n_control_cells=100,
-        min_pct_both=0.01,
+        min_pct_ctrl=0.01,
+        min_pct_pert=0.002,
         min_mean_ctrl=0.05,
-        min_mean_pert=0.0,   # new default
+        min_mean_pert=0.005,
     )
-    # Gene 0: zero in both -> drop
-    # Gene 1: ctrl low (pct+mean), pert pct=0.03 >= 0.01 -> low_p=False -> KEEP
-    # Gene 2: ctrl low (pct+mean), pert pct=0.0 < 0.01 -> low_p=True, low_c=True -> DROP
-    # Gene 3: both expressed -> KEEP
+    # Gene 0: pct_p=0 < 0.002, mean_p=0 < 0.005 -> low_p=True; pct_c=0 < 0.01, mean_c=0 < 0.05 -> low_c=True -> DROP
+    # Gene 1: pct_p=0.03 >= 0.002 -> low_p=False -> KEEP
+    # Gene 2: pct_p=0 < 0.002, mean_p=0 < 0.005 -> low_p=True; low_c=True -> DROP
+    # Gene 3: pct_p=0.8 >= 0.002 -> low_p=False -> KEEP
     assert mask.tolist() == [True, False, True, False], f"Got {mask.tolist()}"
 
 
 def test_low_expr_mask_pert_mean_reenable_reproduces_v002():
-    """Passing min_mean_pert=min_mean_ctrl reproduces the v0.0.2 symmetric behaviour."""
+    """Explicitly setting min_mean_pert=0.05 (symmetric) gives expected results."""
     expr_p = np.array([0,  3,  0, 80])
     expr_c = np.array([0,  0,  0, 80])
     mean_p = np.array([0.0, 0.04, 0.0, 1.5])
     mean_c = np.array([0.0, 0.0,  0.0, 1.5])
-    mask_new = _low_expr_in_both_mask(
+    mask = _low_expr_in_both_mask(
         pert_expr_counts=expr_p,
         control_expr_counts=expr_c,
         pert_mean=mean_p,
         control_mean=mean_c,
         n_pert_cells=100,
         n_control_cells=100,
-        min_pct_both=0.01,
+        min_pct_ctrl=0.01,
+        min_pct_pert=0.01,
         min_mean_ctrl=0.05,
-        min_mean_pert=0.05,  # explicitly re-enable mean check on pert side
+        min_mean_pert=0.05,  # symmetric: same as ctrl
     )
-    mask_old = _low_expr_in_both_mask(
-        pert_expr_counts=expr_p,
-        control_expr_counts=expr_c,
-        pert_mean=mean_p,
-        control_mean=mean_c,
-        n_pert_cells=100,
-        n_control_cells=100,
-        min_pct_both=0.01,
-        min_mean_ctrl=0.05,
-        min_mean_pert=0.05,
-    )
-    assert (mask_new == mask_old).all(), "min_mean_pert=0.05 should match v0.0.2 behaviour"
-    # Gene 1 should now also be flagged (pert mean 0.04 < 0.05, pct 0.03 > 0.01 … wait,
-    # pct_p[1]=3/100=0.03 >= 0.01, so low_p for gene1 = (0.03<0.01)=False -> NOT dropped.
-    # The symmetric filter also does not drop it (pct passes). Both are False for gene1.
-    assert mask_new.tolist() == [True, False, True, False]
+    # Gene 0: pct_p=0 < 0.01, mean_p=0 < 0.05 -> low_p=True; low_c=True -> DROP
+    # Gene 1: pct_p=0.03 >= 0.01 -> low_p=False -> KEEP (pct check passes)
+    # Gene 2: pct_p=0 < 0.01, mean_p=0 < 0.05 -> low_p=True; low_c=True -> DROP
+    # Gene 3: pct_p=0.8 -> KEEP
+    assert mask.tolist() == [True, False, True, False]
 
 
 def _make_dataset_induced(tmp_path: Path):
@@ -357,13 +366,13 @@ def _make_dataset_induced(tmp_path: Path):
 
 
 def test_wilcoxon_asymmetric_retains_induced_gene(tmp_path):
-    """Gene induced from near-zero baseline is retained with v0.0.3 defaults."""
+    """Gene induced from near-zero baseline is retained with v0.0.4 defaults."""
     path = _make_dataset_induced(tmp_path)
     res = cx.wilcoxon_test(
         path,
         perturbation_column="perturbation",
         control_label="ctrl",
-        # v0.0.3 default: min_mean_pert=0.0
+        # v0.0.4 defaults: min_pct_ctrl=0.01, min_pct_pert=0.002, min_mean_pert=0.005
     )
     pert_idx = res.groups.index("KO1")
     pvals = np.asarray(res.pvalues[pert_idx])
@@ -383,27 +392,29 @@ def test_t_test_asymmetric_retains_induced_gene(tmp_path):
         path,
         perturbation_column="perturbation",
         control_label="ctrl",
+        # v0.0.4 defaults: min_pct_ctrl=0.01, min_pct_pert=0.002, min_mean_pert=0.005
     )
     pert_idx = res.groups.index("KO1")
     pvals = np.asarray(res.pvalues[pert_idx])
     assert np.isnan(pvals[4]), f"Gene 4 (silent) should be NaN"
     assert not np.isnan(pvals[5]), (
-        f"Gene 5 (induced) should be finite with min_mean_pert=0.0, got {pvals[5]}"
+        f"Gene 5 (induced) should be finite with v0.0.4 defaults, got {pvals[5]}"
     )
 
 
 def test_wilcoxon_symmetric_compat_retains_expressed_gene(tmp_path):
-    """With min_mean_pert=min_mean_ctrl (v0.0.2 compat), gene 5 (pct_p=6%)
-    is still retained since pct_p >= min_pct_both (pct check passes → not
+    """With min_pct_ctrl=min_pct_pert=0.01 (symmetric), gene 5 (pct_p=6%)
+    is still retained since pct_p >= min_pct_pert (pct check passes → not
     filtered in either version)."""
     path = _make_dataset_induced(tmp_path)
     res = cx.wilcoxon_test(
         path,
         perturbation_column="perturbation",
         control_label="ctrl",
-        min_pct_both=0.01,
+        min_pct_ctrl=0.01,
+        min_pct_pert=0.01,
         min_mean_ctrl=0.05,
-        min_mean_pert=0.05,   # explicit v0.0.2 compat
+        min_mean_pert=0.05,   # explicit symmetric filter
         force=True,
     )
     pert_idx = res.groups.index("KO1")
@@ -414,3 +425,95 @@ def test_wilcoxon_symmetric_compat_retains_expressed_gene(tmp_path):
         f"Gene 5 (pct_p=6%) should be retained with symmetric filter "
         f"(min_mean_pert=0.05), got {pvals[5]}"
     )
+
+
+# ---------------------------------------------------------------------------
+# New v0.0.4 tests
+# ---------------------------------------------------------------------------
+
+def test_low_expr_mask_decoupled_ctrl_pert_thresholds():
+    """min_pct_ctrl and min_pct_pert are independent: a gene with pct_p above
+    min_pct_pert but ctrl below min_pct_ctrl is NOT filtered."""
+    expr_p = np.array([5,  0])   # gene 0: pert expressed; gene 1: both zero
+    expr_c = np.array([0,  0])   # gene 0: ctrl silent
+    mean_p = np.array([0.5, 0.0])
+    mean_c = np.array([0.0, 0.0])
+    mask = _low_expr_in_both_mask(
+        pert_expr_counts=expr_p,
+        control_expr_counts=expr_c,
+        pert_mean=mean_p,
+        control_mean=mean_c,
+        n_pert_cells=100,
+        n_control_cells=100,
+        min_pct_ctrl=0.01,
+        min_pct_pert=0.002,
+        min_mean_ctrl=0.05,
+        min_mean_pert=0.005,
+    )
+    # Gene 0: pct_p=0.05 >= min_pct_pert=0.002 -> low_p=False -> KEEP
+    # Gene 1: pct_p=0 < 0.002, mean_p=0 < 0.005 -> low_p=True; low_c=True -> DROP
+    assert mask.tolist() == [False, True], f"Got {mask.tolist()}"
+
+
+def test_low_expr_mask_min_pct_both_deprecation_warning():
+    """Passing min_pct_both emits DeprecationWarning and overrides ctrl/pert."""
+    expr_p = np.array([0])
+    expr_c = np.array([0])
+    mean_p = np.array([0.0])
+    mean_c = np.array([0.0])
+    with pytest.warns(DeprecationWarning, match="min_pct_both is deprecated"):
+        _low_expr_in_both_mask(
+            pert_expr_counts=expr_p,
+            control_expr_counts=expr_c,
+            pert_mean=mean_p,
+            control_mean=mean_c,
+            n_pert_cells=10,
+            n_control_cells=10,
+            min_pct_both=0.01,
+        )
+
+
+def test_low_expr_mask_default_min_mean_pert_enabled():
+    """With the new default min_mean_pert=0.005, a gene with mean_p < 0.005
+    and pct_p < 0.002 is filtered (dual condition both fail)."""
+    expr_p = np.array([1, 5])    # gene 0: 1 cell (pct=0.001 < 0.002); gene 1: 5 cells
+    expr_c = np.array([0, 0])
+    mean_p = np.array([0.001, 0.01])  # gene 0 mean < 0.005; gene 1 mean >= 0.005
+    mean_c = np.array([0.0, 0.0])
+    mask = _low_expr_in_both_mask(
+        pert_expr_counts=expr_p,
+        control_expr_counts=expr_c,
+        pert_mean=mean_p,
+        control_mean=mean_c,
+        n_pert_cells=1000,
+        n_control_cells=1000,
+        # Use new defaults explicitly
+        min_pct_ctrl=0.01,
+        min_pct_pert=0.002,
+        min_mean_ctrl=0.05,
+        min_mean_pert=0.005,
+    )
+    # Gene 0: pct_p=0.001 < 0.002 AND mean_p=0.001 < 0.005 -> low_p=True;
+    #         pct_c=0 < 0.01 AND mean_c=0 < 0.05 -> low_c=True -> DROP
+    # Gene 1: pct_p=0.005 >= 0.002 -> low_p=False -> KEEP
+    assert mask.tolist() == [True, False], f"Got {mask.tolist()}"
+
+
+def test_wilcoxon_filtered_genes_are_nan_not_one(tmp_path):
+    """Genes filtered by low-expression should produce NaN p-values, not 1.0."""
+    path = _make_dataset(tmp_path, log_normalise=True)
+    res = cx.wilcoxon_test(
+        path,
+        perturbation_column="perturbation",
+        control_label="ctrl",
+        min_pct_ctrl=0.01,
+        min_pct_pert=0.01,
+        min_mean_ctrl=0.05,
+        min_mean_pert=0.05,
+    )
+    pert_idx = res.groups.index("KO1")
+    pvals = np.asarray(res.pvalues[pert_idx])
+    # Gene 3 is jointly silent -> must be NaN, NOT 1.0
+    assert np.isnan(pvals[3]), f"Expected NaN for filtered gene 3, got {pvals[3]}"
+    assert pvals[3] != 1.0, "Filtered gene p-value must be NaN, not 1.0"
+

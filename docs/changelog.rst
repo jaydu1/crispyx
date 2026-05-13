@@ -1,6 +1,36 @@
 Changelog
 =========
 
+Version 0.0.4
+-------------
+
+*Released 2026-05-13.*
+
+* **Decoupled per-condition pct thresholds** – ``min_pct_both`` is replaced
+  by independent ``min_pct_ctrl`` (default ``0.01``) and ``min_pct_pert``
+  (default ``0.002``) parameters across all three DE test functions
+  (``t_test``, ``wilcoxon_test``, ``nb_glm_test``) and the internal
+  ``_low_expr_in_both_mask`` helper.  The lower ``min_pct_pert`` default
+  prevents over-filtering genes induced from near-zero baseline
+  (e.g. transcription-factor target genes).  The old ``min_pct_both``
+  kwarg is retained as a deprecated alias that overrides both new params and
+  emits a ``DeprecationWarning``; it will be removed in a future release.
+
+* **Dual-condition pert filter with enabled ``min_mean_pert``** – The
+  perturbed-side filter now always applies a dual condition:
+  ``(pct_p < min_pct_pert) AND (mean_p < min_mean_pert)``.  The default
+  ``min_mean_pert`` is raised from ``0.0`` (v0.0.3) to ``0.005`` so that
+  genes with very few but high-count expressing cells (possible doublets or
+  ambient RNA) are correctly excluded.  Existing code can restore the
+  v0.0.3 behaviour by passing ``min_mean_pert=0.0``.
+
+* **NaN initialisation for filtered-gene p-values (Wilcoxon)** – The
+  standard single-pass Wilcoxon path previously initialised the chunk
+  p-value array with ``np.ones`` (p=1.0) rather than ``np.nan``, causing
+  filtered genes to appear as nominally non-significant rather than missing.
+  The array is now initialised with ``np.full(..., np.nan)``, consistent
+  with the streaming path and with ``t_test`` / ``nb_glm_test``.
+
 Version 0.0.3
 -------------
 

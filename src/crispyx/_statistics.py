@@ -6,6 +6,7 @@ and batched SE/dispersion computation.
 
 from __future__ import annotations
 
+import warnings
 from typing import Literal
 
 import numpy as np
@@ -19,9 +20,11 @@ def _low_expr_in_both_mask(
     control_mean: np.ndarray,
     n_pert_cells: int,
     n_control_cells: int,
-    min_pct_both: float = 0.01,
+    min_pct_ctrl: float = 0.01,
+    min_pct_pert: float = 0.002,
+    min_pct_both: float | None = None,
     min_mean_ctrl: float = 0.05,
-    min_mean_pert: float = 0.0,
+    min_mean_pert: float = 0.005,
 ) -> np.ndarray:
     """Return a boolean mask flagging genes that are jointly low-expressed.
 
@@ -30,15 +33,13 @@ def _low_expr_in_both_mask(
     low-expression criteria.
 
     **Control side**: flagged when *both* the fraction of expressing cells is
-    below ``min_pct_both`` *and* the mean expression is below ``min_mean_ctrl``.
+    below ``min_pct_ctrl`` *and* the mean expression is below ``min_mean_ctrl``.
 
-    **Perturbed side** (asymmetric by default): flagged when the fraction of
-    expressing cells is below ``min_pct_both``.  If ``min_mean_pert > 0.0``, the
-    mean expression must also be below ``min_mean_pert``.
-
-    The asymmetric default (``min_mean_pert=0.0``) prevents over-filtering of
-    genes that are induced from near-zero baseline expression in unbalanced
-    CRISPR-screen comparisons.
+    **Perturbed side**: flagged when *both* the fraction of expressing cells is
+    below ``min_pct_pert`` *and* the mean expression is below ``min_mean_pert``.
+    The dual condition makes the filter more robust than a pct-only check: a
+    doublet / ambient-RNA artefact with high counts in 1–2 cells has a high mean
+    despite tiny pct, so it passes the mean check and is correctly retained.
 
     Parameters
     ----------
@@ -48,24 +49,36 @@ def _low_expr_in_both_mask(
         Mean expression per gene, shape (n_genes,).
     n_pert_cells, n_control_cells
         Number of cells in each group.
+    min_pct_ctrl
+        Minimum fraction of expressing cells for the *control* side. Default 0.01.
+    min_pct_pert
+        Minimum fraction of expressing cells for the *perturbed* side.
+        Default 0.002 (lower than ctrl; induction from near-zero baseline is valid).
     min_pct_both
-        Minimum fraction of expressing cells applied to *both* sides. Default 0.01.
+        Deprecated. If not ``None``, overrides both ``min_pct_ctrl`` and
+        ``min_pct_pert`` and emits a ``DeprecationWarning``.
     min_mean_ctrl
-        Minimum mean expression applied to the *control* side. Default 0.05.
+        Minimum mean expression for the *control* side. Default 0.05.
     min_mean_pert
-        Minimum mean expression applied to the *perturbed* side. Default ``0.0``
-        (disabled — only the pct check is used for the perturbed group).
-        Set to the same value as ``min_mean_ctrl`` to apply symmetric mean
-        filtering to both groups.
+        Minimum mean expression for the *perturbed* side. Default 0.005.
 
     Returns
     -------
     ndarray of bool, shape (n_genes,)
         ``True`` for genes that should be dropped from this comparison.
     """
+    if min_pct_both is not None:
+        warnings.warn(
+            "min_pct_both is deprecated; use min_pct_ctrl and min_pct_pert instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        min_pct_ctrl = float(min_pct_both)
+        min_pct_pert = float(min_pct_both)
 
     if (
-        (min_pct_both <= 0.0 and min_mean_ctrl <= 0.0 and min_mean_pert <= 0.0)
+        (min_pct_ctrl <= 0.0 and min_pct_pert <= 0.0
+         and min_mean_ctrl <= 0.0 and min_mean_pert <= 0.0)
         or n_pert_cells == 0
         or n_control_cells == 0
     ):
@@ -75,13 +88,10 @@ def _low_expr_in_both_mask(
     pct_c = control_expr_counts.astype(np.float64, copy=False) / float(n_control_cells)
 
     # Control side: pct AND mean check
-    low_c = (pct_c < min_pct_both) & (control_mean < min_mean_ctrl)
+    low_c = (pct_c < min_pct_ctrl) & (control_mean < min_mean_ctrl)
 
-    # Perturbed side: pct-only by default; add mean check only when min_mean_pert > 0
-    if min_mean_pert > 0.0:
-        low_p = (pct_p < min_pct_both) & (pert_mean < min_mean_pert)
-    else:
-        low_p = pct_p < min_pct_both
+    # Perturbed side: pct AND mean check (dual condition)
+    low_p = (pct_p < min_pct_pert) & (pert_mean < min_mean_pert)
 
     return low_p & low_c
 
