@@ -229,8 +229,38 @@ returned :class:`cx.AnnData` wrapper stores previews of the results in
 ``.uns`` so printing ``adata.uns["rank_genes_groups"]`` shows the top genes
 per perturbation while ``.load()`` retrieves the full tables on demand.
 
-Plotting
---------
+Scanpy-compatible parameter aliases
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+All three DE functions (:func:`crispyx.tl.t_test`, :func:`crispyx.tl.wilcoxon_test`,
+:func:`crispyx.tl.nb_glm_test`) and :func:`crispyx.tl.rank_genes_groups` accept
+the Scanpy-style aliases ``groupby`` (for ``perturbation_column``) and
+``reference`` (for ``control_label``), making it easier to port code from
+Scanpy workflows:
+
+.. code-block:: python
+
+   # Scanpy-style call (aliases)
+   result = cx.tl.rank_genes_groups(
+       adata_ro,
+       groupby="perturbation",   # alias for perturbation_column
+       reference="ctrl",         # alias for control_label
+       method="wilcoxon",
+   )
+
+   # Equivalent canonical call
+   result = cx.tl.rank_genes_groups(
+       adata_ro,
+       perturbation_column="perturbation",
+       control_label="ctrl",
+       method="wilcoxon",
+   )
+
+The canonical names (``perturbation_column`` and ``control_label``) remain the
+primary names and are not deprecated. Supplying both a canonical name and its
+alias at the same time raises ``TypeError``.
+
+
 
 crispyx provides Scanpy-style plotting helpers under ``cx.pl`` that work with
 on-disk results. The plotting functions materialise only the metadata needed

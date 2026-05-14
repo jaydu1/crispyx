@@ -620,16 +620,42 @@ class _ToolsNamespace:
         self,
         data: str | Path | ad.AnnData,
         *,
-        perturbation_column: str,
+        perturbation_column: str | None = None,
+        groupby: str | None = None,
         method: str = "wilcoxon",
         control_label: str | None = None,
+        reference: str | None = None,
         gene_name_column: str | None = None,
         perturbations: Iterable[str] | None = None,
         output_dir: str | Path | None = None,
         data_name: str | None = None,
         corr_method: str = "benjamini-hochberg",
+        verbose: int | bool = False,
+        resume: bool = False,
+        memory_limit_gb: float | None = None,
+        force: bool = False,
         **kwargs,
     ) -> RankGenesGroupsResult:
+        # Resolve groupby / reference aliases
+        if groupby is not None and perturbation_column is not None:
+            raise TypeError(
+                "rank_genes_groups() received both 'perturbation_column' and 'groupby'; "
+                "they are aliases for the same parameter — pass only one."
+            )
+        if groupby is not None:
+            perturbation_column = groupby
+        if perturbation_column is None:
+            raise TypeError(
+                "rank_genes_groups() requires either 'perturbation_column' or its alias 'groupby'."
+            )
+        if reference is not None and control_label is not None:
+            raise TypeError(
+                "rank_genes_groups() received both 'control_label' and 'reference'; "
+                "they are aliases for the same parameter — pass only one."
+            )
+        if reference is not None:
+            control_label = reference
+
         path = resolve_data_path(data)
         method_key = method.lower().replace("_", "-")
         method_map = {
@@ -652,10 +678,19 @@ class _ToolsNamespace:
             perturbations=perturbations,
             output_dir=output_dir,
             data_name=data_name,
+            verbose=verbose,
+            resume=resume,
+            memory_limit_gb=memory_limit_gb,
+            force=force,
         )
 
         if normalised == "wilcoxon":
-            allowed = {"min_cells_expressed", "min_pct_both", "min_mean_ctrl", "min_mean_pert", "chunk_size", "tie_correct", "n_jobs", "memory_limit_gb"}
+            allowed = {
+                "min_cells_expressed", "min_pct_ctrl", "min_pct_pert", "min_pct_both",
+                "min_mean_ctrl", "min_mean_pert", "chunk_size", "tie_correct",
+                "n_jobs",
+                "checkpoint_interval",
+            }
             unexpected = set(kwargs) - allowed
             if unexpected:
                 raise TypeError(
@@ -683,12 +718,13 @@ class _ToolsNamespace:
                 "tol",
                 "poisson_init_iter",
                 "min_cells_expressed",
-                "min_pct_both",
+                "min_pct_ctrl", "min_pct_pert", "min_pct_both",
                 "min_mean_ctrl",
                 "min_mean_pert",
                 "min_total_count",
                 "chunk_size",
                 "n_jobs",
+                "checkpoint_interval",
             }
             unexpected = set(kwargs) - allowed
             if unexpected:
@@ -708,7 +744,12 @@ class _ToolsNamespace:
             return result.result
 
         if normalised == "t_test":
-            allowed = {"min_cells_expressed", "min_pct_both", "min_mean_ctrl", "min_mean_pert", "cell_chunk_size", "n_jobs", "memory_limit_gb"}
+            allowed = {
+                "min_cells_expressed", "min_pct_ctrl", "min_pct_pert", "min_pct_both",
+                "min_mean_ctrl", "min_mean_pert", "cell_chunk_size",
+                "n_jobs",
+                "checkpoint_interval",
+            }
             unexpected = set(kwargs) - allowed
             if unexpected:
                 raise TypeError(

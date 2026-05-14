@@ -4,17 +4,37 @@ Changelog
 Version 0.0.4
 -------------
 
-*Released 2026-05-13.*
+*Released 2026-05-14.*
 
-* **Decoupled per-condition pct thresholds** – ``min_pct_both`` is replaced
+* **Scanpy-compatible ``groupby`` / ``reference`` parameter aliases** –
+  ``t_test``, ``wilcoxon_test``, ``nb_glm_test``, and
+  ``cx.tl.rank_genes_groups`` now accept ``groupby`` as an alias for
+  ``perturbation_column`` and ``reference`` as an alias for
+  ``control_label``, matching the parameter names used by Scanpy's
+  ``sc.tl.rank_genes_groups``.  The original names remain the canonical
+  names and are not deprecated.  Passing both a canonical name and its
+  alias raises ``TypeError``.
+
+* **Internal DRY refactor** – four private helpers (``_resolve_de_aliases``,
+  ``_try_load_existing_de_result``, ``_print_de_summary``,
+  ``_print_de_perturbation_verbose``) consolidate previously triplicated
+  boilerplate across the three DE functions.  No behaviour change for
+  existing callers.
+
+* **Verbose improvements** – all three DE test functions accept
+  ``verbose: int | bool``.  ``verbose=1`` prints a per-run summary
+  (perturbations completed, mean genes tested).  ``verbose=2`` additionally
+  prints per-perturbation gene-count lines.
+
+* **Decoupled per-condition pct thresholds** – ``min_pct_both`` is complemented
   by independent ``min_pct_ctrl`` (default ``0.01``) and ``min_pct_pert``
   (default ``0.002``) parameters across all three DE test functions
   (``t_test``, ``wilcoxon_test``, ``nb_glm_test``) and the internal
   ``_low_expr_in_both_mask`` helper.  The lower ``min_pct_pert`` default
   prevents over-filtering genes induced from near-zero baseline
   (e.g. transcription-factor target genes).  The old ``min_pct_both``
-  kwarg is retained as a deprecated alias that overrides both new params and
-  emits a ``DeprecationWarning``; it will be removed in a future release.
+  kwarg is retained as a convenience alias that silently sets both
+  ``min_pct_ctrl`` and ``min_pct_pert`` to the same value.
 
 * **Dual-condition pert filter with enabled ``min_mean_pert``** – The
   perturbed-side filter now always applies a dual condition:

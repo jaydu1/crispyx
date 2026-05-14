@@ -733,11 +733,113 @@ def _load_completed_de_result(
     )
 
 
+# ---------------------------------------------------------------------------
+# Shared helpers for public DE functions
+# ---------------------------------------------------------------------------
+
+def _resolve_de_aliases(
+    *,
+    perturbation_column: str | None,
+    groupby: str | None,
+    control_label: str | None,
+    reference: str | None,
+    min_pct_both: float | None,
+    min_pct_ctrl: float,
+    min_pct_pert: float,
+    fn_name: str,
+) -> tuple[str, str | None, float, float]:
+    """Resolve groupby/reference aliases and handle min_pct_both.
+
+    Returns ``(perturbation_column, control_label, min_pct_ctrl, min_pct_pert)``.
+    """
+    # groupby alias
+    if groupby is not None and perturbation_column is not None:
+        raise TypeError(
+            f"{fn_name}() received both 'perturbation_column' and 'groupby'; "
+            "they are aliases for the same parameter — pass only one."
+        )
+    if groupby is not None:
+        perturbation_column = groupby
+    if perturbation_column is None:
+        raise TypeError(
+            f"{fn_name}() requires either 'perturbation_column' or its alias 'groupby'."
+        )
+    # reference alias
+    if reference is not None and control_label is not None:
+        raise TypeError(
+            f"{fn_name}() received both 'control_label' and 'reference'; "
+            "they are aliases for the same parameter — pass only one."
+        )
+    if reference is not None:
+        control_label = reference
+    # min_pct_both silent alias
+    if min_pct_both is not None:
+        min_pct_ctrl = float(min_pct_both)
+        min_pct_pert = float(min_pct_both)
+    return perturbation_column, control_label, min_pct_ctrl, min_pct_pert
+
+
+def _try_load_existing_de_result(
+    output_path: "Path",
+    *,
+    force: bool,
+    verbose: int | bool,
+    method_name: str,
+    memory_limit_gb: float | None,
+) -> "RankGenesGroupsResult | None":
+    """Return the loaded result if it already exists and ``force=False``, else ``None``."""
+    if not (output_path.exists() and not force):
+        return None
+    logger.info(
+        "Found existing %s result at %s. Loading instead of rerunning.",
+        method_name, output_path,
+    )
+    if verbose:
+        print(f"[crispyx] Loading existing result: {output_path}")
+        print("[crispyx] Pass force=True to rerun the analysis.")
+    return _load_completed_de_result(output_path, memory_limit_gb=memory_limit_gb)
+
+
+def _print_de_summary(
+    verbose: int | bool,
+    method_name: str,
+    n_completed: int,
+    n_groups: int,
+    n_tested_list: "list[int]",
+    n_genes: int,
+) -> None:
+    """Print verbose ≥ 1 summary for a DE run (t-test / NB-GLM)."""
+    if int(verbose) >= 1 and n_tested_list:
+        _mean = int(sum(n_tested_list) / len(n_tested_list))
+        _pct = 100.0 * _mean / n_genes if n_genes else 0
+        print(
+            f"[crispyx] {method_name}: {n_completed}/{n_groups} perturbations "
+            f"complete, mean {_mean}/{n_genes} genes tested ({_pct:.0f}%)"
+        )
+
+
+def _print_de_perturbation_verbose(
+    verbose: int | bool,
+    label: str,
+    n_tested: int,
+    n_genes: int,
+) -> None:
+    """Print verbose ≥ 2 per-perturbation gene-count line."""
+    if int(verbose) >= 2:
+        _pct = 100.0 * n_tested / n_genes if n_genes else 0
+        print(
+            f"[crispyx] {label}: {n_tested}/{n_genes} genes tested "
+            f"({_pct:.0f}%), {n_genes - n_tested} filtered"
+        )
+
+
 def t_test(
     data: str | Path | AnnData | ad.AnnData,
     *,
-    perturbation_column: str,
+    perturbation_column: str | None = None,
+    groupby: str | None = None,
     control_label: str | None = None,
+    reference: str | None = None,
     gene_name_column: str | None = None,
     perturbations: Iterable[str] | None = None,
     min_cells_expressed: int = 0,
@@ -779,8 +881,14 @@ def t_test(
         log-transformed expression data.
     perturbation_column
         Column in `adata.obs` indicating perturbation labels.
+    groupby
+        Alias for ``perturbation_column`` (Scanpy-compatible).
+        Mutually exclusive with ``perturbation_column``.
     control_label
         Label for the control/reference group. If None, infers from common patterns.
+    reference
+        Alias for ``control_label`` (Scanpy-compatible).
+        Mutually exclusive with ``control_label``.
     gene_name_column
         Column in `adata.var` with gene symbols. If None, uses `adata.var_names`.
     perturbations
@@ -796,8 +904,8 @@ def t_test(
         Default ``0.002`` (lower than ctrl; induction from near-zero baseline is
         biologically valid). Set to ``0.0`` to disable the pct check on pert.
     min_pct_both
-        Deprecated. If not ``None``, overrides both ``min_pct_ctrl`` and
-        ``min_pct_pert`` and emits a ``DeprecationWarning``.
+        If not ``None``, overrides both ``min_pct_ctrl`` and
+        ``min_pct_pert`` with the same value.
     min_mean_ctrl
         Minimum mean expression (log1p units) for the *control* side.
         Default ``0.05``. Excluded genes are written as NaN in
@@ -848,24 +956,25 @@ def t_test(
         path is available at `result.result_path`.
     """
 
-    if min_pct_both is not None:
-        warnings.warn(
-            "min_pct_both is deprecated; use min_pct_ctrl and min_pct_pert instead.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        min_pct_ctrl = float(min_pct_both)
-        min_pct_pert = float(min_pct_both)
+    perturbation_column, control_label, min_pct_ctrl, min_pct_pert = _resolve_de_aliases(
+        perturbation_column=perturbation_column,
+        groupby=groupby,
+        control_label=control_label,
+        reference=reference,
+        min_pct_both=min_pct_both,
+        min_pct_ctrl=min_pct_ctrl,
+        min_pct_pert=min_pct_pert,
+        fn_name="t_test",
+    )
 
     path = resolve_data_path(data)
     output_path = resolve_output_path(path, suffix="t_test", output_dir=output_dir, data_name=data_name)
 
-    if output_path.exists() and not force:
-        logger.info("Found existing t_test result at %s. Loading instead of rerunning.", output_path)
-        if verbose:
-            print(f"[crispyx] Loading existing result: {output_path}")
-            print("[crispyx] Pass force=True to rerun the analysis.")
-        return _load_completed_de_result(output_path, memory_limit_gb=memory_limit_gb)
+    if (r := _try_load_existing_de_result(
+        output_path, force=force, verbose=verbose,
+        method_name="t_test", memory_limit_gb=memory_limit_gb,
+    )):
+        return r
 
     backed = read_backed(path)
     try:
@@ -1196,10 +1305,7 @@ def t_test(
                             
                             newly_completed.append(label)
                             n_tested_list.append(int(n_tested_per_slot[local_idx]))
-                            if int(verbose) >= 2:
-                                _n = int(n_tested_per_slot[local_idx])
-                                _pct = 100.0 * _n / n_genes if n_genes else 0
-                                print(f"[crispyx] {label}: {_n}/{n_genes} genes tested ({_pct:.0f}%), {n_genes - _n} filtered")
+                            _print_de_perturbation_verbose(verbose, label, int(n_tested_per_slot[local_idx]), n_genes)
                             n_processed += 1
                             pbar.update(1)
                             logger.debug(f"Completed perturbation: {label}")
@@ -1211,10 +1317,7 @@ def t_test(
                 # Final checkpoint
                 _save_t_test_checkpoint()
                 logger.info(f"Completed {len(newly_completed)}/{n_groups} perturbations")
-                if int(verbose) >= 1 and n_tested_list:
-                    _mean = int(sum(n_tested_list) / len(n_tested_list))
-                    _pct = 100.0 * _mean / n_genes if n_genes else 0
-                    print(f"[crispyx] t-test DE: {len(newly_completed)}/{n_groups} perturbations complete, mean {_mean}/{n_genes} genes tested ({_pct:.0f}%)")
+                _print_de_summary(verbose, "t-test DE", len(newly_completed), n_groups, n_tested_list, n_genes)
 
             pvalue_adj_memmap = np.memmap(
                 tmp_path / "pvalues_adj.dat", mode="w+", dtype=np.float64, shape=shape
@@ -1287,8 +1390,10 @@ def nb_glm_test(
     data: str | Path | AnnData | ad.AnnData,
     *,
     # ---- Data parameters ----
-    perturbation_column: str,
+    perturbation_column: str | None = None,
+    groupby: str | None = None,
     control_label: str | None = None,
+    reference: str | None = None,
     covariates: Iterable[str] | None = None,
     gene_name_column: str | None = None,
     perturbations: Iterable[str] | None = None,
@@ -1358,8 +1463,14 @@ def nb_glm_test(
         raw count data.
     perturbation_column
         Column in `adata.obs` indicating perturbation labels.
+    groupby
+        Alias for ``perturbation_column`` (Scanpy-compatible).
+        Mutually exclusive with ``perturbation_column``.
     control_label
         Label for the control/reference group. If None, infers from common patterns.
+    reference
+        Alias for ``control_label`` (Scanpy-compatible).
+        Mutually exclusive with ``control_label``.
     covariates
         Additional columns in `adata.obs` to include as covariates in the GLM.
     gene_name_column
@@ -1461,8 +1572,8 @@ def nb_glm_test(
         Default ``0.002``. Combined with ``min_mean_pert`` this forms a dual
         condition that is more robust to doublet / ambient-RNA artefacts.
     min_pct_both
-        Deprecated. If not ``None``, overrides both ``min_pct_ctrl`` and
-        ``min_pct_pert`` and emits a ``DeprecationWarning``.
+        If not ``None``, overrides both ``min_pct_ctrl`` and
+        ``min_pct_pert`` with the same value.
     min_mean_ctrl
         Minimum mean (size-factor-normalised) expression for the *control* side.
         Default ``0.05``. Excluded genes appear as NaN in ``pvalue`` /
@@ -1582,14 +1693,16 @@ def nb_glm_test(
         `result[label].effect_size`, `result[label].pvalue`, etc. The h5ad file
         path is available at `result.result_path`.
     """
-    if min_pct_both is not None:
-        warnings.warn(
-            "min_pct_both is deprecated; use min_pct_ctrl and min_pct_pert instead.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        min_pct_ctrl = float(min_pct_both)
-        min_pct_pert = float(min_pct_both)
+    perturbation_column, control_label, min_pct_ctrl, min_pct_pert = _resolve_de_aliases(
+        perturbation_column=perturbation_column,
+        groupby=groupby,
+        control_label=control_label,
+        reference=reference,
+        min_pct_both=min_pct_both,
+        min_pct_ctrl=min_pct_ctrl,
+        min_pct_pert=min_pct_pert,
+        fn_name="nb_glm_test",
+    )
 
     # Validate min_mu parameter
     if min_mu < 0:
@@ -1616,15 +1729,11 @@ def nb_glm_test(
     _candidate_output_path = resolve_output_path(
         path, suffix="nb_glm", output_dir=output_dir, data_name=data_name
     )
-    if _candidate_output_path.exists() and not force:
-        logger.info(
-            "Found existing nb_glm result at %s. Loading instead of rerunning.",
-            _candidate_output_path,
-        )
-        if verbose:
-            print(f"[crispyx] Loading existing result: {_candidate_output_path}")
-            print("[crispyx] Pass force=True to rerun the analysis.")
-        return _load_completed_de_result(_candidate_output_path, memory_limit_gb=memory_limit_gb)
+    if (r := _try_load_existing_de_result(
+        _candidate_output_path, force=force, verbose=verbose,
+        method_name="nb_glm", memory_limit_gb=memory_limit_gb,
+    )):
+        return r
 
     # Warn if the on-disk matrix is stored in CSC format – row-slicing
     # (used by size-factor computation and control-matrix loading) is
@@ -3238,10 +3347,7 @@ def nb_glm_test(
                         _write_result_to_memmap(res, label)
                         newly_completed.append(label)
                         n_tested_list.append(res.get("n_tested", 0))
-                        if int(verbose) >= 2:
-                            _n = res.get("n_tested", 0)
-                            _pct = 100.0 * _n / n_genes if n_genes else 0
-                            print(f"[crispyx] {label}: {_n}/{n_genes} genes tested ({_pct:.0f}%), {n_genes - _n} filtered")
+                        _print_de_perturbation_verbose(verbose, label, res.get("n_tested", 0), n_genes)
                         logger.debug(f"Completed perturbation: {label}")
                     except Exception as e:
                         logger.error(f"Failed perturbation {label}: {e}")
@@ -3322,10 +3428,7 @@ def nb_glm_test(
                         _write_result_to_memmap(res, label)
                         newly_completed.append(label)
                         n_tested_list.append(res.get("n_tested", 0))
-                        if int(verbose) >= 2:
-                            _n = res.get("n_tested", 0)
-                            _pct = 100.0 * _n / n_genes if n_genes else 0
-                            print(f"[crispyx] {label}: {_n}/{n_genes} genes tested ({_pct:.0f}%), {n_genes - _n} filtered")
+                        _print_de_perturbation_verbose(verbose, label, res.get("n_tested", 0), n_genes)
                         logger.debug(f"Completed perturbation: {label}")
                     except Exception as e:
                         logger.error(f"Failed perturbation {label}: {e}")
@@ -3341,10 +3444,7 @@ def nb_glm_test(
         # Final checkpoint save
         _save_checkpoint()
         logger.info(f"Completed {len(newly_completed)}/{n_groups} perturbations")
-        if int(verbose) >= 1 and n_tested_list:
-            _mean = int(sum(n_tested_list) / len(n_tested_list))
-            _pct = 100.0 * _mean / n_genes if n_genes else 0
-            print(f"[crispyx] NB-GLM DE: {len(newly_completed)}/{n_groups} perturbations complete, mean {_mean}/{n_genes} genes tested ({_pct:.0f}%)")
+        _print_de_summary(verbose, "NB-GLM DE", len(newly_completed), n_groups, n_tested_list, n_genes)
         if newly_failed:
             logger.warning(f"Failed {len(newly_failed)} perturbations: {newly_failed[:5]}{'...' if len(newly_failed) > 5 else ''}")
 
@@ -3888,8 +3988,10 @@ def _wilcoxon_test_streaming(
 def wilcoxon_test(
     data: str | Path | AnnData | ad.AnnData,
     *,
-    perturbation_column: str,
+    perturbation_column: str | None = None,
+    groupby: str | None = None,
     control_label: str | None = None,
+    reference: str | None = None,
     gene_name_column: str | None = None,
     perturbations: Iterable[str] | None = None,
     min_cells_expressed: int = 0,
@@ -3926,8 +4028,14 @@ def wilcoxon_test(
         normalised, log-transformed data.
     perturbation_column
         Column in `adata.obs` indicating perturbation labels.
+    groupby
+        Alias for ``perturbation_column`` (Scanpy-compatible).
+        Mutually exclusive with ``perturbation_column``.
     control_label
         Label for the control/reference group. If None, infers from common patterns.
+    reference
+        Alias for ``control_label`` (Scanpy-compatible).
+        Mutually exclusive with ``control_label``.
     gene_name_column
         Column in `adata.var` with gene symbols. If None, uses `adata.var_names`.
     perturbations
@@ -3944,8 +4052,8 @@ def wilcoxon_test(
         biologically valid). Combined with ``min_mean_pert`` this forms a dual
         condition more robust than pct alone.
     min_pct_both
-        Deprecated. If not ``None``, overrides both ``min_pct_ctrl`` and
-        ``min_pct_pert`` and emits a ``DeprecationWarning``.
+        If not ``None``, overrides both ``min_pct_ctrl`` and
+        ``min_pct_pert`` with the same value.
     min_mean_ctrl
         Minimum mean log1p expression for the *control* side. Default ``0.05``.
         Excluded genes are written as NaN in ``score`` / ``pvalue`` /
@@ -4001,24 +4109,25 @@ def wilcoxon_test(
         path is available at `result.result_path`.
     """
 
-    if min_pct_both is not None:
-        warnings.warn(
-            "min_pct_both is deprecated; use min_pct_ctrl and min_pct_pert instead.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        min_pct_ctrl = float(min_pct_both)
-        min_pct_pert = float(min_pct_both)
+    perturbation_column, control_label, min_pct_ctrl, min_pct_pert = _resolve_de_aliases(
+        perturbation_column=perturbation_column,
+        groupby=groupby,
+        control_label=control_label,
+        reference=reference,
+        min_pct_both=min_pct_both,
+        min_pct_ctrl=min_pct_ctrl,
+        min_pct_pert=min_pct_pert,
+        fn_name="wilcoxon_test",
+    )
 
     path = resolve_data_path(data)
     output_path = resolve_output_path(path, suffix="wilcoxon", output_dir=output_dir, data_name=data_name)
 
-    if output_path.exists() and not force:
-        logger.info("Found existing wilcoxon result at %s. Loading instead of rerunning.", output_path)
-        if verbose:
-            print(f"[crispyx] Loading existing result: {output_path}")
-            print("[crispyx] Pass force=True to rerun the analysis.")
-        return _load_completed_de_result(output_path, memory_limit_gb=memory_limit_gb)
+    if (r := _try_load_existing_de_result(
+        output_path, force=force, verbose=verbose,
+        method_name="wilcoxon", memory_limit_gb=memory_limit_gb,
+    )):
+        return r
 
     backed = read_backed(path)
     try:
@@ -4416,9 +4525,7 @@ def wilcoxon_test(
                 if _track_gene_counts:
                     if int(verbose) >= 2:
                         for _gi, _label in enumerate(candidates):
-                            _n = int(_valid_gene_counts[_gi])
-                            _pct = 100.0 * _n / n_genes if n_genes else 0
-                            print(f"[crispyx] {_label}: {_n}/{n_genes} genes tested ({_pct:.0f}%), {n_genes - _n} filtered")
+                            _print_de_perturbation_verbose(verbose, _label, int(_valid_gene_counts[_gi]), n_genes)
                     _mean = int(_valid_gene_counts.mean()) if n_groups > 0 else 0
                     _pct = 100.0 * _mean / n_genes if n_genes else 0
                     print(f"[crispyx] Wilcoxon DE: {n_groups} perturbations complete, mean {_mean}/{n_genes} genes tested ({_pct:.0f}%)")
