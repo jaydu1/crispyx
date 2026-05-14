@@ -240,13 +240,13 @@ class _DummyProgress:
 def _create_progress_context(
     total: int,
     desc: str,
-    verbose: bool,
+    verbose: int | bool,
 ) -> "_tqdm | _DummyProgress":
     """Create a progress bar context manager.
     
-    Returns tqdm progress bar if verbose=True and tqdm is available,
+    Returns tqdm progress bar if verbose>=1 and tqdm is available,
     otherwise returns a dummy context manager.
     """
-    if verbose and HAS_TQDM and total > 0:
+    if int(verbose) >= 1 and HAS_TQDM and total > 0:
         return _tqdm(total=total, desc=desc, unit="perturbation")
     return _DummyProgress()

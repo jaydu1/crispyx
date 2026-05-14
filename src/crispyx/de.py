@@ -750,7 +750,7 @@ def t_test(
     output_dir: str | Path | None = None,
     data_name: str | None = None,
     n_jobs: int | None = None,
-    verbose: bool = False,
+    verbose: int | bool = False,
     resume: bool = False,
     checkpoint_interval: int | None = None,
     scanpy_format: bool = False,
@@ -1045,6 +1045,7 @@ def t_test(
             var_buffer = np.zeros(n_genes, dtype=np.float64)
             se_buffer = np.zeros(n_genes, dtype=np.float64)
             lfc_work_buffer = np.zeros(n_genes, dtype=np.float64)  # Work buffer for in-place LFC
+            n_tested_per_slot = np.zeros(batch_size, dtype=np.int32)
 
             def compute_perturbation(label: str, slot: int) -> None:
                 idx = group_index[label]
@@ -1089,6 +1090,7 @@ def t_test(
                     min_mean_pert=min_mean_pert,
                 )
                 valid &= ~low_both
+                n_tested_per_slot[slot] = int(valid.sum())
 
                 stat_buffer[slot].fill(np.nan)
                 pval_buffer[slot].fill(np.nan)
@@ -1158,6 +1160,7 @@ def t_test(
                 _write_checkpoint_atomic(checkpoint_path, checkpoint_data)
 
             if n_groups > 0:
+                n_tested_list: list[int] = []
                 with _create_progress_context(len(candidates_to_run), "t-test DE", verbose) as pbar:
                     for batch_start in range(0, n_groups, batch_size):
                         batch_labels = candidates[batch_start : batch_start + batch_size]
@@ -1192,6 +1195,11 @@ def t_test(
                             ds_order[global_idx] = order_buffer[local_idx]
                             
                             newly_completed.append(label)
+                            n_tested_list.append(int(n_tested_per_slot[local_idx]))
+                            if int(verbose) >= 2:
+                                _n = int(n_tested_per_slot[local_idx])
+                                _pct = 100.0 * _n / n_genes if n_genes else 0
+                                print(f"[crispyx] {label}: {_n}/{n_genes} genes tested ({_pct:.0f}%), {n_genes - _n} filtered")
                             n_processed += 1
                             pbar.update(1)
                             logger.debug(f"Completed perturbation: {label}")
@@ -1203,6 +1211,10 @@ def t_test(
                 # Final checkpoint
                 _save_t_test_checkpoint()
                 logger.info(f"Completed {len(newly_completed)}/{n_groups} perturbations")
+                if int(verbose) >= 1 and n_tested_list:
+                    _mean = int(sum(n_tested_list) / len(n_tested_list))
+                    _pct = 100.0 * _mean / n_genes if n_genes else 0
+                    print(f"[crispyx] t-test DE: {len(newly_completed)}/{n_groups} perturbations complete, mean {_mean}/{n_genes} genes tested ({_pct:.0f}%)")
 
             pvalue_adj_memmap = np.memmap(
                 tmp_path / "pvalues_adj.dat", mode="w+", dtype=np.float64, shape=shape
@@ -1317,7 +1329,7 @@ def nb_glm_test(
     output_dir: str | Path | None = None,
     data_name: str | None = None,
     scanpy_format: bool = False,
-    verbose: bool = False,
+    verbose: int | bool = False,
     profiling: bool = False,
     # ---- Resume/Memory parameters ----
     resume: bool = False,
@@ -1619,7 +1631,6 @@ def nb_glm_test(
     # extremely slow on CSC.  Recommend the CSR standardized file.
     _storage_fmt = get_matrix_storage_format(path)
     if _storage_fmt == "csc":
-        import warnings
         warnings.warn(
             f"The input file '{path.name}' stores its matrix in CSC format. "
             "NB-GLM performs row-wise access (size factors, control matrix, "
@@ -1875,6 +1886,7 @@ def nb_glm_test(
         # Initialize result arrays
         result = {
             "group_idx": group_idx,
+            "n_tested": int(valid_mask.sum()),
             "effect": np.full(n_genes, np.nan, dtype=np.float64),
             "statistic": np.full(n_genes, np.nan, dtype=np.float64),
             "pvalue": np.full(n_genes, np.nan, dtype=np.float64),
@@ -2199,6 +2211,7 @@ def nb_glm_test(
             min_mean_pert=min_mean_pert,
         )
         valid_mask = valid_mask & ~low_both
+        result["n_tested"] = int(valid_mask.sum())
 
         if not np.any(valid_mask):
             return result
@@ -3136,6 +3149,7 @@ def nb_glm_test(
             _write_checkpoint_atomic(checkpoint_path, checkpoint_data)
         
         # Run fitting with progress tracking
+        n_tested_list: list[int] = []
         with _create_progress_context(n_to_run, "NB-GLM DE", verbose) as pbar:
             if use_parallel:
                 # Use joblib.Parallel with loky backend for true process-based parallelism
@@ -3223,6 +3237,11 @@ def nb_glm_test(
                     try:
                         _write_result_to_memmap(res, label)
                         newly_completed.append(label)
+                        n_tested_list.append(res.get("n_tested", 0))
+                        if int(verbose) >= 2:
+                            _n = res.get("n_tested", 0)
+                            _pct = 100.0 * _n / n_genes if n_genes else 0
+                            print(f"[crispyx] {label}: {_n}/{n_genes} genes tested ({_pct:.0f}%), {n_genes - _n} filtered")
                         logger.debug(f"Completed perturbation: {label}")
                     except Exception as e:
                         logger.error(f"Failed perturbation {label}: {e}")
@@ -3302,6 +3321,11 @@ def nb_glm_test(
                             )
                         _write_result_to_memmap(res, label)
                         newly_completed.append(label)
+                        n_tested_list.append(res.get("n_tested", 0))
+                        if int(verbose) >= 2:
+                            _n = res.get("n_tested", 0)
+                            _pct = 100.0 * _n / n_genes if n_genes else 0
+                            print(f"[crispyx] {label}: {_n}/{n_genes} genes tested ({_pct:.0f}%), {n_genes - _n} filtered")
                         logger.debug(f"Completed perturbation: {label}")
                     except Exception as e:
                         logger.error(f"Failed perturbation {label}: {e}")
@@ -3317,6 +3341,10 @@ def nb_glm_test(
         # Final checkpoint save
         _save_checkpoint()
         logger.info(f"Completed {len(newly_completed)}/{n_groups} perturbations")
+        if int(verbose) >= 1 and n_tested_list:
+            _mean = int(sum(n_tested_list) / len(n_tested_list))
+            _pct = 100.0 * _mean / n_genes if n_genes else 0
+            print(f"[crispyx] NB-GLM DE: {len(newly_completed)}/{n_groups} perturbations complete, mean {_mean}/{n_genes} genes tested ({_pct:.0f}%)")
         if newly_failed:
             logger.warning(f"Failed {len(newly_failed)} perturbations: {newly_failed[:5]}{'...' if len(newly_failed) > 5 else ''}")
 
@@ -3475,7 +3503,7 @@ def _wilcoxon_test_streaming(
     checkpoint_path: Path,
     checkpoint_interval: int | None,
     scanpy_format: bool,
-    verbose: bool,
+    verbose: int | bool,
     resume: bool,
     group_batch_size: int,
     memory_limit_gb: float | None = None,
@@ -3827,6 +3855,8 @@ def _wilcoxon_test_streaming(
             pbar.update(1)
 
     logger.info(f"Completed all {n_batches} group batches")
+    if int(verbose) >= 1:
+        print(f"[crispyx] Wilcoxon DE: {n_groups} perturbations complete, {n_genes} genes")
 
     # Build RankGenesGroupsResult by reading back from h5ad.
     # Uses _build_result_from_h5ad which skips loading for very large results
@@ -3874,7 +3904,7 @@ def wilcoxon_test(
     output_dir: str | Path | None = None,
     data_name: str | None = None,
     n_jobs: int | None = None,
-    verbose: bool = False,
+    verbose: int | bool = False,
     resume: bool = False,
     checkpoint_interval: int | None = None,
     scanpy_format: bool = False,
@@ -4147,6 +4177,9 @@ def wilcoxon_test(
             # Track progress
             current_chunk = 0
             n_chunks_processed = 0
+            _track_gene_counts = int(verbose) >= 1
+            if _track_gene_counts:
+                _valid_gene_counts = np.zeros(n_groups, dtype=np.int32)
             
             # Helper to save checkpoint
             def _save_wilcoxon_checkpoint(chunk_idx: int) -> None:
@@ -4239,6 +4272,11 @@ def wilcoxon_test(
                         )
                         low_both_masks.append(low_both)
                         valid_masks.append(valid & ~low_both)
+
+                    # Accumulate per-perturbation valid gene counts for verbose output
+                    if _track_gene_counts:
+                        for _vi in range(len(valid_masks)):
+                            _valid_gene_counts[_vi] += int(valid_masks[_vi].sum())
 
                     # 4. Find union of all valid genes (to minimize dense conversion)
                     any_valid = np.zeros(n_chunk_genes, dtype=bool)
@@ -4375,6 +4413,15 @@ def wilcoxon_test(
                 # Final checkpoint
                 _save_wilcoxon_checkpoint(current_chunk - 1)
                 logger.info(f"Completed {n_chunks_processed} gene chunks")
+                if _track_gene_counts:
+                    if int(verbose) >= 2:
+                        for _gi, _label in enumerate(candidates):
+                            _n = int(_valid_gene_counts[_gi])
+                            _pct = 100.0 * _n / n_genes if n_genes else 0
+                            print(f"[crispyx] {_label}: {_n}/{n_genes} genes tested ({_pct:.0f}%), {n_genes - _n} filtered")
+                    _mean = int(_valid_gene_counts.mean()) if n_groups > 0 else 0
+                    _pct = 100.0 * _mean / n_genes if n_genes else 0
+                    print(f"[crispyx] Wilcoxon DE: {n_groups} perturbations complete, mean {_mean}/{n_genes} genes tested ({_pct:.0f}%)")
         finally:
             backed.file.close()
 
