@@ -3,7 +3,7 @@ API Reference
 
 crispyx exposes a Scanpy-style API through four namespace singletons:
 
-* ``cx.pp`` — Preprocessing (QC, normalisation, PCA, neighbours, format conversion)
+* ``cx.pp`` — Preprocessing (QC, normalisation, HVG selection, PCA, neighbours, format conversion)
 * ``cx.pb`` — Pseudo-bulk aggregation
 * ``cx.tl`` — Tools (differential expression, LFC shrinkage, overlap analysis)
 * ``cx.pl`` — Plotting
@@ -120,6 +120,14 @@ Negative binomial GLM
 ~~~~~~~~~~~~~~~~~~~~~
 
 .. automodule:: crispyx.glm
+   :members:
+   :undoc-members:
+   :show-inheritance:
+
+Highly variable genes
+~~~~~~~~~~~~~~~~~~~~~
+
+.. automodule:: crispyx.hvg
    :members:
    :undoc-members:
    :show-inheritance:

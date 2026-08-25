@@ -57,6 +57,7 @@ from .de import (
     t_test,
     wilcoxon_test,
 )
+from .hvg import highly_variable_genes
 from ._preflight import estimate_disk_usage
 from .profiling import (
     Profiler,
@@ -124,6 +125,7 @@ __all__ = [
     "filter_genes_by_cell_count",
     "filter_perturbations_by_cell_count",
     "quality_control_summary",
+    "highly_variable_genes",
     # Subsampling
     "subsample",
     # Pseudo-bulk
