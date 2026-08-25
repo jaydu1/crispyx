@@ -1,6 +1,45 @@
 Changelog
 =========
 
+Version 0.1.2
+-------------
+
+*Released 2026-08-25.*
+
+* **New: ``cx.pp.highly_variable_genes``** – streaming, disk-backed highly
+  variable gene (HVG) selection, the producer half of the
+  ``var["highly_variable"]`` contract ``cx.pp.pca`` already consumed. Two
+  flavors, both dispatching on storage format the same way the QC functions
+  do (row-chunked for CSR/dense, column-chunked for CSC), in ``O(n_genes)``
+  memory:
+
+  * ``"seurat_v3"`` (default; Stuart et al. 2019) -- ranks genes by
+    standardized variance fit via a degree-2 LOESS smoother (the new
+    ``scikit-misc`` runtime dependency). Expects raw counts; requires
+    ``n_top_genes``. Two data passes are inherent to the method (the clip
+    threshold used in pass 2 depends on every gene's pass-1 moments).
+    Selection uses an exact rank (matching scanpy's own tie-breaking), so
+    ``n_top_genes`` is always honored exactly even when several genes tie
+    at the cutoff -- a real occurrence on production data, where multiple
+    low-count genes can share an identical normalized variance.
+  * ``"mean_dispersion"`` (Satija et al. 2015) -- bins genes by mean
+    expression and z-normalizes dispersion within each bin. Expects
+    log1p-normalized data; needs no extra dependency. Single data pass.
+
+  Defaults to computing gene statistics from **control cells only**
+  (``cell_mask="control"``, resolved from ``perturbation_column``/
+  ``control_label``) rather than all cells -- a CRISPR/Perturb-seq-specific
+  choice, since over all cells, on-target perturbation effects can dominate
+  the variable-gene list and structure downstream PCA around *which
+  perturbation a cell received* rather than baseline cell-state
+  heterogeneity. Pass ``cell_mask=None`` for the scanpy/Seurat all-cells
+  default, or an explicit boolean array for a custom subset; the mask is
+  resolved from ``obs`` alone and threaded into the streaming pass at no
+  extra cost. Writes ``var["highly_variable"]``, ``var["means"]``,
+  ``var["variances"]``, and ``var["variances_norm"]``. Verified against
+  scanpy on real datasets (including outlier/edge-case genes) with an exact
+  match of both the selected gene set and the normalized-variance values.
+
 Version 0.1.1
 -------------
 

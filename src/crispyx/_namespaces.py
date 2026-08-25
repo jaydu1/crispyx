@@ -31,6 +31,7 @@ from .de import (
     t_test,
     wilcoxon_test,
 )
+from .hvg import highly_variable_genes
 from .plotting import (
     materialize_rank_genes_groups,
     plot_ma,
@@ -474,6 +475,51 @@ class _PreprocessingNamespace:
             chunk_size=chunk_size,
             data_name=data_name,
             random_state=random_state,
+            verbose=verbose,
+        )
+
+    def highly_variable_genes(
+        self,
+        data: str | Path | ad.AnnData,
+        *,
+        flavor: Literal["seurat_v3", "mean_dispersion"] = "seurat_v3",
+        n_top_genes: int | None = 2000,
+        min_mean: float = 0.0125,
+        max_mean: float = 3.0,
+        min_disp: float = 0.5,
+        n_bins: int = 20,
+        span: float = 0.3,
+        layer: str | None = None,
+        perturbation_column: str | None = None,
+        control_label: str | None = None,
+        cell_mask: "Literal['control'] | np.ndarray | None" = "control",
+        gene_name_column: str | None = None,
+        chunk_size: int | None = None,
+        inplace: bool = True,
+        verbose: int | bool = True,
+    ):
+        """Select highly variable genes, streamed off disk.
+
+        See :func:`crispyx.hvg.highly_variable_genes` for the full parameter
+        documentation, including the ``cell_mask="control"`` default.
+        """
+        path = resolve_data_path(data)
+        return highly_variable_genes(
+            path,
+            flavor=flavor,
+            n_top_genes=n_top_genes,
+            min_mean=min_mean,
+            max_mean=max_mean,
+            min_disp=min_disp,
+            n_bins=n_bins,
+            span=span,
+            layer=layer,
+            perturbation_column=perturbation_column,
+            control_label=control_label,
+            cell_mask=cell_mask,
+            gene_name_column=gene_name_column,
+            chunk_size=chunk_size,
+            inplace=inplace,
             verbose=verbose,
         )
 

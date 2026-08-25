@@ -14,7 +14,7 @@ Genome-wide CRISPR screens routinely produce datasets with hundreds of thousands
 
 ## Features
 
-- **Streaming QC & preprocessing** – Filter cells, perturbations, and genes; normalise and log-transform; CSC-aware streaming with `format_mismatch_policy`; all without loading the full matrix into memory
+- **Streaming QC & preprocessing** – Filter cells, perturbations, and genes; normalise and log-transform; select highly variable genes (`seurat_v3`/`mean_dispersion`, control-cells-only by default); CSC-aware streaming with `format_mismatch_policy`; all without loading the full matrix into memory
 - **Subsampling & downsampling** – Stratified or cluster-sampled cell subsampling (`cx.pp.subsample`, exact count or proportion per stratum, drop or keep small groups) and dependency-free per-cell count thinning (`cx.pp.downsample_counts`, the streaming equivalent of `scanpy.pp.downsample_counts`) for aligning dataset scale and sequencing depth before comparing screens
 - **Pseudo-bulk aggregation** – Absolute profiles over multiple grouping columns (for example, perturbation × batch), strict count sums or mean log1p expression, optional deterministic bootstrap sampling, and explicit within-batch effect calculation
 - **Differential expression** – t-test, Wilcoxon rank-sum (including batch-stratified / van Elteren test via `batch_column`), and negative binomial GLM with apeGLM LFC shrinkage; multi-core support and adaptive memory management; per-condition low-expression filtering to exclude genes that are near-zero in both groups

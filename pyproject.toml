@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "crispyx"
-version = "0.1.1"
+version = "0.1.2"
 description = "Memory-efficient streaming analysis of large-scale CRISPR and Perturb-seq screens on disk-backed AnnData files"
 readme = "README.md"
 license = {file = "LICENSE"}
@@ -42,6 +42,7 @@ dependencies = [
     "h5py>=3.0",
     "joblib>=1.0",
     "scikit-learn>=1.0",
+    "scikit-misc>=0.1.4",
     "scanpy>=1.9.2",
     "seaborn>=0.12",
     "matplotlib>=3.5",
