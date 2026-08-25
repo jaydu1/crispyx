@@ -11,9 +11,9 @@ in this package are crispyx's own reimplementations.
 
 from __future__ import annotations
 
-import logging
+import warnings
 from pathlib import Path
-from typing import Literal
+from typing import Callable, Literal
 
 import anndata as ad
 import numpy as np
@@ -24,9 +24,10 @@ from tqdm.auto import tqdm
 from . import _messages
 from .data import (
     AnnData,
+    _detect_backed_sparse_format,
     calculate_optimal_chunk_size,
+    calculate_optimal_gene_chunk_size,
     ensure_gene_symbol_column,
-    get_matrix_storage_format,
     iter_matrix_chunks,
     load_obs,
     load_var,
@@ -36,7 +37,67 @@ from .data import (
     write_var,
 )
 
-logger = logging.getLogger(__name__)
+
+def _stream_reduce(
+    backed: ad.AnnData,
+    *,
+    storage_format: str,
+    layer: str | None,
+    cell_mask: np.ndarray | None,
+    chunk_size: int,
+    show_progress: bool,
+    desc: str,
+    block_fn: Callable[[np.ndarray | sp.spmatrix, slice], tuple[np.ndarray, np.ndarray]],
+) -> tuple[np.ndarray, np.ndarray]:
+    """Stream ``matrix`` off disk, applying ``block_fn`` per chunk and combining results.
+
+    Shared dispatch/looping core for :func:`_stream_gene_moments` and
+    :func:`_stream_clipped_sums`: column-chunked for CSC (each chunk already
+    holds every cell for its genes, so ``block_fn``'s per-gene outputs are
+    assigned directly by ``slc``), row-chunked with a running accumulator
+    otherwise (``block_fn``'s outputs are summed across cell chunks).
+    ``convert_to_dense=False`` throughout so a chunk's memory is ``O(nnz in
+    that chunk)``, not ``O(chunk_size x n_genes)`` -- for the CSC path in
+    particular, a "column chunk" spans every cell, so staying sparse is not
+    optional.
+    """
+    matrix = backed.X if layer is None else backed.layers[layer]
+
+    if storage_format == "csc":
+        n_chunks = (backed.n_vars + chunk_size - 1) // chunk_size
+        out_a = np.empty(backed.n_vars)
+        out_b = np.empty(backed.n_vars)
+        for slc, block in tqdm(
+            iter_matrix_chunks(backed, axis=1, matrix=matrix, chunk_size=chunk_size, convert_to_dense=False),
+            total=n_chunks,
+            desc=f"{desc} (CSC)",
+            disable=not show_progress,
+        ):
+            if cell_mask is not None:
+                block = block[cell_mask]
+            a, b = block_fn(block, slc)
+            out_a[slc] = a
+            out_b[slc] = b
+        return out_a, out_b
+
+    n_chunks = (backed.n_obs + chunk_size - 1) // chunk_size
+    out_a = np.zeros(backed.n_vars)
+    out_b = np.zeros(backed.n_vars)
+    for slc, block in tqdm(
+        iter_matrix_chunks(backed, axis=0, matrix=matrix, chunk_size=chunk_size, convert_to_dense=False),
+        total=n_chunks,
+        desc=desc,
+        disable=not show_progress,
+    ):
+        local_mask = None if cell_mask is None else cell_mask[slc]
+        if local_mask is not None:
+            if not np.any(local_mask):
+                continue
+            block = block[local_mask]
+        a, b = block_fn(block, slc)
+        out_a += a
+        out_b += b
+    return out_a, out_b
 
 
 def _stream_gene_moments(
@@ -51,23 +112,19 @@ def _stream_gene_moments(
 ) -> tuple[np.ndarray, np.ndarray, int]:
     """Return ``(mean, var, n_cells_used)`` per gene, streamed off disk.
 
-    Dispatches on ``storage_format`` the same way ``qc.py``'s masks-only path
-    does: column-chunked for CSC (each chunk already holds every cell for its
-    genes, so mean/var are computed directly per chunk), row-chunked with a
-    running accumulator otherwise. ``convert_to_dense=False`` throughout so a
-    chunk's memory is ``O(nnz in that chunk)``, not ``O(chunk_size x
-    n_genes)`` -- for the CSC path in particular, a "column chunk" spans
-    every cell, so staying sparse is not optional. ``expm1``/masking are
-    applied to a per-block copy (never the shared backed slice) and, for the
-    sparse case, only to ``block.data`` -- both operations are
-    sparsity-preserving (``expm1(0) == 0``; masking rows never touches
-    nonzero *values*), so no dense transformed copy of a chunk is ever
-    materialized. Variance uses the unbiased (``ddof=1``) estimator.
+    ``expm1``/masking are applied to a per-block copy (never the shared
+    backed slice) and, for the sparse case, only to ``block.data`` -- both
+    operations are sparsity-preserving (``expm1(0) == 0``; masking rows
+    never touches nonzero *values*), so no dense transformed copy of a
+    chunk is ever materialized. Variance uses the unbiased (``ddof=1``)
+    estimator, computed from the per-gene sum/sum-of-squares totals after
+    streaming -- these totals are already summed over every cell in both
+    the CSC and row-chunked dispatch, so the same closed-form pass works
+    for either.
     """
-    matrix = backed.X if layer is None else backed.layers[layer]
     n_used = int(cell_mask.sum()) if cell_mask is not None else backed.n_obs
 
-    def _sum_and_sqsum(block) -> tuple[np.ndarray, np.ndarray]:
+    def _sum_and_sqsum(block, _slc: slice) -> tuple[np.ndarray, np.ndarray]:
         if transform == "expm1":
             if sp.issparse(block):
                 block = block.copy()
@@ -82,44 +139,51 @@ def _stream_gene_moments(
             ss = np.square(block).sum(axis=0)
         return s, ss
 
-    if storage_format == "csc":
-        n_chunks = (backed.n_vars + chunk_size - 1) // chunk_size
-        mean = np.empty(backed.n_vars)
-        var = np.empty(backed.n_vars)
-        for slc, block in tqdm(
-            iter_matrix_chunks(backed, axis=1, matrix=matrix, chunk_size=chunk_size, convert_to_dense=False),
-            total=n_chunks,
-            desc="Computing gene moments (CSC)",
-            disable=not show_progress,
-        ):
-            if cell_mask is not None:
-                block = block[cell_mask]
-            s, ss = _sum_and_sqsum(block)
-            m = s / n_used
-            mean[slc] = m
-            var[slc] = (ss - n_used * np.square(m)) / max(n_used - 1, 1)
-        return mean, var, n_used
-
-    n_chunks = (backed.n_obs + chunk_size - 1) // chunk_size
-    s_acc = np.zeros(backed.n_vars)
-    ss_acc = np.zeros(backed.n_vars)
-    for slc, block in tqdm(
-        iter_matrix_chunks(backed, axis=0, matrix=matrix, chunk_size=chunk_size, convert_to_dense=False),
-        total=n_chunks,
+    s_acc, ss_acc = _stream_reduce(
+        backed,
+        storage_format=storage_format,
+        layer=layer,
+        cell_mask=cell_mask,
+        chunk_size=chunk_size,
+        show_progress=show_progress,
         desc="Computing gene moments",
-        disable=not show_progress,
-    ):
-        local_mask = None if cell_mask is None else cell_mask[slc]
-        if local_mask is not None:
-            if not np.any(local_mask):
-                continue
-            block = block[local_mask]
-        s, ss = _sum_and_sqsum(block)
-        s_acc += s
-        ss_acc += ss
+        block_fn=_sum_and_sqsum,
+    )
     mean = s_acc / n_used
     var = (ss_acc - n_used * np.square(mean)) / max(n_used - 1, 1)
     return mean, var, n_used
+
+
+def _check_looks_like_counts(
+    backed: ad.AnnData,
+    *,
+    storage_format: str,
+    layer: str | None,
+) -> None:
+    """Warn if the first non-empty chunk doesn't look like raw counts.
+
+    Mirrors scanpy's own ``flavor="seurat_v3"`` sanity check
+    (``check_nonnegative_integers``): only the first chunk is inspected,
+    matching the same "peek, don't scan" cost the rest of this module pays
+    for correctness checks (e.g. ``de.py``'s count-likeness guard).
+    """
+    matrix = backed.X if layer is None else backed.layers[layer]
+    axis = 1 if storage_format == "csc" else 0
+    for _, block in iter_matrix_chunks(
+        backed, axis=axis, matrix=matrix, chunk_size=100, convert_to_dense=False,
+    ):
+        values = block.data if sp.issparse(block) else np.asarray(block)
+        if values.size == 0:
+            continue
+        looks_like_counts = not np.any(values < 0) and np.all(np.isclose(values, np.round(values)))
+        if not looks_like_counts:
+            warnings.warn(
+                "flavor='seurat_v3' expects raw count data, but non-integer or "
+                "negative values were found. Results may be unreliable.",
+                UserWarning,
+                stacklevel=2,
+            )
+        break
 
 
 def _top_n_mask(scores: np.ndarray, n_top_genes: int) -> np.ndarray:
@@ -132,7 +196,7 @@ def _top_n_mask(scores: np.ndarray, n_top_genes: int) -> np.ndarray:
     ``seurat_v3``, whose selection semantics are different.
     """
     finite = scores[~np.isnan(scores)]
-    if finite.size == 0:
+    if finite.size == 0 or n_top_genes <= 0:
         return np.zeros(scores.shape, dtype=bool)
     n_top = min(n_top_genes, finite.size)
     cutoff = finite.min() if n_top >= finite.size else np.sort(finite)[::-1][n_top - 1]
@@ -176,9 +240,9 @@ def _stream_clipped_sums(
     clipping a zero entry is a no-op and sparsity is preserved. Dispatches
     the same way as :func:`_stream_gene_moments`.
     """
-    matrix = backed.X if layer is None else backed.layers[layer]
 
-    def _clip_and_sum(block, clip_local: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    def _clip_and_sum(block, slc: slice) -> tuple[np.ndarray, np.ndarray]:
+        clip_local = clip_val[slc] if storage_format == "csc" else clip_val
         if sp.issparse(block):
             block = block.tocsc() if storage_format == "csc" else block.tocsr()
             block = block.copy()
@@ -196,41 +260,16 @@ def _stream_clipped_sums(
             ss = np.square(clipped).sum(axis=0)
         return s, ss
 
-    if storage_format == "csc":
-        n_chunks = (backed.n_vars + chunk_size - 1) // chunk_size
-        clipped_sum = np.empty(backed.n_vars)
-        clipped_sqsum = np.empty(backed.n_vars)
-        for slc, block in tqdm(
-            iter_matrix_chunks(backed, axis=1, matrix=matrix, chunk_size=chunk_size, convert_to_dense=False),
-            total=n_chunks,
-            desc="Clipping counts (CSC)",
-            disable=not show_progress,
-        ):
-            if cell_mask is not None:
-                block = block[cell_mask]
-            s, ss = _clip_and_sum(block, clip_val[slc])
-            clipped_sum[slc] = s
-            clipped_sqsum[slc] = ss
-        return clipped_sum, clipped_sqsum
-
-    n_chunks = (backed.n_obs + chunk_size - 1) // chunk_size
-    clipped_sum = np.zeros(backed.n_vars)
-    clipped_sqsum = np.zeros(backed.n_vars)
-    for slc, block in tqdm(
-        iter_matrix_chunks(backed, axis=0, matrix=matrix, chunk_size=chunk_size, convert_to_dense=False),
-        total=n_chunks,
+    return _stream_reduce(
+        backed,
+        storage_format=storage_format,
+        layer=layer,
+        cell_mask=cell_mask,
+        chunk_size=chunk_size,
+        show_progress=show_progress,
         desc="Clipping counts",
-        disable=not show_progress,
-    ):
-        local_mask = None if cell_mask is None else cell_mask[slc]
-        if local_mask is not None:
-            if not np.any(local_mask):
-                continue
-            block = block[local_mask]
-        s, ss = _clip_and_sum(block, clip_val)
-        clipped_sum += s
-        clipped_sqsum += ss
-    return clipped_sum, clipped_sqsum
+        block_fn=_clip_and_sum,
+    )
 
 
 def _seurat_v3_flavor(
@@ -257,6 +296,8 @@ def _seurat_v3_flavor(
     2 cannot start until pass 1 has finished for every gene.
     """
     from skmisc.loess import loess
+
+    _check_looks_like_counts(backed, storage_format=storage_format, layer=layer)
 
     mean, var, n_used = _stream_gene_moments(
         backed,
@@ -361,6 +402,7 @@ def _mean_dispersion_flavor(
 def _resolve_cell_mask(
     path: Path,
     *,
+    n_obs: int,
     perturbation_column: str | None,
     control_label: str | None,
     cell_mask: "Literal['control'] | np.ndarray | None",
@@ -401,6 +443,11 @@ def _resolve_cell_mask(
         return mask
 
     mask = np.asarray(cell_mask, dtype=bool)
+    if mask.ndim != 1 or mask.shape[0] != n_obs:
+        raise ValueError(
+            f"cell_mask must be a 1D boolean array of length n_obs ({n_obs}); "
+            f"got shape {mask.shape}."
+        )
     if not mask.any():
         raise ValueError(
             "cell_mask selects zero cells; pass a mask with at least one True entry, "
@@ -515,27 +562,30 @@ def highly_variable_genes(
     path = resolve_data_path(data)
     _messages.print_reading(verbose, "pp.highly_variable_genes", path)
 
-    cell_mask_arr = _resolve_cell_mask(
-        path,
-        perturbation_column=perturbation_column,
-        control_label=control_label,
-        cell_mask=cell_mask,
-        verbose=verbose,
-    )
-
     backed = read_backed(path)
     try:
         ensure_gene_symbol_column(backed, gene_name_column)
         n_obs, n_vars = backed.n_obs, backed.n_vars
-    finally:
-        backed.file.close()
 
-    storage_format = get_matrix_storage_format(path)
-    if chunk_size is None:
-        chunk_size = calculate_optimal_chunk_size(n_obs, n_vars)
+        cell_mask_arr = _resolve_cell_mask(
+            path,
+            n_obs=n_obs,
+            perturbation_column=perturbation_column,
+            control_label=control_label,
+            cell_mask=cell_mask,
+            verbose=verbose,
+        )
 
-    backed = read_backed(path)
-    try:
+        matrix = backed.X if layer is None else backed.layers[layer]
+        detected_format = _detect_backed_sparse_format(matrix)
+        storage_format = detected_format if detected_format is not None else "dense"
+        if chunk_size is None:
+            chunk_size = (
+                calculate_optimal_gene_chunk_size(n_obs, n_vars)
+                if storage_format == "csc"
+                else calculate_optimal_chunk_size(n_obs, n_vars)
+            )
+
         if flavor == "seurat_v3":
             mean, var, variances_norm = _seurat_v3_flavor(
                 backed,
